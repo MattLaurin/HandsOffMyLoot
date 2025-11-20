@@ -1,0 +1,4065 @@
+--- StarterPlayer.StarterPlayerScripts.UpgradeBillboardHandler (LocalScript) ---
+--!strict
+local Players           = game:GetService("Players")
+local Workspace         = game:GetService("Workspace")
+
+local localPlayer = Players.LocalPlayer
+local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
+
+local billboardMap: {[Model]: BillboardGui} = {}
+
+local function createBillboard(parentPart: BasePart): BillboardGui
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "UpgradePlotBillboard"
+	bb.Adornee = parentPart
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.fromOffset(380, 120)
+	bb.StudsOffsetWorldSpace = Vector3.new(0, 10, 0)
+	bb.MaxDistance = 200
+
+	local frame = Instance.new("Frame")
+	frame.BackgroundTransparency = 1
+	frame.Size = UDim2.fromScale(1, 1)
+	frame.Parent = bb
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, 0, 0, 72)
+	title.Position = UDim2.new(0, 0, 0, 0)
+	title.Text = "Upgrade your plot"
+	title.TextColor3 = Color3.fromRGB(235, 64, 64)
+	title.TextScaled = true
+	title.Font = Enum.Font.FredokaOne
+	title.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 2
+	stroke.Color = Color3.new(0, 0, 0)
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+	stroke.Parent = title
+
+	local arrow = Instance.new("TextLabel")
+	arrow.BackgroundTransparency = 1
+	arrow.Size = UDim2.new(1, 0, 0, 40)
+	arrow.Position = UDim2.new(0, 0, 0, 78)
+	arrow.Text = "▼"
+	arrow.TextColor3 = Color3.fromRGB(235, 64, 64)
+	arrow.TextScaled = true
+	arrow.Font = Enum.Font.FredokaOne
+	arrow.Parent = frame
+
+	local arrowStroke = Instance.new("UIStroke")
+	arrowStroke.Thickness = 2
+	arrowStroke.Color = Color3.new(0, 0, 0)
+	arrowStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+	arrowStroke.Parent = arrow
+
+	bb.Parent = parentPart
+	return bb
+end
+
+local function attachBillboardToPlot(plot: Model)
+	if billboardMap[plot] then return end
+	local upgrade = plot:FindFirstChild("Upgrade")
+	local upgradeTouch = upgrade and upgrade:FindFirstChild("UpgradeTouch")
+	local touch = upgradeTouch and upgradeTouch:FindFirstChild("Touch")
+	if touch and touch:IsA("BasePart") then
+		local bb = createBillboard(touch)
+		billboardMap[plot] = bb
+		touch.AncestryChanged:Connect(function(_, parent)
+			if not parent then
+				if billboardMap[plot] then
+					billboardMap[plot]:Destroy()
+					billboardMap[plot] = nil
+				end
+			end
+		end)
+	end
+end
+
+local function removeBillboard(plot: Model)
+	local bb = billboardMap[plot]
+	if bb then
+		bb:Destroy()
+		billboardMap[plot] = nil
+	end
+end
+
+local function refresh()
+	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do
+		if plot:IsA("Model") then
+			if plot:GetAttribute("OwnerId") == localPlayer.UserId then
+				attachBillboardToPlot(plot)
+			else
+				removeBillboard(plot)
+			end
+		end
+	end
+end
+
+-- Initial + auto-refresh every 2s
+refresh()
+task.spawn(function()
+	while task.wait(2) do
+		refresh()
+	end
+end)
+
+-- Detect new plots
+PLOTS_FOLDER.ChildAdded:Connect(function(child)
+	task.wait(1)
+	refresh()
+end)
+
+-- Clean on respawn
+localPlayer.CharacterAdded:Connect(function()
+	for plot, bb in pairs(billboardMap) do
+		if bb then bb:Destroy() end
+	end
+	table.clear(billboardMap)
+	refresh()
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.UIInitializer (LocalScript) ---
+--!strict
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+
+-- Modules
+local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+
+-- Player
+local player: Player = Players.LocalPlayer
+
+-- Small helper: add hover/press tweens to an icon button
+local function attachIconTweens(btn: TextButton | ImageButton)
+	local scale = btn:FindFirstChildOfClass("UIScale")
+	if not scale then
+		scale = Instance.new("UIScale")
+		scale.Scale = 1
+		scale.Parent = btn
+	end
+
+	local TI = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local hoverUp   = TweenService:Create(scale, TI, { Scale = 1.05 })
+	local hoverDown = TweenService:Create(scale, TI, { Scale = 1.00 })
+	local pressIn   = TweenService:Create(scale, TI, { Scale = 0.97 })
+
+	btn.MouseEnter:Connect(function() hoverUp:Play() end)
+	btn.MouseLeave:Connect(function() hoverDown:Play() end)
+	btn.MouseButton1Down:Connect(function() pressIn:Play() end)
+	btn.MouseButton1Up:Connect(function() hoverUp:Play() end)
+end
+
+local function hookButtonToFrame(btn: Instance?, frameName: string)
+	if not btn then return end
+	if not (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return end
+	attachIconTweens(btn)
+	FrameManager.connect(btn, frameName, "Toggle")
+end
+
+local function initializeUI()
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+	end)
+
+	local playerGui = player:WaitForChild("PlayerGui")
+	local gui = playerGui:WaitForChild("GUI")
+	local framesContainer = gui:WaitForChild("Frames")
+	local hud = gui:WaitForChild("HUD")
+
+	-- Left: RobuxStore only (keep)
+	local leftHud = hud:WaitForChild("Left")
+	hookButtonToFrame(leftHud:FindFirstChild("RobuxStore"), "RobuxStore")
+
+	-- Removed: Right-side hooks for MiniGunpack & StarterPack.
+	-- Those are owned by AdsUiController to avoid double-binding.F
+
+	-- Close buttons inside Frames
+	for _, frame in ipairs(framesContainer:GetChildren()) do
+		if frame:IsA("GuiObject") then
+			local closeButton = frame:FindFirstChild("Close")
+			if closeButton and (closeButton:IsA("TextButton") or closeButton:IsA("ImageButton")) then
+				FrameManager.connect(closeButton, frame.Name, "Close")
+			end
+		end
+	end
+end
+
+player.CharacterAdded:Connect(initializeUI)
+if player.Character then
+	initializeUI()
+end
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.ShopClient (LocalScript) ---
+--[[
+	ShopClient Script
+	
+	Description: Listens for the OpenShopFrame event from the server and
+	uses the FrameManager to open the specified shop UI.
+	
+	Location: StarterPlayerScripts
+--]]
+--!strict
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Modules
+local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+
+-- Events
+local openShopFrameEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild("OpenShopFrame")
+
+-- Listen for the server's instruction to open a shop frame
+openShopFrameEvent.OnClientEvent:Connect(function(frameName: string)
+	--print(`Received instruction to open frame: {frameName}`)
+	FrameManager.open(frameName)
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.PurchasePrompter (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/PurchasePrompter.lua
+
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local MarketplaceService  = game:GetService("MarketplaceService")
+local Players             = game:GetService("Players")
+
+local player  = Players.LocalPlayer
+local Events  = ReplicatedStorage:WaitForChild("Events")
+
+local promptSkipTimerRequest = Events:WaitForChild("PromptSkipTimerRequest")
+local promptNearestProduct   = Events:WaitForChild("PromptNearestProduct") -- <-- WaitForChild (important)
+
+-- Existing: skip-timer prompts
+promptSkipTimerRequest.OnClientEvent:Connect(function(productId: number)
+	MarketplaceService:PromptProductPurchase(player, productId)
+end)
+
+-- New: nearest-cash prompts
+promptNearestProduct.OnClientEvent:Connect(function(productId: number?)
+	if typeof(productId) ~= "number" then return end
+	local ok, err = pcall(function()
+		MarketplaceService:PromptProductPurchase(player, productId)
+	end)
+	if not ok then
+		warn("[PurchasePrompter] PromptProductPurchase failed:", err)
+	end
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.PromotionalCrateHandler (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/PromotionalCrateHandler.lua
+-- Handles: ProximityPrompt/Touch purchase + rotating/cycling gun display (client-only, no scaling)
+
+local Players            = game:GetService("Players")
+local Workspace          = game:GetService("Workspace")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+
+-- === CONFIG (display) ===
+local GUN_SRC     = ReplicatedStorage:WaitForChild("Weapons"):WaitForChild("GunDisplays")
+local ROT_SPEED   = math.rad(40) -- rad/s
+local CYCLE_TIME  = 2.2          -- seconds per model
+local FADE_TIME   = 0.18         -- seconds
+-- =========================
+
+-- ---------- utils ----------
+local function parts(inst: Instance): {BasePart}
+	local t = {}
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then t[#t+1] = d end
+	end
+	return t
+end
+
+local function makePassive(m: Instance)
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Light") then d.Enabled = false end
+		if d:IsA("Script") or d:IsA("LocalScript") then d.Disabled = true end
+	end
+	for _, p in ipairs(parts(m)) do
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.Massless = true
+		p.CastShadow = false
+	end
+end
+
+local function setAlpha(inst: Instance, a: number)
+	for _, p in ipairs(parts(inst)) do
+		p.Transparency = a
+	end
+end
+
+local function waitForAttachment(crate: Model, timeout: number?): Attachment?
+	local deadline = time() + (timeout or 5)
+	repeat
+		local gd = crate:FindFirstChild("GunDisplay", true)
+		if gd then
+			for _, d in ipairs(gd:GetDescendants()) do
+				if d:IsA("Attachment") then return d end
+			end
+		end
+		RunService.Heartbeat:Wait()
+	until time() >= deadline or not crate.Parent
+	return nil
+end
+-- --------------------------
+
+-- Build rotating/cycling display on a given crate (idempotent)
+local function buildGunDisplay(crate: Model)
+	if not crate or not crate:IsDescendantOf(Workspace) then return end
+	if crate:GetAttribute("HasDisplay") then return end
+
+	local attach = waitForAttachment(crate, 5)
+	if not attach then
+		-- retry once descendants stream in
+		local con; con = crate.DescendantAdded:Connect(function()
+			local a = waitForAttachment(crate, 2)
+			if a then
+				con:Disconnect()
+				buildGunDisplay(crate)
+			end
+		end)
+		return
+	end
+
+	crate:SetAttribute("HasDisplay", true)
+
+	-- pivot at attachment
+	local pivot = Instance.new("Part")
+	pivot.Name = "GunPivot"
+	pivot.Size = Vector3.new(0.2, 0.2, 0.2)
+	pivot.Anchored = true
+	pivot.Transparency = 1
+	pivot.CanCollide = false
+	pivot.CanQuery = false
+	pivot.Parent = crate
+	pivot.CFrame = attach.WorldCFrame
+
+	-- clone silhouettes (NO SCALING)
+	local pool: {Model} = {}
+	for _, src in ipairs(GUN_SRC:GetChildren()) do
+		if src:IsA("Model") then
+			local m = src:Clone()
+			makePassive(m)
+			m:PivotTo(pivot.CFrame)
+			setAlpha(m, 1) -- hidden
+			m.Parent = crate
+			table.insert(pool, m)
+		end
+	end
+	if #pool == 0 then return end
+	setAlpha(pool[1], 0) -- show first
+
+	-- animate
+	local idx, last = 1, time()
+	RunService.RenderStepped:Connect(function()
+		if not crate:IsDescendantOf(Workspace) then return end
+
+		-- keep glued to attachment (handles crate motion/streaming)
+		pivot.CFrame = attach.WorldCFrame
+
+		-- rotate around Y (no scaling)
+		local rot = CFrame.Angles(0, ROT_SPEED * (time() % 10000), 0)
+		local target = pivot.CFrame * rot
+		for _, m in ipairs(pool) do
+			m:PivotTo(target)
+		end
+
+		-- cycle
+		if time() - last >= CYCLE_TIME then
+			last = time()
+			local old = pool[idx]
+			idx = (idx % #pool) + 1
+			local newM = pool[idx]
+
+			local t0 = time()
+			while time() - t0 < FADE_TIME do
+				local a = (time() - t0) / FADE_TIME
+				setAlpha(old, a)
+				setAlpha(newM, 1 - a)
+				RunService.RenderStepped:Wait()
+			end
+			setAlpha(old, 1)
+			setAlpha(newM, 0)
+		end
+	end)
+
+	-- if the attachment changes because of streaming, refresh our reference
+	crate.AncestryChanged:Connect(function(_, parent)
+		if parent and parent:IsDescendantOf(Workspace) then
+			local newAttach = waitForAttachment(crate, 2)
+			if newAttach then attach = newAttach end
+		end
+	end)
+end
+
+-- Wire the purchase UX on a given crate (prompt + touch)
+local function wirePurchaseUI(crate: Model)
+	local goldCrateConfig = WeaponConfigurations.Crates.GoldCrate
+	if not goldCrateConfig then return end
+
+	-- Wait for PrimaryPart just in case
+	while crate and crate.Parent and not crate.PrimaryPart do task.wait() end
+	if not crate or not crate.PrimaryPart then return end
+
+	-- ProximityPrompt
+	if not crate.PrimaryPart:FindFirstChildOfClass("ProximityPrompt") then
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.ObjectText = goldCrateConfig.DisplayName
+		prompt.ActionText = "Buy"
+		prompt.MaxActivationDistance = 20
+		prompt.RequiresLineOfSight = false
+		prompt.Parent = crate.PrimaryPart
+		prompt.Triggered:Connect(function()
+			MarketplaceService:PromptProductPurchase(player, goldCrateConfig.ProductID)
+		end)
+	end
+
+	-- Touched purchase (simple debounce)
+	local touchDebounce = false
+	crate.PrimaryPart.Touched:Connect(function(hit)
+		if touchDebounce then return end
+		if not player.Character or not hit:IsDescendantOf(player.Character) then return end
+		touchDebounce = true
+		MarketplaceService:PromptProductPurchase(player, goldCrateConfig.ProductID)
+		task.delay(3, function() touchDebounce = false end)
+	end)
+end
+
+-- Main: wait plot → find crate → wire + display, and handle respawns
+task.spawn(function()
+	-- wait for the player's plot
+	local plot: Model?
+	while not plot do
+		local n = player:GetAttribute("PlotNumber")
+		if n then plot = Workspace:FindFirstChild("Plots") and Workspace.Plots:FindFirstChild("Plot" .. tostring(n)) or nil end
+		task.wait(0.5)
+	end
+
+	-- helper to handle a single crate instance
+	local function handleCrate(crate: Model)
+		buildGunDisplay(crate)
+		wirePurchaseUI(crate)
+	end
+
+	-- existing promo crate
+	local promoCrate = plot:WaitForChild("PromotionalGoldCrate", 10)
+	if promoCrate and promoCrate:IsA("Model") then
+		handleCrate(promoCrate)
+	end
+
+	-- if a new promo crate appears later (e.g., respawn), handle it too
+	plot.ChildAdded:Connect(function(ch)
+		if ch:IsA("Model") and ch.Name == "PromotionalGoldCrate" then
+			handleCrate(ch)
+		end
+	end)
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.PlacementInitializer (LocalScript) ---
+--!strict
+--[[
+	SCRIPT: PlacementInitializer (LocalScript)
+	LOCATION: StarterPlayerScripts/PlacementInitializer.lua
+	DESCRIPTION: Initializes the client-side PlacementHandler module.
+--]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-- ## MODIFIED ## Renamed to PlacementHandler
+local PlacementHandler = require(ReplicatedStorage.Modules:WaitForChild("PlacementHandler"))
+
+PlacementHandler:Init()
+---
+
+--- StarterPlayer.StarterPlayerScripts.NotificationClient (LocalScript) ---
+--[[
+	SCRIPT: NotificationClient (LocalScript)
+	LOCATION: StarterPlayerScripts/NotificationClient.lua
+	DESCRIPTION: Listens for the "ShowNotification" event from the server
+	and displays the message using the NotificationManager module.
+--]]
+--!strict
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Modules
+local NotificationManager = require(ReplicatedStorage.Modules:WaitForChild("NotificationManager"))
+
+-- Events
+local showNotificationEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild("ShowNotification")
+
+-- Connect to the event and show the notification when the server sends one.
+showNotificationEvent.OnClientEvent:Connect(function(message: string, messageType: string?)
+	NotificationManager.show(message, messageType)
+end)
+---
+
+--- StarterPlayer.StarterPlayerScripts.ModelAwardHandler (LocalScript) ---
+--!strict
+-- Handles the award UI pop-up for unlocking new protection models.
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local showModelAwardEvent = ReplicatedStorage.Events:WaitForChild("ShowModelAward")
+
+local awardFrame = playerGui:WaitForChild("GUI"):WaitForChild("Frames"):WaitForChild("ModelAward")
+local itemIcon = awardFrame:FindFirstChild("Icon")
+local itemNameLabel = awardFrame:FindFirstChild("NameLabel")
+local awardSound: Sound = awardFrame:WaitForChild("AwardSound")
+
+awardFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+awardFrame.Position = UDim2.fromScale(0.5, 0.5)
+awardFrame.Visible = false
+local originalSize = awardFrame.Size
+local originalTransparency = awardFrame.BackgroundTransparency
+local tweenInfoIn = TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local tweenInfoOut = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+
+showModelAwardEvent.OnClientEvent:Connect(function(modelName: string, imageId: string)
+	if itemIcon and itemIcon:IsA("ImageLabel") then
+		itemIcon.Image = imageId
+	end
+	if itemNameLabel and itemNameLabel:IsA("TextLabel") then
+		itemNameLabel.Text = "" .. modelName
+	end
+
+	awardFrame.Size = UDim2.fromScale(0, 0)
+	awardFrame.BackgroundTransparency = 1
+	awardFrame.Visible = true
+
+	local tweenIn = TweenService:Create(awardFrame, tweenInfoIn, {
+		Size = originalSize,
+		BackgroundTransparency = originalTransparency,
+	})
+	local tweenOut = TweenService:Create(awardFrame, tweenInfoOut, {
+		Size = UDim2.fromScale(0, 0),
+		BackgroundTransparency = 1,
+	})
+
+	tweenIn:Play()
+	awardSound:Play()
+	tweenIn.Completed:Wait()
+	task.wait(3) -- Keep on screen
+	tweenOut:Play()
+
+	tweenOut.Completed:Once(function()
+		awardFrame.Visible = false
+	end)
+end)
+---
+
+--- StarterPlayer.StarterPlayerScripts.HUDButtons (LocalScript) ---
+--!strict
+-- This script manages HUD button interactions, visuals, and auto equip/unequip logic.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local MarketplaceService = game:GetService("MarketplaceService") -- ADDED
+
+-- Modules
+local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+local PlacementHandler = require(ReplicatedStorage.Modules.PlacementHandler)
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+
+-- Player and UI
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local guiRoot = playerGui:WaitForChild("GUI")
+local hudRoot = guiRoot:WaitForChild("HUD")
+
+local bottomHud = hudRoot:WaitForChild("Bottom")
+local inventoryButton = bottomHud:WaitForChild("Inventory")
+local deleteButton = bottomHud:WaitForChild("Delete")
+local weaponsButton = bottomHud:WaitForChild("Weapons")
+local weaponsButtonImage = weaponsButton:WaitForChild("Image")
+
+-- Plus (Follow) button under Cash
+local cash = hudRoot:WaitForChild("Cash")
+local cashDesign = cash:WaitForChild("Design")
+local plusButton = cashDesign:WaitForChild("PlusButton") :: ImageButton -- ADDED
+
+local inventoryDesign = inventoryButton:WaitForChild("Design")
+local inventoryStroke = inventoryDesign:WaitForChild("Stroke")
+local deleteDesign = deleteButton:WaitForChild("Design")
+local deleteStroke = deleteDesign:WaitForChild("Stroke")
+local weaponsDesign = weaponsButton:WaitForChild("Design")
+local weaponsStroke = weaponsDesign:WaitForChild("Stroke")
+
+-- Events
+local unequipWeaponRequest = ReplicatedStorage.Events:WaitForChild("UnequipWeaponRequest")
+local equipLastWeaponRequest = ReplicatedStorage.Events:WaitForChild("EquipLastWeaponRequest")
+
+-- State Tracking
+local wasInUIMode = false
+
+-- Color Definitions
+local SELECTED_BG_COLOR = Color3.fromRGB(0, 255, 0)
+local SELECTED_STROKE_COLOR = Color3.fromRGB(0, 255, 0)
+local DEFAULT_BG_COLOR = Color3.fromRGB(0, 0, 0)
+local DEFAULT_STROKE_COLOR = Color3.fromRGB(50, 50, 50)
+
+-- ===== helpers =====
+local function hudActive(): boolean
+	return bottomHud.Visible == true
+end
+
+-- ========== Unified actions used by buttons & hotkeys ==========
+local function toggleInventoryPlacement()
+	if not hudActive() then return end
+	unequipWeaponRequest:FireServer()
+	PlacementHandler:ExitAllModes()
+	FrameManager.close("InventoryTwo")
+	if FrameManager.getOpenFrameName() == "Inventory" then
+		FrameManager.close("Inventory")
+	else
+		FrameManager.open("Inventory")
+	end
+end
+
+local function toggleWeapons()
+	if not hudActive() then return end
+	PlacementHandler:ExitAllModes()
+	FrameManager.close("Inventory")
+	if FrameManager.getOpenFrameName() == "InventoryTwo" then
+		FrameManager.close("InventoryTwo")
+	else
+		FrameManager.open("InventoryTwo")
+	end
+end
+
+local function toggleDeleteMode()
+	if not hudActive() then return end
+	unequipWeaponRequest:FireServer()
+	FrameManager.close("Inventory")
+	FrameManager.close("InventoryTwo")
+	PlacementHandler:EnterDeleteMode()
+end
+
+-- ========== Robux store opener (PlusButton) ==========
+local function openRobuxStore()
+	if not hudActive() then return end
+
+	-- 1) Try direct Dev Product purchase
+	local productId: any = plusButton:GetAttribute("ProductId")
+	if productId == nil then
+		local nv = plusButton:FindFirstChild("ProductId")
+		if nv and nv:IsA("NumberValue") then productId = nv.Value end
+	end
+
+	if typeof(productId) == "number" then
+		MarketplaceService:PromptProductPurchase(player, productId)
+		return
+	end
+
+	-- 2) Otherwise, open a store frame if provided
+	local frameName = plusButton:GetAttribute("OpenFrame")
+	if typeof(frameName) == "string" and #frameName > 0 then
+		PlacementHandler:ExitAllModes()
+		FrameManager.open(frameName)
+		return
+	end
+
+	-- 3) Fallback: try a conventional frame name
+	if FrameManager.open then
+		PlacementHandler:ExitAllModes()
+		FrameManager.open("RobuxStore")
+	end
+end
+
+-- ========== Button wiring ==========
+inventoryButton.MouseButton1Click:Connect(toggleInventoryPlacement)
+weaponsButton.MouseButton1Click:Connect(toggleWeapons)
+deleteButton.MouseButton1Click:Connect(toggleDeleteMode)
+plusButton.MouseButton1Click:Connect(openRobuxStore) -- ADDED
+
+-- If any inventory panel closes, kill placement state so we don't leave a ghost active.
+FrameManager.onFrameClosed(function(frameName)
+	if frameName == "Inventory" or frameName == "InventoryTwo" then
+		PlacementHandler:ExitAllModes()
+	end
+end)
+
+-- ========== 1/2/3 Hotkeys (mirror the buttons exactly) ==========
+ContextActionService:BindActionAtPriority(
+	"HK_Placement",
+	function(_, state)
+		if state ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+		if not hudActive() then return Enum.ContextActionResult.Pass end
+		toggleInventoryPlacement()
+		return Enum.ContextActionResult.Sink
+	end,
+	false,
+	Enum.ContextActionPriority.High.Value,
+	Enum.KeyCode.One
+)
+
+ContextActionService:BindActionAtPriority(
+	"HK_Delete",
+	function(_, state)
+		if state ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+		if not hudActive() then return Enum.ContextActionResult.Pass end
+		toggleDeleteMode()
+		return Enum.ContextActionResult.Sink
+	end,
+	false,
+	Enum.ContextActionPriority.High.Value,
+	Enum.KeyCode.Two
+)
+
+ContextActionService:BindActionAtPriority(
+	"HK_Weapons",
+	function(_, state)
+		if state ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+		if not hudActive() then return Enum.ContextActionResult.Pass end
+		toggleWeapons()
+		return Enum.ContextActionResult.Sink
+	end,
+	false,
+	Enum.ContextActionPriority.High.Value,
+	Enum.KeyCode.Three
+)
+
+-- Enable/disable hotkeys when the HUD shows/hides
+local function updateHotkeysEnabled()
+	local enabled = hudActive()
+	pcall(function() ContextActionService:SetBindEnabled("HK_Placement", enabled) end)
+	pcall(function() ContextActionService:SetBindEnabled("HK_Delete", enabled) end)
+	pcall(function() ContextActionService:SetBindEnabled("HK_Weapons", enabled) end)
+end
+bottomHud:GetPropertyChangedSignal("Visible"):Connect(updateHotkeysEnabled)
+updateHotkeysEnabled()
+
+-- ========== Weapon icon preview ==========
+local function updateWeaponsButtonImage()
+	local weaponName = player:GetAttribute("LastEquippedWeapon")
+	if typeof(weaponName) == "string" then
+		local weaponConfig = WeaponConfigurations.Weapons[weaponName]
+		if weaponConfig and weaponConfig.ImageId then
+			weaponsButtonImage.Image = weaponConfig.ImageId
+			weaponsButtonImage.ImageTransparency = 0
+			return
+		end
+	end
+	weaponsButtonImage.ImageTransparency = 1
+end
+player:GetAttributeChangedSignal("LastEquippedWeapon"):Connect(updateWeaponsButtonImage)
+updateWeaponsButtonImage()
+
+-- ========== HUD visuals + auto (re)equip ==========
+RunService.Heartbeat:Connect(function()
+	local openFrameName = FrameManager.getOpenFrameName()
+	local isDeleteActive = PlacementHandler.State.isDeleteMode
+
+	-- Inventory
+	if openFrameName == "Inventory" then
+		inventoryDesign.BackgroundColor3 = SELECTED_BG_COLOR
+		inventoryStroke.Color = SELECTED_STROKE_COLOR
+	else
+		inventoryDesign.BackgroundColor3 = DEFAULT_BG_COLOR
+		inventoryStroke.Color = DEFAULT_STROKE_COLOR
+	end
+
+	-- Weapons
+	if openFrameName == "InventoryTwo" then
+		weaponsDesign.BackgroundColor3 = SELECTED_BG_COLOR
+		weaponsStroke.Color = SELECTED_STROKE_COLOR
+	else
+		weaponsDesign.BackgroundColor3 = DEFAULT_BG_COLOR
+		weaponsStroke.Color = DEFAULT_STROKE_COLOR
+	end
+
+	-- Delete
+	if isDeleteActive then
+		deleteDesign.BackgroundColor3 = SELECTED_BG_COLOR
+		deleteStroke.Color = SELECTED_STROKE_COLOR
+	else
+		deleteDesign.BackgroundColor3 = DEFAULT_BG_COLOR
+		deleteStroke.Color = DEFAULT_STROKE_COLOR
+	end
+
+	-- Auto (re)equip last weapon when leaving UI/delete modes
+	local isCurrentlyInUIMode = (openFrameName == "Inventory") or (openFrameName == "InventoryTwo") or isDeleteActive
+	if not isCurrentlyInUIMode and wasInUIMode then
+		equipLastWeaponRequest:FireServer()
+	end
+	wasInUIMode = isCurrentlyInUIMode
+end)
+
+-- On join: if we're not in any UI/delete, re-equip the last weapon
+task.wait(1)
+do
+	local openFrameName = FrameManager.getOpenFrameName()
+	local isDeleteActive = PlacementHandler.State.isDeleteMode
+	if not ((openFrameName == "Inventory") or (openFrameName == "InventoryTwo") or isDeleteActive) then
+		equipLastWeaponRequest:FireServer()
+	end
+end
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.GunDisplayHandler (LocalScript) ---
+--!strict
+-- Client-side display for GoldCrate / PromotionalGoldCrate
+-- Put in StarterPlayerScripts (LocalScript)
+-- Clones silhouette guns above every crate and rotates/cycles them (no scaling).
+
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+
+local GUN_SRC = ReplicatedStorage:WaitForChild("Weapons"):WaitForChild("GunDisplays")
+local ROT_SPEED   = math.rad(40)
+local CYCLE_TIME  = 2.2
+local FADE_TIME   = 0.18
+
+local function parts(inst: Instance): {BasePart}
+	local t = {}
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then table.insert(t, d) end
+	end
+	return t
+end
+
+local function makePassive(m: Instance)
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Light") then d.Enabled = false end
+		if d:IsA("Script") or d:IsA("LocalScript") then d.Disabled = true end
+	end
+	for _, p in ipairs(parts(m)) do
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.Massless = true
+	end
+end
+
+local function setAlpha(m: Instance, a: number)
+	for _, p in ipairs(parts(m)) do p.Transparency = a end
+end
+
+-- Find attachment under a crate
+local function getAttachment(crate: Model): Attachment?
+	local gd = crate:FindFirstChild("GunDisplay", true)
+	if not gd then return nil end
+	for _, d in ipairs(gd:GetDescendants()) do
+		if d:IsA("Attachment") then return d end
+	end
+	return nil
+end
+
+-- Build the display for one crate
+local function buildDisplay(crate: Model)
+	if crate:GetAttribute("HasDisplay") then return end
+	crate:SetAttribute("HasDisplay", true)
+
+	local attach = getAttachment(crate)
+	if not attach then return end
+
+	local pivot = Instance.new("Part")
+	pivot.Name = "GunPivot"
+	pivot.Size = Vector3.new(0.2, 0.2, 0.2)
+	pivot.Transparency = 1
+	pivot.Anchored = true
+	pivot.CanCollide = false
+	pivot.CanQuery = false
+	pivot.Parent = crate
+	pivot.CFrame = attach.WorldCFrame
+
+	local guns: {Model} = {}
+	for _, src in ipairs(GUN_SRC:GetChildren()) do
+		if src:IsA("Model") then
+			local m = src:Clone()
+			makePassive(m)
+			m:PivotTo(pivot.CFrame)
+			setAlpha(m, 1)
+			m.Parent = crate
+			table.insert(guns, m)
+		end
+	end
+	if #guns == 0 then return end
+	setAlpha(guns[1], 0)
+
+	local i, last = 1, time()
+	RunService.RenderStepped:Connect(function()
+		if not crate:IsDescendantOf(Workspace) then return end
+		pivot.CFrame = attach.WorldCFrame
+
+		local rot = CFrame.Angles(0, ROT_SPEED * (tick() % 10000), 0)
+		local target = pivot.CFrame * rot
+		for _, m in ipairs(guns) do
+			m:PivotTo(target)
+		end
+
+		if time() - last >= CYCLE_TIME then
+			last = time()
+			local old = guns[i]
+			i = (i % #guns) + 1
+			local new = guns[i]
+
+			local t0 = time()
+			while time() - t0 < FADE_TIME do
+				local a = (time() - t0) / FADE_TIME
+				setAlpha(old, a)
+				setAlpha(new, 1 - a)
+				RunService.RenderStepped:Wait()
+			end
+			setAlpha(old, 1)
+			setAlpha(new, 0)
+		end
+	end)
+end
+
+-- Handle all crates already present + future ones
+for _, c in ipairs(Workspace:GetDescendants()) do
+	if c:IsA("Model") and (c.Name == "GoldCrate" or c.Name == "PromotionalGoldCrate") then
+		buildDisplay(c)
+	end
+end
+Workspace.DescendantAdded:Connect(function(obj)
+	if obj:IsA("Model") and (obj.Name == "GoldCrate" or obj.Name == "PromotionalGoldCrate") then
+		buildDisplay(obj)
+	end
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.DisableResetButton (LocalScript) ---
+while wait() do
+	local ok, err = pcall(function()
+		game.StarterGui:SetCore("ResetButtonCallback", false)
+	end)
+	if ok then break end
+end
+---
+
+--- StarterPlayer.StarterPlayerScripts.CustomPromptHandler (LocalScript) ---
+--[[
+	SCRIPT: CustomPromptHandler (LocalScript)
+	LOCATION: StarterPlayerScripts/CustomPromptHandler.lua
+	DESCRIPTION: Overrides the default ProximityPrompt UI with a custom,
+	stylish version from the templates folder.
+--]]
+--!strict
+
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+ProximityPromptService.Enabled = false
+
+local player: Player = Players.LocalPlayer
+local playerGui: PlayerGui = player:WaitForChild("PlayerGui")
+local customPromptTemplate: TextButton = ReplicatedStorage.Templates:WaitForChild("CustomPrompt")
+
+local promptContainer: ScreenGui = playerGui:FindFirstChild("PromptContainer") or Instance.new("ScreenGui")
+promptContainer.Name = "PromptContainer"
+promptContainer.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+promptContainer.Parent = playerGui
+
+local currentPromptUI: TextButton? = nil
+local currentPromptObject: ProximityPrompt? = nil
+local renderConnection: RBXScriptConnection? = nil
+local propertyChangedConnection: RBXScriptConnection? = nil
+
+local placeStrokeColor = Color3.fromRGB(50, 62, 130)
+local placeGradient = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 120, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(62, 204, 255))
+})
+
+local pickupStrokeColor = Color3.fromRGB(145, 0, 0)
+local pickupGradient = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 85, 127))
+})
+
+local function updateUIPosition()
+	if currentPromptUI and currentPromptObject and currentPromptObject.Parent then
+		local worldPosition: Vector3 = currentPromptObject.Parent.Position
+		local screenPosition: Vector3, onScreen: boolean = workspace.CurrentCamera:WorldToScreenPoint(worldPosition)
+		if onScreen then
+			currentPromptUI.Visible = true
+			currentPromptUI.Position = UDim2.new(0, screenPosition.X, 0, screenPosition.Y) + UDim2.fromOffset(currentPromptObject.UIOffset.X, currentPromptObject.UIOffset.Y)
+		else
+			currentPromptUI.Visible = false
+		end
+	else
+		if currentPromptUI then currentPromptUI.Visible = false end
+		if renderConnection then
+			renderConnection:Disconnect()
+			renderConnection = nil
+		end
+	end
+end
+
+local function updatePromptStyle(prompt: ProximityPrompt)
+	if not currentPromptUI then return end
+
+	local gradient: UIGradient? = currentPromptUI:FindFirstChild("Gradient")
+	local stroke: UIStroke? = currentPromptUI:FindFirstChild("Stroke")
+	if not gradient or not stroke then return end
+
+	if prompt.ActionText == "Place Car" then
+		stroke.Color = placeStrokeColor
+		gradient.Color = placeGradient
+	elseif prompt.ActionText == "Pick Up Car" then
+		stroke.Color = pickupStrokeColor
+		gradient.Color = pickupGradient
+	else -- ## FIXED ## The invisible character after 'else' has been replaced with a normal space.
+		stroke.Color = placeStrokeColor
+		gradient.Color = placeGradient
+	end
+end
+
+local function onPromptShown(prompt: ProximityPrompt)
+	currentPromptUI = customPromptTemplate:Clone()
+	currentPromptObject = prompt
+
+	local keyLabel: TextLabel? = currentPromptUI:FindFirstChild("KeyLabel")
+	local tapImage: ImageLabel? = currentPromptUI:FindFirstChild("TapImage")
+
+	if UserInputService.TouchEnabled then
+		if keyLabel then keyLabel.Visible = false end
+		if tapImage then tapImage.Visible = true end
+	else
+		if keyLabel then
+			keyLabel.Visible = true
+			keyLabel.Text = UserInputService:GetStringForKeyCode(prompt.KeyboardKeyCode)
+		end
+		if tapImage then tapImage.Visible = false end
+	end
+
+	updatePromptStyle(prompt)
+
+	currentPromptUI.MouseButton1Click:Connect(function()
+		prompt:InputHoldBegin()
+		prompt:InputHoldEnd()
+	end)
+
+	propertyChangedConnection = prompt:GetPropertyChangedSignal("ActionText"):Connect(function()
+		updatePromptStyle(prompt)
+	end)
+
+	currentPromptUI.Parent = promptContainer
+
+	if not renderConnection then
+		renderConnection = RunService.RenderStepped:Connect(updateUIPosition)
+	end
+end
+
+local function onPromptHidden()
+	if currentPromptUI then
+		currentPromptUI:Destroy()
+		currentPromptUI = nil
+	end
+	currentPromptObject = nil
+
+	if renderConnection then
+		renderConnection:Disconnect()
+		renderConnection = nil
+	end
+
+	if propertyChangedConnection then
+		propertyChangedConnection:Disconnect()
+		propertyChangedConnection = nil
+	end
+end
+
+ProximityPromptService.PromptShown:Connect(onPromptShown)
+ProximityPromptService.PromptHidden:Connect(onPromptHidden)
+---
+
+--- StarterPlayer.StarterPlayerScripts.ClientCrateHandler (LocalScript) ---
+--!strict
+-- Manages the client-side visual timer for placed crates.
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local crateGUITemplate = ReplicatedStorage.Templates:WaitForChild("CrateGUITemplate")
+
+local activeCrateUpdaters = {}
+
+local COUNTDOWN_STROKE_COLOR = Color3.fromRGB(50, 50, 50)
+local READY_STROKE_COLOR = Color3.fromRGB(120, 78, 0)
+
+local function formatTime(seconds: number): string
+	if seconds < 0 then seconds = 0 end
+	local hours = math.floor(seconds / 3600)
+	local minutes = math.floor((seconds % 3600) / 60)
+	local secs = seconds % 60
+	return string.format("%02i:%02i:%02i", hours, minutes, secs)
+end
+
+local function setupCrate(crateModel: Model)
+	-- ## ADDED ## Wait for the PrimaryPart to be loaded
+	while not crateModel.PrimaryPart do
+		task.wait()
+	end
+
+	local ownerId = crateModel:GetAttribute("OwnerId")
+	if ownerId ~= player.UserId then return end
+
+	local gui = crateGUITemplate:Clone()
+	gui.Parent = crateModel.PrimaryPart
+
+	local timerLabel = gui.TimerLabel
+	local textStroke = timerLabel:FindFirstChild("Stroke")
+	local textGradient = timerLabel:FindFirstChild("Gradient")
+
+	activeCrateUpdaters[crateModel] = RunService.Heartbeat:Connect(function()
+		local unlockTimestamp = crateModel:GetAttribute("UnlockTimestamp")
+		if typeof(unlockTimestamp) ~= "number" then
+			if activeCrateUpdaters[crateModel] then
+				activeCrateUpdaters[crateModel]:Disconnect()
+				activeCrateUpdaters[crateModel] = nil
+			end
+			return
+		end
+
+		local remaining = unlockTimestamp - os.time()
+
+		if remaining > 0 then
+			timerLabel.Text = "" .. formatTime(remaining)
+			if textStroke then textStroke.Color = COUNTDOWN_STROKE_COLOR end
+			if textGradient then textGradient.Enabled = false end
+		else
+			timerLabel.Text = "Ready!"
+			if textStroke then textStroke.Color = READY_STROKE_COLOR end
+			if textGradient then textGradient.Enabled = true end
+
+			if activeCrateUpdaters[crateModel] then
+				activeCrateUpdaters[crateModel]:Disconnect()
+				activeCrateUpdaters[crateModel] = nil
+			end
+		end
+	end)
+end
+
+local function cleanupCrate(crateModel: Model)
+	if activeCrateUpdaters[crateModel] then
+		activeCrateUpdaters[crateModel]:Disconnect()
+		activeCrateUpdaters[crateModel] = nil
+	end
+end
+
+task.spawn(function()
+	local playerPlot: Model?
+	while not playerPlot do
+		local plotNum = player:GetAttribute("PlotNumber")
+		if plotNum then playerPlot = Workspace.Plots:FindFirstChild("Plot"..tostring(plotNum)) end
+		task.wait(1)
+	end
+
+	local crateFolder = playerPlot:WaitForChild("Crate")
+	for _, child in ipairs(crateFolder:GetChildren()) do
+		if child:IsA("Model") then setupCrate(child) end
+	end
+	crateFolder.ChildAdded:Connect(function(child)
+		if child:IsA("Model") then setupCrate(child) end
+	end)
+	crateFolder.ChildRemoved:Connect(cleanupCrate)
+end)
+---
+
+--- StarterGui.GUI.HUD.Cash.Amount.CashDisplayHandler (LocalScript) ---
+--!strict
+-- This script animates the cash display on the HUD.
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+-- Modules & Player
+local player = Players.LocalPlayer
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+
+-- UI Elements
+local playerGui = player:WaitForChild("PlayerGui")
+local amountLabel = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Cash"):WaitForChild("Amount")
+
+-- State
+local oldCashValue = 0
+local connection: RBXScriptConnection?
+
+-- Smoothly animates the cash value counting up
+local function animateCashIncrease(startValue: number, endValue: number)
+	local duration = 0.5
+	local startTime = os.clock()
+	local delta = endValue - startValue
+
+	if connection then
+		connection:Disconnect()
+	end
+
+	-- Use Heartbeat for UI updates that are not tied to the camera
+	connection = RunService.Heartbeat:Connect(function()
+		local elapsed = os.clock() - startTime
+		local progress = math.min(elapsed / duration, 1)
+
+		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		local current = math.floor(startValue + delta * alpha)
+
+		amountLabel.Text = NumberFormatter.formatNumber(current, "$")
+
+		if progress >= 1 then
+			amountLabel.Text = NumberFormatter.formatNumber(endValue, "$")
+			if connection then
+				connection:Disconnect()
+				connection = nil
+			end
+		end
+	end)
+end
+
+-- ## MODIFIED ## This function now only updates the text, without the red color flash.
+local function animateCashDecrease(newValue: number)
+	amountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
+end
+
+
+local function onCashChanged(newValue: number)
+	if newValue > oldCashValue then
+		animateCashIncrease(oldCashValue, newValue)
+	elseif newValue < oldCashValue then
+		animateCashDecrease(newValue)
+	else
+		-- This case is for the initial setup
+		amountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
+	end
+
+	oldCashValue = newValue
+end
+
+-- Initialization: Wait for leaderstats and connect to the Cash value
+task.spawn(function()
+	local leaderstats = player:WaitForChild("leaderstats")
+	local cash = leaderstats:WaitForChild("Cash")
+
+	if cash then
+		oldCashValue = cash.Value
+		amountLabel.Text = NumberFormatter.formatNumber(cash.Value, "$")
+		cash.Changed:Connect(onCashChanged)
+	end
+end)
+---
+
+--- StarterGui.GUI.HUD.Top.Buttons.WaveButton.WaveButtonHandler (LocalScript) ---
+--!strict
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+-- ## ADDED ## Get the PlacementController to exit preview mode
+local PlacementHandler = require(ReplicatedStorage.Modules.PlacementHandler)
+
+local WaveButton = script.Parent
+local DesignFrame = WaveButton:WaitForChild("Design")
+local TextLabel = WaveButton:WaitForChild("Text")
+local Gradient = DesignFrame:WaitForChild("Gradient")
+local Stroke = DesignFrame:WaitForChild("Stroke")
+local TextStroke = TextLabel:WaitForChild("Stroke")
+
+local ToggleWaveStateEvent = ReplicatedStorage.Events:WaitForChild("ToggleWaveState")
+local WaveStateChangedEvent = ReplicatedStorage.Events:WaitForChild("WaveStateChanged")
+
+-- Color presets for the button states
+local FIGHT_STROKE_COLOR = Color3.fromRGB(33, 100, 0)
+local FIGHT_GRADIENT = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 255, 0)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 0))
+})
+
+local STOP_STROKE_COLOR = Color3.fromRGB(130, 0, 0)
+local STOP_GRADIENT = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 85, 127))
+})
+
+local isWaveActive = false
+
+local function updateButtonState()
+	if isWaveActive then
+		TextLabel.Text = "Stop"
+		Stroke.Color = STOP_STROKE_COLOR
+		TextStroke.Color = STOP_STROKE_COLOR
+		Gradient.Color = STOP_GRADIENT
+	else
+		TextLabel.Text = "Fight"
+		Stroke.Color = FIGHT_STROKE_COLOR
+		TextStroke.Color = FIGHT_STROKE_COLOR
+		Gradient.Color = FIGHT_GRADIENT
+	end
+end
+
+WaveStateChangedEvent.OnClientEvent:Connect(function(isActive: boolean)
+	isWaveActive = isActive
+	updateButtonState()
+end)
+
+WaveButton.MouseButton1Click:Connect(function()
+	-- If the fight is about to start, close inventory and exit placement mode.
+	if not isWaveActive then
+		FrameManager.close("Inventory")
+		PlacementHandler:ExitAllModes() -- ## ADDED ##
+	end
+
+	ToggleWaveStateEvent:FireServer()
+end)
+
+-- Initial setup
+updateButtonState()
+---
+
+--- StarterGui.GUI.HUD.Top.WaveSettings.AutoWave.AutoWaveHandler (LocalScript) ---
+--!strict
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- UI Elements
+local autoWaveButton = script.Parent
+local DesignFrame = autoWaveButton:WaitForChild("Design")
+local Gradient = DesignFrame:WaitForChild("Gradient")
+local Stroke = DesignFrame:WaitForChild("Stroke")
+
+-- Events
+local SetAutoWaveEvent = ReplicatedStorage.Events:WaitForChild("SetAutoWave")
+local AutoWaveStateChangedEvent = ReplicatedStorage.Events:WaitForChild("AutoWaveStateChanged") -- ## ADDED ##
+
+-- State
+local isAutoWaveEnabled = false -- Default to off
+
+-- Visual States
+local OnStroke = Color3.fromRGB(33, 100, 0)
+local OnGradient = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 255, 0)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 0))
+})
+
+local OffStroke = Color3.fromRGB(0, 93, 140)
+local OffGradient = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 170, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 255))
+})
+
+local function updateButtonVisuals()
+	if isAutoWaveEnabled then
+		Gradient.Color = OnGradient
+		Stroke.Color = OnStroke
+	else
+		Gradient.Color = OffGradient
+		Stroke.Color = OffStroke
+	end
+end
+
+-- Listen for the button to be clicked
+autoWaveButton.MouseButton1Click:Connect(function()
+	-- Toggle the state
+	isAutoWaveEnabled = not isAutoWaveEnabled
+
+	-- Update the button's look
+	updateButtonVisuals()
+
+	-- Tell the server about the change
+	SetAutoWaveEvent:FireServer(isAutoWaveEnabled)
+end)
+
+-- ## ADDED ## Listen for the server to force an update to our state
+AutoWaveStateChangedEvent.OnClientEvent:Connect(function(newState: boolean)
+	-- Check if the state is actually different to avoid redundant updates
+	if isAutoWaveEnabled ~= newState then
+		isAutoWaveEnabled = newState
+		updateButtonVisuals()
+	end
+end)
+
+
+-- Set the initial appearance
+updateButtonVisuals()
+---
+
+--- StarterGui.GUI.HUD.Top.WaveSpeed.2xWaveSpeed.FastWaveHandler (LocalScript) ---
+--!strict
+-- PlayerGui/YourFrame/2xWaveSpeedClient.lua
+
+-- Services
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+-- CONFIG
+local GAMEPASS_ID = 1542612384
+local COLOR_ACTIVE   = Color3.fromRGB(6, 237, 0)    -- green
+local COLOR_INACTIVE = Color3.fromRGB(238, 29, 0)   -- red
+
+-- UI refs
+local root = script.Parent :: Instance  -- your 2xWaveSpeed container (Frame/Button/etc.)
+-- be robust: find the first image/text anywhere under root
+local imageObj = root:FindFirstChildWhichIsA("ImageLabel", true)
+	or root:FindFirstChildWhichIsA("ImageButton", true)
+	or root
+local textObj  = root:FindFirstChildWhichIsA("TextLabel", true)
+	or root:FindFirstChild("Text")
+
+-- add a small status dot if none exists
+local dot = root:FindFirstChild("StatusDot")
+if not dot and root:IsA("GuiObject") then
+	dot = Instance.new("Frame")
+	dot.Name = "StatusDot"
+	dot.AnchorPoint = Vector2.new(1, 0)
+	dot.Position = UDim2.new(1, -6, 0, 6)
+	dot.Size = UDim2.fromOffset(12, 12)
+	dot.BackgroundTransparency = 0
+	dot.BorderSizePixel = 0
+	local uiCorner = Instance.new("UICorner")
+	uiCorner.CornerRadius = UDim.new(1, 0)
+	uiCorner.Parent = dot
+	dot.Parent = root
+end
+
+-- Remotes
+local Events = ReplicatedStorage:WaitForChild("Events")
+local ToggleFastForward = Events:WaitForChild("ToggleFastForward") :: RemoteEvent
+local FastForwardUnlocked = Events:WaitForChild("FastForwardUnlocked") :: RemoteEvent
+local WaveSpeedChanged = Events:WaitForChild("WaveSpeedChanged") :: RemoteEvent
+
+-- Create-or-get: RefreshFastForwardOwnership
+local RefreshOwnership =
+	Events:FindFirstChild("RefreshFastForwardOwnership") :: RemoteEvent
+	or (function()
+		local re = Instance.new("RemoteEvent")
+		re.Name = "RefreshFastForwardOwnership"
+		re.Parent = Events
+		return re
+	end)()
+
+-- State
+local owned = false        -- has gamepass
+local active = false       -- 2x currently ON
+local debounce = false
+
+-- Helpers
+local function setTint()
+	local color = active and COLOR_ACTIVE or COLOR_INACTIVE
+
+	-- Image layer
+	if imageObj:IsA("ImageLabel") or imageObj:IsA("ImageButton") then
+		(imageObj :: any).ImageColor3 = color
+	elseif imageObj:IsA("GuiObject") then
+		(imageObj :: any).BackgroundColor3 = color
+	end
+
+	-- Root background (helps if the image is covered)
+	if root:IsA("GuiObject") then
+		root.BackgroundColor3 = color
+	end
+
+	-- Text label for extra clarity
+	if textObj and textObj:IsA("TextLabel") then
+		textObj.TextColor3 = color
+	end
+
+	-- Status dot if present
+	if dot and dot:IsA("Frame") then
+		dot.BackgroundColor3 = color
+	end
+end
+
+-- start red (inactive)
+setTint()
+
+-- Server confirms ownership (on join / after purchase refresh)
+-- Expect a boolean param: true if player owns the pass, false otherwise.
+FastForwardUnlocked.OnClientEvent:Connect(function(isOwned: any)
+	if typeof(isOwned) == "boolean" then
+		owned = isOwned
+		if owned then
+			print("[2x] You own the 2x Wave Speed gamepass! ✅")
+		else
+			print("[2x] You do NOT own the 2x Wave Speed gamepass.")
+		end
+	end
+	setTint()
+end)
+
+-- Server reports current multiplier (this is the truth)
+WaveSpeedChanged.OnClientEvent:Connect(function(multiplier: number)
+	active = (tonumber(multiplier) or 1) > 1
+	setTint()
+end)
+
+-- Purchase finished -> ask server to re-check; stays inactive until user clicks again
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(plr, passId, purchased)
+	if plr == player and passId == GAMEPASS_ID and purchased then
+		--print("[2x] Purchase completed! Refreshing ownership with server...")
+		RefreshOwnership:FireServer()
+	end
+end)
+
+-- Local check (used only when the user presses the button and we think they don't own it)
+local function ownsPassLocal(): boolean
+	if owned then return true end
+	local ok, has = pcall(function()
+		return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)
+	end)
+	if ok and has then
+		owned = true
+		--print("[2x] You own the 2x Wave Speed gamepass! ✅ (verified locally)")
+		return true
+	end
+	return false
+end
+
+-- Click handler
+local function onPressed()
+	if debounce then return end
+	debounce = true
+
+	-- If they own it -> toggle on server; if not -> prompt purchase
+	if ownsPassLocal() then
+		ToggleFastForward:FireServer()
+	else
+		--print("[2x] Prompting purchase for 2x Wave Speed gamepass...")
+		MarketplaceService:PromptGamePassPurchase(player, GAMEPASS_ID)
+	end
+
+	task.delay(0.15, function() debounce = false end)
+end
+
+-- Hook clicks on any GuiButton inside root (or the root if it is one)
+local function hookButton(btn: GuiButton)
+	btn.Activated:Connect(onPressed)
+	if btn:IsA("TextButton") or btn:IsA("ImageButton") then
+		(btn :: any).MouseButton1Click:Connect(onPressed)
+	end
+end
+
+if root:IsA("GuiButton") then
+	hookButton(root)
+else
+	local btn = root:FindFirstChildWhichIsA("GuiButton", true)
+	if btn then hookButton(btn) end
+	-- last resort: click on the container
+	if root:IsA("GuiObject") then
+		root.Active = true
+		root.Selectable = true
+		root.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				onPressed()
+			end
+		end)
+	end
+end
+
+-- IMPORTANT:
+-- We intentionally do NOT set `owned = ownsPassLocal()` at startup.
+-- The server should inform us via FastForwardUnlocked(isOwned:boolean),
+-- and we only run a local check when the player actively clicks.
+
+---
+
+--- StarterGui.GUI.HUD.Left.SmallButtons.ChangeLog.ChangeLogBtnHandler (LocalScript) ---
+--!strict
+local Players = game:GetService("Players")
+
+local button = script.Parent
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+button.Activated:Connect(function()
+	local gui = playerGui:FindFirstChild("GUI")
+	if not gui then return end
+
+	local frames = gui:FindFirstChild("Frames")
+	if not frames then return end
+
+	local patchNotes = frames:WaitForChild("PatchNotes")
+	if patchNotes and patchNotes:IsA("Frame") then
+		patchNotes.Visible = true
+	end
+end)
+
+---
+
+--- StarterGui.GUI.HUD.Gems.GemsDisplayHandler (LocalScript) ---
+--!strict
+-- GemsDisplayHandler.client.lua
+-- Parent: Gems (frame)  -> Design -> Amount (TextLabel)
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+-- Player / UI
+local player = Players.LocalPlayer
+local amountLabel: TextLabel =
+	script.Parent:WaitForChild("Design"):WaitForChild("GemsImage"):WaitForChild("Amount") :: TextLabel
+
+-- ===== Formatting =====
+local function comma(n: number): string
+	n = math.max(0, math.floor(n))
+	local s = tostring(n)
+	local left = #s % 3
+	if left == 0 then left = 3 end
+	local head = s:sub(1, left)
+	local tail = s:sub(left + 1)
+	if tail ~= "" then tail = tail:gsub("(%d%d%d)", "%1,") end
+	return head .. tail
+end
+
+local function render(v: number)
+	amountLabel.Text = "x" .. comma(v)
+end
+
+-- ===== Animation (increase only) =====
+local lastValue = 0
+local hbConn: RBXScriptConnection?
+
+local function animateIncrease(startValue: number, endValue: number)
+	if hbConn then hbConn:Disconnect() end
+	local duration = 0.5
+	local startTime = os.clock()
+	local delta = endValue - startValue
+
+	hbConn = RunService.Heartbeat:Connect(function()
+		local t = os.clock() - startTime
+		local progress = math.min(t / duration, 1)
+		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		local current = math.floor(startValue + delta * alpha)
+		render(current)
+
+		if progress >= 1 then
+			render(endValue)
+			if hbConn then hbConn:Disconnect(); hbConn = nil end
+		end
+	end)
+end
+
+local function applyNewValue(newValue: number)
+	newValue = math.max(0, math.floor(tonumber(newValue) or 0))
+	if newValue > lastValue then
+		animateIncrease(lastValue, newValue)
+	else
+		-- snap on equal or decrease
+		if hbConn then hbConn:Disconnect(); hbConn = nil end
+		render(newValue)
+	end
+	lastValue = newValue
+end
+
+-- ===== Sources =====
+-- 1) Same as MutationController: use the Mutation_List RF and read payload.gems
+local function fetchFromMutationList(): number?
+	local events = ReplicatedStorage:FindFirstChild("Events")
+	if not events then return nil end
+	local rf = events:FindFirstChild("Mutation_List")
+	if rf and rf:IsA("RemoteFunction") then
+		local ok, payload = pcall(function()
+			return (rf :: RemoteFunction):InvokeServer()
+		end)
+		if ok and type(payload) == "table" and typeof(payload.gems) == "number" then
+			return payload.gems
+		end
+	end
+	return nil
+end
+
+-- 2) Fallback: player attribute set by server (e.g., PlayerController sets/upgrades it)
+local function readAttr(): number?
+	local v = player:GetAttribute("Gemstone")
+	if typeof(v) == "number" then return v end
+	return nil
+end
+
+-- 3) Optional: a dedicated GetPlayerGems RF if you have one
+local function fetchFromGetPlayerGems(): number?
+	local events = ReplicatedStorage:FindFirstChild("Events")
+	if not events then return nil end
+	local rf = events:FindFirstChild("GetPlayerGems")
+	if rf and rf:IsA("RemoteFunction") then
+		local ok, v = pcall(function()
+			return (rf :: RemoteFunction):InvokeServer()
+		end)
+		if ok and typeof(v) == "number" then return v end
+	end
+	return nil
+end
+
+local function hookLiveUpdates()
+	local events = ReplicatedStorage:FindFirstChild("Events")
+
+	-- If you broadcast direct gem changes anywhere:
+	if events then
+		local ev = events:FindFirstChild("GemsUpdated")
+		if ev and ev:IsA("RemoteEvent") then
+			(ev :: RemoteEvent).OnClientEvent:Connect(function(v: number)
+				if typeof(v) == "number" then applyNewValue(v) end
+			end)
+		end
+
+		-- Mutation flow may deduct/spend; if you include gems in the job payload, we’ll use it.
+		local jobEv = events:FindFirstChild("Mutation_JobUpdated")
+		if jobEv and jobEv:IsA("RemoteEvent") then
+			(jobEv :: RemoteEvent).OnClientEvent:Connect(function(payload: any)
+				if type(payload) == "table" and typeof(payload.gems) == "number" then
+					applyNewValue(payload.gems)
+				end
+			end)
+		end
+	end
+
+	-- Attribute pathway (robust + cheap)
+	player:GetAttributeChangedSignal("Gemstone"):Connect(function()
+		local v = player:GetAttribute("Gemstone")
+		if typeof(v) == "number" then applyNewValue(v) end
+	end)
+end
+
+-- ===== Init =====
+task.spawn(function()
+	-- Priority: same path as Mutation UI -> attribute -> optional RF -> 0
+	local initial = fetchFromMutationList()
+		or readAttr()
+		or fetchFromGetPlayerGems()
+		or 0
+
+	lastValue = initial
+	render(initial)
+	hookLiveUpdates()
+end)
+
+---
+
+--- StarterGui.GUI.HUD.Luck.LuckDisplayHandler (LocalScript) ---
+--!strict
+-- Shows combined multiplier (server x personal) on Multiplier.
+-- Timer still shows ONLY personal time (per your original design).
+
+local Players        = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService     = game:GetService("RunService")
+
+local LP   = Players.LocalPlayer
+local gui  = script.Parent :: ScreenGui
+local design = gui:WaitForChild("Design") :: Frame
+local badge  = design:WaitForChild("LuckBadge") :: ImageLabel
+local multLb = badge:WaitForChild("Multiplier") :: TextLabel
+local timeLb = badge:WaitForChild("TimeLeft") :: TextLabel
+
+local Events    = ReplicatedStorage:WaitForChild("Events")
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local LuckBoostChanged: RemoteEvent    = Events:WaitForChild("LuckBoostChanged")
+local GetLuckRemaining: RemoteFunction = Functions:WaitForChild("GetLuckRemaining")
+
+local TravellingConfig = require(ReplicatedStorage.Modules.TravellingConfigurations)
+if typeof(TravellingConfig.LUCK_BADGE_ICON) == "string" and TravellingConfig.LUCK_BADGE_ICON ~= "" then
+	badge.Image = TravellingConfig.LUCK_BADGE_ICON
+end
+
+local hbConn: RBXScriptConnection? = nil
+local endAt: number = 0
+
+local function setVisible(v: boolean) design.Visible = v end
+local function fmt(s: number): string
+	s = math.max(0, math.floor(s)); local m = math.floor(s/60); local c = s % 60
+	return string.format("%02d:%02d", m, c)
+end
+
+local function stopCountdown()
+	if hbConn then hbConn:Disconnect(); hbConn = nil end
+	endAt = 0
+	timeLb.Text = ""
+end
+
+local function startCountdown(seconds: number)
+	if hbConn then hbConn:Disconnect(); hbConn = nil end
+	if (seconds or 0) <= 0 then stopCountdown(); return end
+	endAt = os.time() + seconds
+	timeLb.Text = fmt(seconds)
+	hbConn = RunService.Heartbeat:Connect(function()
+		local remain = math.max(0, endAt - os.time())
+		timeLb.Text = fmt(remain)
+		if remain <= 0 then stopCountdown() end
+	end)
+end
+
+local function applyState(_remainAny: number, badges: any)
+	-- badges = { personal:number, server:number, remainPersonal:number, remainServer:number }
+	local personalMult   = (type(badges) == "table" and tonumber(badges.personal)) or 1
+	local serverMult     = (type(badges) == "table" and tonumber(badges.server))   or 1
+	local remainPersonal = (type(badges) == "table" and tonumber(badges.remainPersonal)) or 0
+
+	-- === Multiplier label: show EFFECTIVE = server * personal (each at least 1)
+	local eff = (serverMult > 1 and serverMult or 1) * (personalMult > 1 and personalMult or 1)
+	if eff < 1 then eff = 1 end
+	multLb.Text = "x" .. tostring(eff)
+
+	-- === Visibility + timer (personal timer only)
+	if serverMult > 1 then
+		-- server active: show badge, hide timer (per spec)
+		stopCountdown()
+		setVisible(true)
+	elseif remainPersonal > 0 then
+		-- personal-only boost: show timer
+		startCountdown(remainPersonal)
+		setVisible(true)
+	else
+		-- nothing active: hide (keep as your original behavior)
+		stopCountdown()
+		setVisible(false)
+	end
+end
+
+-- Initial pull
+do
+	local ok, remainAny, badges = pcall(function()
+		return GetLuckRemaining:InvokeServer()
+	end)
+	if ok then applyState(tonumber(remainAny) or 0, badges) else setVisible(false) end
+end
+
+-- Live updates
+LuckBoostChanged.OnClientEvent:Connect(function(remainAny: number, badges: any)
+	applyState(remainAny or 0, badges)
+end)
+
+---
+
+--- StarterGui.GUI.Frames.WeaponsShop.WeaponsShopHandler (LocalScript) ---
+--!strict
+-- Populates the weapons shop and handles purchase requests.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local TopUp = require(ReplicatedStorage.Modules:WaitForChild("TopUpModule"))
+
+local player = Players.LocalPlayer
+local shopFrame = script.Parent
+local scrollingFrame = shopFrame:WaitForChild("ScrollingFrame")
+local itemTemplate = ReplicatedStorage.Templates:WaitForChild("WeaponsTemplate")
+local designFrame = shopFrame:WaitForChild("Design")
+local timerLabel = designFrame:WaitForChild("Timer")
+local restockButton = designFrame:WaitForChild("RestockButton")
+
+local purchaseItemEvent = ReplicatedStorage.Events:WaitForChild("PurchaseWeaponCrate")
+local updateStocksEvent = ReplicatedStorage.Events:WaitForChild("UpdateWeaponStocks")
+local getResetTime = ReplicatedStorage.Functions:WaitForChild("GetWeaponShopResetTime")
+local getStocks = ReplicatedStorage.Functions:WaitForChild("GetWeaponShopStocks")
+local crateDataUpdatedEvent = ReplicatedStorage.Events:WaitForChild("CrateDataUpdated")
+
+local currentStocks: {[string]: number} = {}
+local currentCrateCount = 0
+local MAX_CRATES = 3
+local timerConnection: RBXScriptConnection?
+local robuxPricesCache: {[number]: string} = {}
+
+-- Robust balance getter (supports Cash/Money/Coins/Balance in leaderstats/Leaderstats/Stats)
+local function getLocalBalance(p: Player): number
+	local folders = { "leaderstats", "Leaderstats", "Stats" }
+	local names   = { "Cash", "Money", "Coins", "Balance" }
+	for _, fname in ipairs(folders) do
+		local f = p:FindFirstChild(fname)
+		if f then
+			for _, n in ipairs(names) do
+				local v = f:FindFirstChild(n)
+				if v and typeof(v.Value) == "number" then
+					return v.Value
+				end
+			end
+		end
+	end
+	return 0
+end
+
+local function formatRemaining(seconds: number): string
+	if seconds <= 0 then return "00:00" end
+	local min = math.floor(seconds / 60)
+	local sec = seconds % 60
+	return string.format("%02d:%02d", min, sec)
+end
+
+-- Treat broadcast restock time as authoritative; fetch only as fallback on first open.
+local function startTimer(nextTime: number?)
+	if timerConnection then timerConnection:Disconnect() end
+
+	local function bind(ts: number)
+		timerConnection = RunService.Heartbeat:Connect(function()
+			if not shopFrame.Visible then
+				if timerConnection then timerConnection:Disconnect(); timerConnection = nil end
+				return
+			end
+			local remaining = ts - os.time()
+			timerLabel.Text = formatRemaining(remaining)
+		end)
+	end
+
+	if nextTime and typeof(nextTime) == "number" then
+		bind(nextTime)
+	else
+		local ok, ts = pcall(getResetTime.InvokeServer, getResetTime)
+		if ok and typeof(ts) == "number" then bind(ts) end
+	end
+end
+
+local function populateShop()
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if not child:IsA("UILayout") then child:Destroy() end
+	end
+
+	local itemsToSort = {}
+	for itemId, config in pairs(WeaponConfigurations.Crates) do
+		if config.Price then
+			table.insert(itemsToSort, {Id = itemId, Config = config})
+		end
+	end
+
+	table.sort(itemsToSort, function(a, b) return a.Config.Price < b.Config.Price end)
+
+	for _, itemData in ipairs(itemsToSort) do
+		local itemId = itemData.Id
+		local config = itemData.Config
+		local item = itemTemplate:Clone()
+		item.Name = itemId
+		item.ItemImage.Image = config.ImageId
+		item.ItemName.Text = config.DisplayName
+		item.ItemPrice.Text = NumberFormatter.formatNumber(config.Price, "$")
+		item.ItemStock.Text = "Stock: " .. tostring(currentStocks[itemId] or 0)
+
+		item.BuyButton.MouseButton1Click:Connect(function()
+			local balance = getLocalBalance(player)
+			local cost = config.Price or 0
+			if balance < cost then
+				local opened = TopUp.PromptIfShort(cost, balance, function(purchased: boolean)
+					if not purchased then
+						if NotificationManager then
+							NotificationManager.show("Not enough money!", "Error")
+						else
+							warn("Not enough money!")
+						end
+					end
+				end)
+				if not opened then
+					-- Prompt couldn't open (bad product/universe/etc.)
+					if NotificationManager then
+						NotificationManager.show("Not enough money!", "Error")
+					end
+				end
+				return
+			end
+
+			purchaseItemEvent:FireServer(itemId)
+
+
+		end)
+
+		local robuxButton = item:FindFirstChild("RobuxBuy")
+		if robuxButton and robuxButton:IsA("GuiButton") then
+			local priceLabel = robuxButton:FindFirstChild("Text")
+			if priceLabel and priceLabel:IsA("TextLabel") then
+				if config.ProductID and config.ProductID > 0 then
+					robuxButton.Visible = true
+					robuxButton.Active = (currentCrateCount < MAX_CRATES)
+
+					if robuxPricesCache[config.ProductID] then
+						priceLabel.Text = robuxPricesCache[config.ProductID]
+					else
+						priceLabel.Text = "..."
+						task.spawn(function()
+							local success, productInfo = pcall(function()
+								return MarketplaceService:GetProductInfo(config.ProductID, Enum.InfoType.Product)
+							end)
+							if success and productInfo and item.Parent then
+								local priceString = "" .. productInfo.PriceInRobux
+								robuxPricesCache[config.ProductID] = priceString
+								priceLabel.Text = priceString
+							elseif item.Parent then
+								priceLabel.Text = "N/A"
+							end
+						end)
+					end
+
+					robuxButton.MouseButton1Click:Connect(function()
+						MarketplaceService:PromptProductPurchase(player, config.ProductID)
+					end)
+				else
+					robuxButton.Visible = false
+				end
+			end
+		end
+
+		item.Parent = scrollingFrame
+	end
+end
+
+crateDataUpdatedEvent.OnClientEvent:Connect(function(crateData: table)
+	currentCrateCount = #crateData
+	if shopFrame.Visible then
+		populateShop()
+	end
+end)
+
+-- Use the broadcast time directly.
+updateStocksEvent.OnClientEvent:Connect(function(newStocks: {[string]: number}, newRestockTime: number?)
+	currentStocks = newStocks
+	if shopFrame.Visible then
+		populateShop()
+		startTimer(newRestockTime)
+	end
+end)
+
+shopFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if shopFrame.Visible then
+		populateShop()
+		startTimer() -- fallback fetch on first open
+	elseif timerConnection then
+		timerConnection:Disconnect()
+		timerConnection = nil
+	end
+end)
+
+local restockConfig = WeaponConfigurations.ShopProducts.RestockWeaponsShop
+if restockButton and restockConfig then
+	local priceLabel = restockButton:FindFirstChild("Text")
+	if priceLabel and priceLabel:IsA("TextLabel") then
+		if robuxPricesCache[restockConfig.ProductID] then
+			priceLabel.Text = robuxPricesCache[restockConfig.ProductID]
+		else
+			priceLabel.Text = "..."
+			task.spawn(function()
+				local success, productInfo = pcall(function()
+					return MarketplaceService:GetProductInfo(restockConfig.ProductID, Enum.InfoType.Product)
+				end)
+				if success and productInfo and restockButton.Parent then
+					local priceString = "" .. productInfo.PriceInRobux
+					robuxPricesCache[restockConfig.ProductID] = priceString
+					priceLabel.Text = priceString
+				elseif restockButton.Parent then
+					priceLabel.Text = "N/A"
+				end
+			end)
+		end
+	end
+
+	restockButton.MouseButton1Click:Connect(function()
+		MarketplaceService:PromptProductPurchase(player, restockConfig.ProductID)
+	end)
+end
+
+local success, initialStocks = pcall(getStocks.InvokeServer, getStocks)
+if success and initialStocks then currentStocks = initialStocks end
+
+---
+
+--- StarterGui.GUI.Frames.RobuxStore.SoundHandler (LocalScript) ---
+--!strict
+--[[
+	SCRIPT: SoundHandler (LocalScript)
+	LOCATION: GUI.Frames.RobuxStore
+	DESCRIPTION: Plays a sound when this frame becomes visible.
+--]]
+
+local frame = script.Parent
+local storeSound: Sound? = frame:WaitForChild("StoreSound")
+
+-- Check if the sound object exists and is a sound
+if not storeSound or not storeSound:IsA("Sound") then
+	warn("Could not find a valid 'StoreSound' object in the frame.")
+	return
+end
+
+-- This function runs whenever a property of the frame changes
+frame:GetPropertyChangedSignal("Visible"):Connect(function()
+	-- If the property that changed was "Visible" and it's now true...
+	if frame.Visible then
+		-- ...play the sound.
+		storeSound:Play()
+	end
+end)
+---
+
+--- StarterGui.GUI.Frames.RobuxStore.RobuxStoreHandler (LocalScript) ---
+--!strict
+-- LOCATION: GUI/Frames/RobuxStore/RobuxStoreHandler.lua
+-- Populates the Robux store UI for cash purchases.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+
+local player = Players.LocalPlayer
+local storeFrame = script.Parent
+local cashFrame = storeFrame:WaitForChild("ScrollingFrame"):WaitForChild("Cash")
+
+local robuxPricesCache = {}
+
+local function populateStore()
+	for productName, productConfig in pairs(WeaponConfigurations.CashProducts) do
+		local productFrame = cashFrame:FindFirstChild(productName)
+		if not productFrame then continue end
+
+		local buyButton = productFrame:FindFirstChild("BuyButton")
+		local amountLabel = productFrame:FindFirstChild("Amount")
+
+		if not (buyButton and amountLabel) then continue end
+
+		-- Set the cash amount text
+		amountLabel.Text = NumberFormatter.formatNumber(productConfig.CashAmount)
+
+		-- Fetch and display the Robux price
+		local priceLabel = buyButton:FindFirstChild("Text")
+		if not (priceLabel and priceLabel:IsA("TextLabel")) then continue end
+
+		if robuxPricesCache[productConfig.ProductID] then
+			priceLabel.Text = robuxPricesCache[productConfig.ProductID]
+		else
+			priceLabel.Text = "..." -- Placeholder
+			task.spawn(function()
+				local success, productInfo = pcall(function()
+					return MarketplaceService:GetProductInfo(productConfig.ProductID, Enum.InfoType.Product)
+				end)
+				if success and productInfo and productFrame.Parent then
+					local priceString = "" .. productInfo.PriceInRobux
+					robuxPricesCache[productConfig.ProductID] = priceString
+					priceLabel.Text = priceString
+				elseif productFrame.Parent then
+					priceLabel.Text = "N/A"
+				end
+			end)
+		end
+
+		-- Connect the buy button
+		buyButton.MouseButton1Click:Connect(function()
+			MarketplaceService:PromptProductPurchase(player, productConfig.ProductID)
+		end)
+	end
+end
+
+populateStore()
+---
+
+--- StarterGui.GUI.Frames.RobuxStore.ScrollingFrame.AHighlights.Crate.BuyButton.ExtraCrateHandler (LocalScript) ---
+--!strict
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players = game:GetService("Players")
+
+local GAMEPASS_EXTRA_CRATE_SLOTS = 1572988194
+
+local button = script.Parent :: TextButton
+local player = Players.LocalPlayer
+
+button.Activated:Connect(function()
+	if GAMEPASS_EXTRA_CRATE_SLOTS == 0 then return end
+	MarketplaceService:PromptGamePassPurchase(player, GAMEPASS_EXTRA_CRATE_SLOTS)
+end)
+
+---
+
+--- StarterGui.GUI.Frames.RobuxStore.ScrollingFrame.AHighlights.GemstoneSpins.GemSpinsClient (LocalScript) ---
+--!strict
+-- GemSpinsClient — winner ends exactly under the centered white line (with edge buffers).
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContentProvider = game:GetService("ContentProvider")
+local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local LP = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+
+local Events = ReplicatedStorage:WaitForChild("Events")
+local GemSpinStart: RemoteEvent = Events:WaitForChild("GemSpinStart")
+
+-- Dev Product
+local PRODUCT_GEM_SPIN = 3446368683
+
+-- Script is under GUI.Frames.RobuxStore...GemstoneSpins
+local RootFrame = script.Parent :: Frame
+local BuyButton = RootFrame:WaitForChild("BuyButton") :: TextButton
+
+-- Layout constants (match your tiles)
+local CELL_W, CELL_H, PAD = 120, 140, 8
+local PLACEHOLDER_IMAGE = "rbxassetid://7190630405"
+
+-- Overlay refs
+local overlay: ScreenGui? = nil
+local window: Frame
+local reel: ScrollingFrame
+local skipBtn: TextButton
+local centerBar: Frame
+
+-- Colors
+local COLORS = {
+	common    = Color3.fromRGB(93,108,150),
+	rare      = Color3.fromRGB(113,181,143),
+	epic      = Color3.fromRGB(178,114,210),
+	legendary = Color3.fromRGB(240,183,75),
+}
+
+-- Buy button -> prompt product
+BuyButton.Activated:Connect(function()
+	MarketplaceService:PromptProductPurchase(LP, PRODUCT_GEM_SPIN)
+end)
+
+-- UI build
+local function ensureOverlay()
+	if overlay and overlay.Parent then return end
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "GemSpinOverlay"
+	sg.ResetOnSpawn = false
+	sg.IgnoreGuiInset = true
+	sg.DisplayOrder = 9999
+	sg.Enabled = false
+	sg.Parent = PlayerGui
+	overlay = sg
+
+	local dim = Instance.new("Frame")
+	dim.BackgroundColor3 = Color3.new(0, 0, 0)
+	dim.BackgroundTransparency = 0.35
+	dim.Size = UDim2.fromScale(1, 1)
+	dim.ZIndex = 1
+	dim.Parent = sg
+
+	window = Instance.new("Frame")
+	window.Name = "Window"
+	window.Size = UDim2.new(0, 760, 0, 170)
+	window.Position = UDim2.new(0.5, -380, 0.75, -85)
+	window.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+	window.BorderSizePixel = 0
+	window.ClipsDescendants = true
+	window.ZIndex = 10
+	window.Parent = sg
+	local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0, 10); c1.Parent = window
+	local st = Instance.new("UIStroke"); st.Thickness = 2; st.Transparency = 0.2; st.Parent = window
+
+	-- centered marker (white bar)
+	centerBar = Instance.new("Frame")
+	centerBar.AnchorPoint = Vector2.new(0.5, 0)
+	centerBar.Position = UDim2.new(0.5, 0, 0, 0) -- centered
+	centerBar.Size = UDim2.new(0, 3, 1, 0)
+	centerBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	centerBar.BackgroundTransparency = 0.1
+	centerBar.ZIndex = 30
+	centerBar.Parent = window
+
+	-- reel
+	reel = Instance.new("ScrollingFrame")
+	reel.Name = "Reel"
+	reel.Active = false
+	reel.ScrollBarThickness = 0
+	reel.BackgroundTransparency = 1
+	reel.Size = UDim2.fromScale(1, 1)
+	reel.CanvasSize = UDim2.fromOffset(0, 0)
+	reel.ZIndex = 15
+	reel.Parent = window
+
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.Padding = UDim.new(0, PAD)
+	layout.VerticalAlignment = Enum.VerticalAlignment.Center
+	layout.Parent = reel
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, PAD)
+	pad.PaddingRight = UDim.new(0, PAD)
+	pad.Parent = reel
+
+	-- skip / close
+	skipBtn = Instance.new("TextButton")
+	skipBtn.AnchorPoint = Vector2.new(0.5, 0)
+	skipBtn.Position = UDim2.new(0.5, 0, 1, 10)
+	skipBtn.Size = UDim2.fromOffset(160, 40)
+	skipBtn.Text = "Skip"
+	skipBtn.Font = Enum.Font.GothamBold
+	skipBtn.TextScaled = true
+	skipBtn.BackgroundColor3 = Color3.fromRGB(119, 149, 235)
+	skipBtn.ZIndex = 25
+	skipBtn.Parent = window
+	local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0, 10); c2.Parent = skipBtn
+end
+
+local function clearOldCells()
+	for _, ch in ipairs(reel:GetChildren()) do
+		if ch:IsA("Frame") and ch.Name == "Cell" then
+			ch:Destroy()
+		end
+	end
+end
+
+local function closeStoreIfPresent()
+	local store = RootFrame:FindFirstAncestor("RobuxStore")
+	if store and store:IsA("Frame") then
+		store.Visible = false
+	end
+end
+
+-- tiles
+local function makeCell(r: any, i: number): Frame
+	local rarity = tostring(r[7] or "common")
+	local tint = COLORS[rarity] or COLORS.common
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Cell"
+	frame.Size = UDim2.fromOffset(CELL_W, CELL_H)
+	frame.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(50, 55, 70) or Color3.fromRGB(38, 42, 56)
+	frame.BorderSizePixel = 0
+	frame.ZIndex = 16
+	local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 8); cc.Parent = frame
+
+	local border = Instance.new("UIStroke")
+	border.Name = "Border"
+	border.Thickness = 2
+	border.Transparency = 0.25
+	border.Color = tint
+	border.Parent = frame
+
+	local icon = Instance.new("ImageLabel")
+	icon.BackgroundTransparency = 1
+	icon.Size = UDim2.new(1, -8, 1, -36)
+	icon.Position = UDim2.fromOffset(4, 4)
+	icon.Image = tostring(r[6] or PLACEHOLDER_IMAGE)
+	icon.ZIndex = 17
+	icon.Parent = frame
+
+	local text = Instance.new("TextLabel")
+	text.Size = UDim2.new(1, -8, 0, 28)
+	text.Position = UDim2.new(0, 4, 1, -32)
+	text.BackgroundTransparency = 1
+	text.Font = Enum.Font.GothamBold
+	text.TextScaled = true
+	text.TextColor3 = Color3.new(1, 1, 1)
+	text.TextTruncate = Enum.TextTruncate.AtEnd
+	text.ZIndex = 18
+	text.Text = tostring(r[2] or "")
+	text.Parent = frame
+
+	return frame
+end
+
+local function preload(sequence: {any})
+	local list: {string | Instance} = {}
+	for _, r in ipairs(sequence) do
+		table.insert(list, tostring(r[6] or PLACEHOLDER_IMAGE))
+	end
+	pcall(function()
+		ContentProvider:PreloadAsync(list)
+	end)
+end
+
+local function pulseWinner(cell: Frame)
+	local border = cell:FindFirstChild("Border")
+	if border and border:IsA("UIStroke") then
+		local a = TweenService:Create(border, TweenInfo.new(0.12), { Thickness = 6, Transparency = 0 })
+		local b = TweenService:Create(border, TweenInfo.new(0.18), { Thickness = 2, Transparency = 0.25 })
+		a:Play()
+		a.Completed:Wait()
+		b:Play()
+	end
+end
+
+-- ===== math helpers =====
+
+local function cellCenterCanvasX(i: number): number
+	return PAD + (i - 1) * (CELL_W + PAD) + (CELL_W * 0.5)
+end
+
+local function targetCanvasXForIndex(i: number): number
+	local desired = cellCenterCanvasX(i) - (window.AbsoluteSize.X * 0.5)
+	return math.floor(desired + 0.5)
+end
+
+local function finalCenterSnap(winnerCell: Frame)
+	RunService.RenderStepped:Wait()
+	RunService.RenderStepped:Wait()
+	for _ = 1, 4 do
+		local barCenterX = window.AbsolutePosition.X + window.AbsoluteSize.X * 0.5
+		local cellCenterX = winnerCell.AbsolutePosition.X + winnerCell.AbsoluteSize.X * 0.5
+		local deltaPx = cellCenterX - barCenterX
+		if math.abs(deltaPx) <= 0.5 then break end
+		reel.CanvasPosition = Vector2.new(reel.CanvasPosition.X + deltaPx, 0)
+		RunService.RenderStepped:Wait()
+	end
+end
+
+-- === Spin ===
+local spinning = false
+local skipConn: RBXScriptConnection? = nil
+
+local function playSpin(original: {any}, stopIndex: number)
+	if spinning then return end
+	if not original or #original == 0 then return end
+	spinning = true
+
+	ensureOverlay()
+	if overlay then overlay.Enabled = true end
+	clearOldCells()
+
+	-- ---- Dynamic edge buffers so any index can be perfectly centered ----
+	-- How many full cells we need on EACH side to cover half the window.
+	local cellsPerHalf = math.ceil((window.AbsoluteSize.X * 0.5) / (CELL_W + PAD)) + 1
+	local leftBuf = cellsPerHalf
+	local rightBuf = cellsPerHalf
+
+	-- Build an augmented sequence: [tail buffer] + original + [head buffer]
+	local seq: {any} = {}
+
+	-- left buffer: take from the end
+	for i = #original - leftBuf + 1, #original do
+		local src = original[((i - 1) % #original) + 1]
+		table.insert(seq, src)
+	end
+	-- original
+	for _, r in ipairs(original) do
+		table.insert(seq, r)
+	end
+	-- right buffer: take from the start
+	for i = 1, rightBuf do
+		local src = original[((i - 1) % #original) + 1]
+		table.insert(seq, src)
+	end
+
+	-- Re-map winner index into the augmented array
+	local augStopIndex = leftBuf + math.clamp(stopIndex, 1, #original)
+
+	-- Create cells from augmented list
+	local cells: {Frame} = {}
+	for i, r in ipairs(seq) do
+		local cell = makeCell(r, i)
+		cell.Parent = reel
+		table.insert(cells, cell)
+	end
+
+	RunService.RenderStepped:Wait()
+	RunService.RenderStepped:Wait()
+	preload(seq)
+
+	local total = #seq
+	reel.CanvasSize = UDim2.fromOffset(total * CELL_W + (total + 1) * PAD, 0)
+
+	-- Start near the left buffer so the animation feels natural
+	local startX = targetCanvasXForIndex(leftBuf) - (CELL_W + PAD) * 2
+	reel.CanvasPosition = Vector2.new(math.max(startX, 0), 0)
+
+	local winnerCell = cells[augStopIndex]
+	if not winnerCell then
+		spinning = false
+		if overlay then overlay.Enabled = false end
+		return
+	end
+
+	local targetX = targetCanvasXForIndex(augStopIndex)
+
+	local function closeOverlaySoon(delaySec: number)
+		task.delay(delaySec, function()
+			if overlay then overlay.Enabled = false end
+			closeStoreIfPresent()
+		end)
+	end
+
+	local function finishSpin()
+		reel.CanvasPosition = Vector2.new(targetX, 0)
+		finalCenterSnap(winnerCell)
+		pulseWinner(winnerCell)
+		if skipBtn then skipBtn.Text = "Close" end
+		spinning = false
+		closeOverlaySoon(0.7)
+	end
+
+	if skipBtn then
+		skipBtn.Text = "Skip"
+		if skipConn then skipConn:Disconnect() end
+		skipConn = skipBtn.Activated:Connect(function()
+			if spinning then
+				finishSpin()
+			else
+				if overlay then overlay.Enabled = false end
+				closeStoreIfPresent()
+			end
+		end)
+	end
+
+	local tween = TweenService:Create(
+		reel,
+		TweenInfo.new(2.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+		{ CanvasPosition = Vector2.new(targetX, 0) }
+	)
+
+	tween.Completed:Connect(finishSpin)
+	tween:Play()
+end
+
+GemSpinStart.OnClientEvent:Connect(function(sequence: {any}, stopIndex: number, _chosen: any)
+	playSpin(sequence, stopIndex)
+end)
+
+---
+
+--- StarterGui.GUI.Frames.RobuxStore.ScrollingFrame.AAServerLuck.ServerLuckHandler (LocalScript) ---
+--!strict
+-- ServerLuckButton: single populate + react to LuckBoostChanged, with a local countdown.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+local RunService = game:GetService("RunService")
+
+local LP   = Players.LocalPlayer
+local card = script.Parent :: Frame
+
+-- === Product IDs ===
+local PRODUCT_X2      = 3446300267 -- 299R$
+local PRODUCT_X4      = 3446300425 -- 799R$
+local PRODUCT_ADD15M  = 3446300596 -- 699R$
+
+-- === UI refs (use EXACT children already in your hierarchy) ===
+local buyBtn     = card:WaitForChild("RobuxButton") :: TextButton
+local robuxValue = buyBtn:WaitForChild("RobuxValue") :: TextLabel
+local prevLbl    = card:WaitForChild("PreviousMulti") :: TextLabel
+local nextLbl    = card:WaitForChild("NextMulti") :: TextLabel
+local timeLbl    = card:WaitForChild("TimeLabel") :: TextLabel
+
+-- Remotes
+local Events = ReplicatedStorage:WaitForChild("Events")
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local LuckBoostChanged: RemoteEvent   = Events:WaitForChild("LuckBoostChanged")
+local GetLuckRemaining: RemoteFunction = Functions:WaitForChild("GetLuckRemaining")
+
+-- state
+local productToPrompt: number = PRODUCT_X2
+local hbConn: RBXScriptConnection?
+
+local function mmss(sec: number): string
+	sec = math.max(0, math.floor(sec))
+	local m = math.floor(sec/60); local s = sec % 60
+	return string.format("%02d:%02d", m, s)
+end
+
+local function setText(lbl: TextLabel, txt: string)
+	if lbl.Text ~= txt then lbl.Text = txt end
+end
+
+local function stopCountdown()
+	if hbConn then hbConn:Disconnect(); hbConn = nil end
+end
+
+local function startCountdown(seconds: number)
+	stopCountdown()
+	if (seconds or 0) <= 0 then
+		setText(timeLbl, "Server: 00:00")
+		return
+	end
+	local endAt = os.time() + math.floor(seconds)
+	setText(timeLbl, "Server: " .. mmss(seconds))
+	hbConn = RunService.Heartbeat:Connect(function()
+		local remain = math.max(0, endAt - os.time())
+		setText(timeLbl, "Server: " .. mmss(remain))
+		if remain <= 0 then stopCountdown() end
+	end)
+end
+
+local function applyFromBadges(badges: any)
+	-- badges from GetLuckRemaining() / LuckBoostChanged:
+	--   { personal, server, remainPersonal, remainServer }
+	local serverMult = 1
+	local remainServer = 0
+	if type(badges) == "table" then
+		serverMult   = tonumber(badges.server) or 1
+		remainServer = tonumber(badges.remainServer) or 0
+	end
+
+	-- Decide which product to sell based on *current* server multi
+	if serverMult < 2 then
+		productToPrompt = PRODUCT_X2
+		setText(prevLbl, tostring(serverMult) .. "x")
+		setText(nextLbl, "2x")
+		setText(robuxValue, "299")
+	elseif serverMult < 4 then
+		productToPrompt = PRODUCT_X4
+		setText(prevLbl, tostring(serverMult) .. "x")
+		setText(nextLbl, "4x")
+		setText(robuxValue, "799")
+	else
+		productToPrompt = PRODUCT_ADD15M
+		setText(prevLbl, "4x")
+		setText(nextLbl, "4x")
+		setText(robuxValue, "699")
+	end
+
+	-- Keep a local ticking display for server time
+	startCountdown(remainServer)
+end
+
+local function populateOnce()
+	local ok, _remainAny, badges = pcall(function()
+		return GetLuckRemaining:InvokeServer()
+	end)
+	if ok then
+		applyFromBadges(badges)
+	else
+		-- fallback UI
+		productToPrompt = PRODUCT_X2
+		setText(prevLbl, "1x")
+		setText(nextLbl, "2x")
+		setText(robuxValue, "299")
+		setText(timeLbl, "Server: 00:00")
+	end
+end
+
+-- Click to buy
+buyBtn.MouseButton1Click:Connect(function()
+	MarketplaceService:PromptProductPurchase(LP, productToPrompt)
+end)
+
+-- Live updates while the store stays open
+LuckBoostChanged.OnClientEvent:Connect(function(_remainAny: number, badges: any)
+	applyFromBadges(badges)
+end)
+
+-- Clean up countdown if the card is destroyed
+card.AncestryChanged:Connect(function(_, parent)
+	if not parent then stopCountdown() end
+end)
+
+-- Initial populate
+populateOnce()
+
+---
+
+--- StarterGui.GUI.Frames.BlocksShop.BlocksShopHandler (LocalScript) ---
+--!strict
+-- Populates the blocks shop, handles category filtering,
+-- and manages user interactions for purchasing items.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local NotificationManager = require(ReplicatedStorage.Modules.NotificationManager)
+local TopUp = require(ReplicatedStorage.Modules:WaitForChild("TopUpModule")) -- ✅ ADD
+
+local player = Players.LocalPlayer
+local shopFrame = script.Parent
+local scrollingFrame = shopFrame:WaitForChild("ScrollingFrame")
+local itemTemplate = ReplicatedStorage.Templates:WaitForChild("BlocksTemplate")
+local designFrame = shopFrame:WaitForChild("Design")
+local timerLabel = designFrame:WaitForChild("Timer")
+local restockButton = designFrame:WaitForChild("RestockButton")
+local buttonFrame = shopFrame:WaitForChild("Buttons")
+local blocksButton = buttonFrame:WaitForChild("Blocks")
+local turretsButton = buttonFrame:WaitForChild("Turrets")
+
+local purchaseItemEvent = ReplicatedStorage.Events:WaitForChild("PurchaseBlockItem")
+local updateStocksEvent = ReplicatedStorage.Events:WaitForChild("UpdateBlockStocks")
+local getResetTime = ReplicatedStorage.Functions:WaitForChild("GetBlockShopResetTime")
+local getStocks = ReplicatedStorage.Functions:WaitForChild("GetBlockShopStocks")
+
+local currentStocks: {[string]: number} = {}
+local isPopulating = false
+local visualTimerConnection: RBXScriptConnection?
+local robuxPricesCache: {[number]: string} = {}
+local currentFilter: string = "Turrets"
+
+-- ✅ Robust balance getter (Cash/Money/Coins/Balance in leaderstats/Leaderstats/Stats)
+local function getLocalBalance(p: Player): number
+	local folders = { "leaderstats", "Leaderstats", "Stats" }
+	local names   = { "Cash", "Money", "Coins", "Balance" }
+	for _, fname in ipairs(folders) do
+		local f = p:FindFirstChild(fname)
+		if f then
+			for _, n in ipairs(names) do
+				local v = f:FindFirstChild(n)
+				if v and typeof(v.Value) == "number" then
+					return v.Value
+				end
+			end
+		end
+	end
+	return 0
+end
+
+local function formatRemaining(seconds: number): string
+	if seconds <= 0 then return "00:00" end
+	local min = math.floor(seconds / 60)
+	local sec = seconds % 60
+	return string.format("%02d:%02d", min, sec)
+end
+
+local function startTimer(nextTime: number?)
+	if visualTimerConnection then visualTimerConnection:Disconnect() end
+
+	local function bind(ts: number)
+		visualTimerConnection = RunService.Heartbeat:Connect(function()
+			if not shopFrame.Visible then
+				if visualTimerConnection then visualTimerConnection:Disconnect(); visualTimerConnection = nil end
+				return
+			end
+			local remaining = ts - os.time()
+			timerLabel.Text = formatRemaining(remaining)
+		end)
+	end
+
+	if nextTime and typeof(nextTime) == "number" then
+		bind(nextTime)
+	else
+		local success, ts = pcall(getResetTime.InvokeServer, getResetTime)
+		if success and typeof(ts) == "number" then bind(ts) end
+	end
+end
+
+local function populateShop()
+	if isPopulating then return end
+	isPopulating = true
+
+	-- wipe current cards
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if not child:IsA("UILayout") then child:Destroy() end
+	end
+
+	-- Gate to hide mutation variants and any intentionally hidden/not-purchasable entries
+	local function shouldShow(config: any, filter: string): boolean
+		if config.Type ~= filter then return false end
+		if config.IsMutation == true then return false end
+		if config.ShopHidden == true then return false end
+		if config.Purchasable == false then return false end
+		-- ensure price exists so sort/labels don't break
+		if typeof(config.Price) ~= "number" then return false end
+		return true
+	end
+
+	-- collect items for the active tab (Blocks/Turrets)
+	local itemsToDisplay = {}
+	for itemId, config in pairs(ItemConfigurations) do
+		if shouldShow(config, currentFilter) then
+			table.insert(itemsToDisplay, { Id = itemId, Config = config })
+		end
+	end
+
+	-- cheapest first
+	table.sort(itemsToDisplay, function(a, b)
+		return (a.Config.Price or math.huge) < (b.Config.Price or math.huge)
+	end)
+
+	-- build cards
+	for _, itemData in ipairs(itemsToDisplay) do
+		local itemId = itemData.Id
+		local config = itemData.Config
+
+		local item = itemTemplate:Clone()
+		item.Name = itemId
+
+		local itemImage: ImageLabel? = item:FindFirstChild("ItemImage")
+		if itemImage then itemImage.Image = config.ImageId end
+
+		local itemName: TextLabel? = item:FindFirstChild("ItemName")
+		if itemName then itemName.Text = config.DisplayName end
+
+		local itemPrice: TextLabel? = item:FindFirstChild("ItemPrice")
+		if itemPrice then itemPrice.Text = NumberFormatter.formatNumber(config.Price, "$") end
+
+		local stockLabel: TextLabel? = item:FindFirstChild("ItemStock")
+		if stockLabel then
+			stockLabel.Text = "Stock: " .. tostring(currentStocks[itemId] or 0)
+		end
+
+		local buyButton: TextButton? = item:FindFirstChild("BuyButton")
+		if buyButton then
+			local isInStock = (currentStocks[itemId] or 0) > 0
+			buyButton.Active = isInStock
+			buyButton.TextColor3 = if isInStock then Color3.new(1,1,1) else Color3.fromRGB(200,200,200)
+
+			buyButton.MouseButton1Click:Connect(function()
+				if not isInStock then
+					NotificationManager.show("This item is out of stock!", "Error")
+					return
+				end
+
+				local balance = getLocalBalance(player)
+				local cost = config.Price or 0
+				if balance < cost then
+					local opened = TopUp.PromptIfShort(cost, balance, function(purchased: boolean)
+						if not purchased then
+							NotificationManager.show("Not enough money!", "Error")
+						end
+					end)
+					if not opened then
+						NotificationManager.show("Not enough money!", "Error")
+					end
+					return
+				end
+
+				purchaseItemEvent:FireServer(itemId)
+			end)
+		end
+
+		local robuxButton: TextButton? = item:FindFirstChild("RobuxButton")
+		if robuxButton then
+			if config.ProductID and config.ProductID > 0 then
+				robuxButton.Visible = true
+				local priceLabel = robuxButton:FindFirstChild("Text")
+				if priceLabel and priceLabel:IsA("TextLabel") then
+					if robuxPricesCache[config.ProductID] then
+						priceLabel.Text = robuxPricesCache[config.ProductID]
+					else
+						priceLabel.Text = "..."
+						task.spawn(function()
+							local success, result = pcall(MarketplaceService.GetProductInfo, MarketplaceService, config.ProductID, Enum.InfoType.Product)
+							if success and result and result.PriceInRobux and item.Parent then
+								local priceString = "" .. result.PriceInRobux
+								robuxPricesCache[config.ProductID] = priceString
+								priceLabel.Text = priceString
+							elseif item.Parent then
+								priceLabel.Text = "N/A"
+							end
+						end)
+					end
+				end
+
+				robuxButton.MouseButton1Click:Connect(function()
+					MarketplaceService:PromptProductPurchase(player, config.ProductID)
+				end)
+			else
+				robuxButton.Visible = false
+			end
+		end
+
+		item.Parent = scrollingFrame
+	end
+
+	isPopulating = false
+end
+
+
+local function onFilterButtonClicked(filterName: string)
+	if currentFilter == filterName then return end
+	currentFilter = filterName
+	populateShop()
+end
+
+blocksButton.MouseButton1Click:Connect(function() onFilterButtonClicked("Blocks") end)
+turretsButton.MouseButton1Click:Connect(function() onFilterButtonClicked("Turrets") end)
+
+-- Accept the broadcast restock time and use it.
+updateStocksEvent.OnClientEvent:Connect(function(newStocks: {[string]: number}, newRestockTime: number?)
+	currentStocks = newStocks
+	if shopFrame.Visible then
+		populateShop()
+		startTimer(newRestockTime)
+	end
+end)
+
+shopFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if shopFrame.Visible then
+		populateShop()
+		startTimer() -- fetch from server on open
+	else
+		if visualTimerConnection then visualTimerConnection:Disconnect(); visualTimerConnection = nil end
+	end
+end)
+
+local restockConfig = WeaponConfigurations.ShopProducts.RestockBlocksShop
+if restockButton and restockConfig then
+	local priceLabel = restockButton:FindFirstChild("Text")
+	if priceLabel and priceLabel:IsA("TextLabel") then
+		if robuxPricesCache[restockConfig.ProductID] then
+			priceLabel.Text = robuxPricesCache[restockConfig.ProductID]
+		else
+			priceLabel.Text = "..."
+			task.spawn(function()
+				local success, productInfo = pcall(function()
+					return MarketplaceService:GetProductInfo(restockConfig.ProductID, Enum.InfoType.Product)
+				end)
+				if success and productInfo and restockButton.Parent then
+					local priceString = "" .. productInfo.PriceInRobux
+					robuxPricesCache[restockConfig.ProductID] = priceString
+					priceLabel.Text = priceString
+				elseif restockButton.Parent then
+					priceLabel.Text = "N/A"
+				end
+			end)
+		end
+	end
+
+	restockButton.MouseButton1Click:Connect(function()
+		MarketplaceService:PromptProductPurchase(player, restockConfig.ProductID)
+	end)
+end
+
+local ok, initialStocks = pcall(getStocks.InvokeServer, getStocks)
+if ok and initialStocks then
+	currentStocks = initialStocks
+else
+	warn("[BlocksShopHandler] Could not get initial stocks on startup.")
+end
+
+---
+
+--- StarterGui.GUI.Frames.Inventory.InventoryHandler (LocalScript) ---
+--!strict
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Modules
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local PlacementHandler  = require(ReplicatedStorage.Modules:WaitForChild("PlacementHandler"))
+local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+
+-- UI, Events, and State
+local player = Players.LocalPlayer
+local inventoryFrame = script.Parent
+local scrollingFrame = inventoryFrame:WaitForChild("ScrollingFrame")
+local blocksInventoryTemplate = ReplicatedStorage.Templates:WaitForChild("BlocksInventoryTemplate")
+local turretsInventoryTemplate = ReplicatedStorage.Templates:WaitForChild("TurretsInventoryTemplate")
+local plotResetButton = inventoryFrame:WaitForChild("PlotReset")
+
+local ResetPlotEvent = ReplicatedStorage.Events:WaitForChild("ResetPlot")
+
+local function populateInventory()
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if child:IsA("UILayout") then continue end
+		child:Destroy()
+	end
+
+	local inventoryData = PlacementHandler:GetInventory()
+
+	local itemsToDisplay = {}
+	for itemId, count in pairs(inventoryData) do
+		local config = ItemConfigurations[itemId]
+		if config and count > 0 then
+			table.insert(itemsToDisplay, {Id = itemId, Config = config, Count = count})
+		end
+	end
+	table.sort(itemsToDisplay, function(a, b) return a.Config.DisplayName < b.Config.DisplayName end)
+
+	for _, itemData in ipairs(itemsToDisplay) do
+		local config = itemData.Config
+		local template = if config.Type == "Blocks" then blocksInventoryTemplate else turretsInventoryTemplate
+		local item = template:Clone()
+		item.Name = itemData.Id
+
+		local itemImage: ImageLabel? = item:FindFirstChild("Image")
+		if itemImage then itemImage.Image = config.ImageId end
+
+		local itemText: TextLabel? = item:FindFirstChild("Text")
+		if itemText then itemText.Text = `{config.DisplayName} (x{itemData.Count})` end
+
+		item.MouseButton1Click:Connect(function()
+			PlacementHandler:EnterPlacementMode(itemData.Id)
+		end)
+
+		item.Parent = scrollingFrame
+	end
+end
+
+-- Listen for the state object to change to handle real-time updates.
+PlacementHandler.InventoryState.Changed:Connect(function()
+	if inventoryFrame.Visible then
+		populateInventory()
+	end
+end)
+
+inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if inventoryFrame.Visible then
+		populateInventory()
+	end
+end)
+
+plotResetButton.MouseButton1Click:Connect(function()
+	ResetPlotEvent:FireServer()
+	-- ## CHANGE APPLIED ## The line below was removed.
+	-- FrameManager.close("Inventory")
+end)
+---
+
+--- StarterGui.GUI.Frames.InventoryTwo.WeaponsInventoryHandler (LocalScript) ---
+--!strict
+-- Populates the weapon inventory UI and handles weapon selection.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+
+local player = Players.LocalPlayer
+local inventoryFrame = script.Parent
+local scrollingFrame = inventoryFrame:WaitForChild("ScrollingFrame")
+local template = ReplicatedStorage.Templates:WaitForChild("WeaponsInventoryTemplate")
+
+local setSelectedWeaponRequest = ReplicatedStorage.Events:WaitForChild("SetSelectedWeaponRequest")
+local equipWeaponRequest = ReplicatedStorage.Events:WaitForChild("EquipWeaponRequest")
+
+local myWeapons = {}
+local selectedTemplate: GuiObject? = nil
+
+-- ## MODIFIED ## Color definitions updated for Design background and Text stroke
+local DEFAULT_FRAME_STROKE_COLOR = Color3.fromRGB(85, 0, 127)
+local SELECTED_FRAME_STROKE_COLOR = Color3.fromRGB(0, 255, 0)
+local DEFAULT_DESIGN_COLOR = Color3.fromRGB(170, 0, 255)
+local SELECTED_DESIGN_COLOR = Color3.fromRGB(0, 255, 0)
+local DEFAULT_TEXT_STROKE_COLOR = Color3.fromRGB(85, 0, 127)
+local SELECTED_TEXT_STROKE_COLOR = Color3.fromRGB(0, 110, 0)
+
+
+local function populateInventory()
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if not child:IsA("UILayout") then child:Destroy() end
+	end
+	selectedTemplate = nil
+
+	local lastEquippedWeapon = player:GetAttribute("LastEquippedWeapon")
+
+	for _, weaponId in ipairs(myWeapons) do
+		local weaponConfig = WeaponConfigurations.Weapons[weaponId]
+		if weaponConfig then
+			local item = template:Clone()
+			item.Name = weaponId
+
+			-- Find all the necessary UI elements
+			local textLabel = item:FindFirstChild("Text")
+			local imageLabel = item:FindFirstChild("Image")
+			local design = item:FindFirstChild("Design")
+			local frameStroke = design and design:FindFirstChild("Stroke")
+			local textStroke = textLabel and textLabel:FindFirstChild("Stroke")
+
+			-- Set Text and Image
+			if textLabel and textLabel:IsA("TextLabel") then
+				textLabel.Text = weaponConfig.DisplayName
+			end
+			if imageLabel and imageLabel:IsA("ImageLabel") then
+				imageLabel.Image = weaponConfig.ImageId
+			end
+
+			-- Check if this is the currently selected weapon to set initial colors
+			if weaponId == lastEquippedWeapon then
+				if frameStroke then frameStroke.Color = SELECTED_FRAME_STROKE_COLOR end
+				if design then design.BackgroundColor3 = SELECTED_DESIGN_COLOR end
+				if textStroke then textStroke.Color = SELECTED_TEXT_STROKE_COLOR end
+				selectedTemplate = item
+			end
+
+			if item:IsA("GuiButton") then
+				item.MouseButton1Click:Connect(function()
+					-- Reset the previously selected item to default colors
+					if selectedTemplate then
+						local oldDesign = selectedTemplate:FindFirstChild("Design")
+						local oldFrameStroke = oldDesign and oldDesign:FindFirstChild("Stroke")
+						local oldTextLabel = selectedTemplate:FindFirstChild("Text")
+						local oldTextStroke = oldTextLabel and oldTextLabel:FindFirstChild("Stroke")
+
+						if oldFrameStroke then oldFrameStroke.Color = DEFAULT_FRAME_STROKE_COLOR end
+						if oldDesign then oldDesign.BackgroundColor3 = DEFAULT_DESIGN_COLOR end
+						if oldTextStroke then oldTextStroke.Color = DEFAULT_TEXT_STROKE_COLOR end
+					end
+
+					-- ## MODIFIED ## Highlight the new item using BackgroundColor and TextStroke
+					if frameStroke then frameStroke.Color = SELECTED_FRAME_STROKE_COLOR end
+					if design then design.BackgroundColor3 = SELECTED_DESIGN_COLOR end
+					if textStroke then textStroke.Color = SELECTED_TEXT_STROKE_COLOR end
+					selectedTemplate = item
+
+					-- Tell the server about our new selection and to equip it
+					setSelectedWeaponRequest:FireServer(weaponId)
+					equipWeaponRequest:FireServer(weaponId)
+				end)
+			end
+			item.Parent = scrollingFrame
+		end
+	end
+end
+
+ReplicatedStorage.Events.WeaponInventoryUpdated.OnClientEvent:Connect(function(newInventory)
+	myWeapons = newInventory
+	if inventoryFrame.Visible then
+		populateInventory()
+	end
+end)
+
+inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if inventoryFrame.Visible then
+		populateInventory()
+	end
+end)
+
+task.spawn(function()
+	local getInventoryFunc = ReplicatedStorage.Functions:WaitForChild("GetWeaponInventory")
+	local success, result = pcall(function()
+		return getInventoryFunc:InvokeServer()
+	end)
+	if success and result then
+		myWeapons = result
+		if inventoryFrame.Visible then
+			populateInventory()
+		end
+	else
+		warn("WeaponsInventoryHandler: Could not get initial inventory. Error: " .. tostring(result))
+	end
+end)
+---
+
+--- StarterGui.GUI.Frames.PatchNotes.PatchNotesHandler (LocalScript) ---
+--!strict
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local gui = player:WaitForChild("PlayerGui"):WaitForChild("GUI") :: ScreenGui
+
+-- Force this ScreenGui to render above others
+
+local frame = script.Parent :: Frame
+local scroll = frame:WaitForChild("BodyScroll") :: ScrollingFrame
+local text = scroll:WaitForChild("BodyText") :: TextLabel
+local closeBtn = frame:FindFirstChild("Close")
+
+-- Patch text source
+local meta = RS:FindFirstChild("Meta") or Instance.new("Folder", RS)
+meta.Name = "Meta"; meta.Parent = RS
+local notes = meta:FindFirstChild("PatchNotes") :: StringValue
+if not notes then
+	notes = Instance.new("StringValue")
+	notes.Name = "PatchNotes"
+	notes.Value = "<b>Update Log</b>\n- Write your notes here."
+	notes.Parent = meta
+end
+
+-- Hard fail-safes to MAKE IT VISIBLE
+local function forceOnTop()
+	-- Unclip every ancestor
+	local a: Instance? = frame
+	while a and a ~= gui do
+		if a:IsA("GuiObject") then (a :: GuiObject).ClipsDescendants = false end
+		a = a.Parent
+	end
+
+	-- Big safe size + center if needed
+	frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	frame.Position = UDim2.fromScale(0.5, 0.5)
+	if frame.AbsoluteSize.X < 50 or frame.AbsoluteSize.Y < 50 then
+		frame.Size = UDim2.fromOffset(900, 560)
+	end
+
+	-- Ensure not fully transparent
+	if frame.BackgroundTransparency >= 1 then frame.BackgroundTransparency = 0 end
+
+	-- Brutally raise ZIndex for all children
+	local function bumpZ(o: Instance, z: number)
+		if o:IsA("GuiObject") then o.ZIndex = z end
+		for _, d in ipairs(o:GetChildren()) do bumpZ(d, z) end
+	end
+	bumpZ(frame, 1000)
+
+	-- Make sure text/images aren’t invisible
+	for _, d in ipairs(frame:GetDescendants()) do
+		if d:IsA("TextLabel") or d:IsA("TextButton") then d.TextTransparency = 0 end
+		if d:IsA("ImageLabel") or d:IsA("ImageButton") then d.ImageTransparency = 0 end
+	end
+end
+
+-- Apply text + autosize scroll
+local function refresh()
+	text.RichText = true
+	text.TextWrapped = true
+	text.TextScaled = false
+	text.Text = notes.Value
+	task.wait() -- let TextBounds update
+	text.Size = UDim2.new(1, -24, 0, math.max(24, text.TextBounds.Y))
+	scroll.CanvasSize = UDim2.new(0, 0, 0, text.AbsoluteSize.Y + 24)
+end
+
+-- When someone sets Visible=true (your ChangeLog button), guarantee visibility
+frame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if frame.Visible then
+		forceOnTop()
+		refresh()
+	end
+end)
+
+-- Live updates to the text
+notes:GetPropertyChangedSignal("Value"):Connect(function()
+	if frame.Visible then refresh() end
+end)
+
+-- Close button
+if closeBtn and (closeBtn:IsA("TextButton") or closeBtn:IsA("ImageButton")) then
+	(closeBtn :: any).Activated:Connect(function() frame.Visible = false end)
+end
+
+-- ESC closes
+UIS.InputBegan:Connect(function(i,gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.Escape and frame.Visible then
+		frame.Visible = false
+	end
+end)
+
+-- start hidden
+frame.Visible = false
+
+---
+
+--- StarterGui.ScreenGui.TravellingMerchant.TravellingHandler (LocalScript) ---
+--!strict
+-- TravellingHandler (client) — non-destructive populate (no size/constraint changes)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local TextChatService = game:GetService("TextChatService")
+
+local LP = Players.LocalPlayer
+local TravellingConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TravellingConfigurations"))
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+
+-- Remotes / Functions
+local Events = ReplicatedStorage:WaitForChild("Events")
+local PurchaseTravellingItem: RemoteEvent = Events:WaitForChild("PurchaseTravellingItem")
+local UpdateTravellingStocks: RemoteEvent   = Events:WaitForChild("UpdateTravellingStocks")
+local OpenShopFrame: RemoteEvent            = Events:WaitForChild("OpenShopFrame")
+local ForceMerchant: RemoteEvent            = Events:WaitForChild("ForceMerchant")
+
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local GetTravellingResetTime: RemoteFunction = Functions:WaitForChild("GetTravellingResetTime")
+local GetTravellingStocks: RemoteFunction    = Functions:WaitForChild("GetTravellingStocks")
+local GetTravellingPrice: RemoteFunction?    = Functions:FindFirstChild("GetTravellingPrice") :: RemoteFunction?
+
+-- UI refs (this LocalScript must be parented to the TravellingMerchant Frame)
+local root = script.Parent :: Frame
+local design = root:WaitForChild("Design") :: Frame
+local timerLabel = design:WaitForChild("Timer") :: TextLabel
+local restockButton = design:FindFirstChild("RestockButton") :: TextButton?
+local scrolling = root:WaitForChild("ScrollingFrame") :: ScrollingFrame
+local closeBtn = root:WaitForChild("Close") :: TextButton
+
+-- Template: first ItemFrame found is used as template and kept hidden
+local template: Frame? = nil
+for _, ch in ipairs(scrolling:GetChildren()) do
+	if ch:IsA("Frame") and ch.Name == "ItemFrame" then
+		template = ch
+		template.Visible = false
+		break
+	end
+end
+if not template then warn("[TM] No ItemFrame template found under ScrollingFrame.") end
+
+-- State
+local currentStocks: {[string]: number} = {}
+local timerConn: RBXScriptConnection?
+local cardPool: {[string]: Frame} = {} -- offerId -> card frame
+
+local function fmtMoney(n: number): string
+	if NumberFormatter and NumberFormatter.formatNumber then
+		return NumberFormatter.formatNumber(n, "$")
+	end
+	return ("$%s"):format(tostring(n))
+end
+
+local function setTimer(on: boolean, untilUnix: number?)
+	if timerConn then timerConn:Disconnect(); timerConn = nil end
+	if not on or not untilUnix or untilUnix <= 0 then
+		timerLabel.Text = ""
+		return
+	end
+	timerConn = RunService.Heartbeat:Connect(function()
+		if not root.Visible then if timerConn then timerConn:Disconnect(); timerConn=nil end return end
+		local remain = math.max(0, untilUnix - os.time())
+		local m = math.floor(remain/60)
+		local s = remain % 60
+		timerLabel.Text = string.format("%02d:%02d", m, s)
+	end)
+end
+
+-- Create (once) or fetch a persistent card for an offer
+local function getOrCreateCard(offerId: string): Frame?
+	if cardPool[offerId] then return cardPool[offerId] end
+	if not template then return nil end
+
+	-- clone OFFSCREEN (parent later to reduce layout thrash)
+	local card = template:Clone()
+	card.Name = "Item_"..offerId
+	card.Visible = false
+	card.Parent = scrolling
+
+	-- Wire buy once
+	local buy = card:FindFirstChild("BuyButton") :: TextButton?
+	if buy then
+		buy.MouseButton1Click:Connect(function()
+			-- We re-check stock on click; UI text doesn't gate it
+			local left = currentStocks[offerId] or 0
+			if left > 0 then
+				PurchaseTravellingItem:FireServer(offerId)
+			end
+		end)
+	end
+
+	cardPool[offerId] = card
+	return card
+end
+
+-- Only updates text / image — NO size/constraint edits.
+local function setCardData(card: Frame, offerId: string, offerCfg: any, stockLeft: number)
+	local itemImage = card:FindFirstChild("ItemImage") :: ImageLabel?
+	local itemName  = card:FindFirstChild("ItemName")  :: TextLabel?
+	local itemPrice = card:FindFirstChild("ItemPrice") :: TextLabel?
+	local itemStock = card:FindFirstChild("ItemStock") :: TextLabel?
+	local buyButton = card:FindFirstChild("BuyButton") :: TextButton?
+
+	-- ICON
+	if itemImage and offerCfg.Icon then
+		itemImage.Image = offerCfg.Icon
+	end
+
+	-- NAME
+	if itemName then
+		itemName.Text = offerCfg.Title or offerId
+	end
+
+	-- PRICE (server-dynamic if provided)
+	local priceValue = offerCfg.Price
+	if GetTravellingPrice then
+		local ok, dyn = pcall(function() return GetTravellingPrice:InvokeServer(offerId) end)
+		if ok and typeof(dyn) == "number" and dyn > 0 then
+			priceValue = dyn
+		end
+	end
+	if itemPrice then
+		itemPrice.Text = fmtMoney(priceValue or 0)
+	end
+
+	-- STOCK label "xN"
+	if itemStock then
+		itemStock.Text = "x"..tostring(stockLeft or 0)
+	end
+
+	-- BUY button text/state (but do not disable interaction props that could affect visuals)
+	if buyButton then
+		local enabled = (stockLeft or 0) > 0
+		buyButton.Text = enabled and ((offerCfg.Kind=="Upgrade" and "Buy (+1)") or (offerCfg.Kind=="Luck" and "Buy (15m)") or "Buy") or "Out"
+		-- keep AutoButtonColor/Active as-is stylistically; we only set label text
+	end
+end
+
+local function sortOffers(a: any, b: any): boolean
+	local rank = { Upgrade = 1, Luck = 2 }
+	local ra = rank[tostring(a.Kind or "")] or 3
+	local rb = rank[tostring(b.Kind or "")] or 3
+	if ra ~= rb then return ra < rb end
+	local ta = tostring(a.Title or a.Id or "")
+	local tb = tostring(b.Title or b.Id or "")
+	return ta < tb
+end
+
+-- Non-destructive populate: never destroys cards; toggles visibility only
+local function populateShop()
+	if not template then return end
+
+	-- sort offers (doesn't affect layout sizes)
+	local offers = table.clone(TravellingConfig.OFFERS)
+	table.sort(offers, sortOffers)
+
+	-- First hide all pooled cards (we'll reactivate only those we need)
+	for _, card in pairs(cardPool) do
+		card.Visible = false
+	end
+
+	-- Ensure a card exists for each offer, update text/image, and make visible
+	for order, o in ipairs(offers) do
+		local card = getOrCreateCard(o.Id)
+		if card then
+			setCardData(card, o.Id, o, currentStocks[o.Id] or 0)
+			card.LayoutOrder = order -- optional; respects your UIListLayout if used
+			card.Visible = true
+		end
+	end
+
+	-- Do NOT touch CanvasSize or constraints; let your layout drive it.
+end
+
+-- Optional public restock button visibility
+if restockButton then
+	if not TravellingConfig.ALLOW_PUBLIC_RESTOCK or TravellingConfig.RESTOCK_DEVPRODUCT_ID == 0 then
+		restockButton.Visible = false
+	else
+		restockButton.Visible = true
+		restockButton.MouseButton1Click:Connect(function()
+			MarketplaceService:PromptProductPurchase(LP, TravellingConfig.RESTOCK_DEVPRODUCT_ID)
+		end)
+	end
+end
+
+-- live stock updates
+UpdateTravellingStocks.OnClientEvent:Connect(function(newStocks: {[string]: number})
+	currentStocks = newStocks
+	if root.Visible then
+		populateShop()
+	end
+end)
+
+-- open by server instruction
+OpenShopFrame.OnClientEvent:Connect(function(frameName: string)
+	if frameName ~= "TravellingMerchant" then return end
+	root.Visible = true
+
+	local ok1, stocks = pcall(function() return GetTravellingStocks:InvokeServer() end)
+	if ok1 and stocks then currentStocks = stocks end
+
+	local ok2, closeAt = pcall(function() return GetTravellingResetTime:InvokeServer() end)
+	if ok2 and typeof(closeAt) == "number" then setTimer(true, closeAt) else setTimer(false, nil) end
+
+	populateShop()
+end)
+
+-- visibility toggled by other UI code
+root:GetPropertyChangedSignal("Visible"):Connect(function()
+	if root.Visible then
+		local ok1, stocks = pcall(function() return GetTravellingStocks:InvokeServer() end)
+		if ok1 and stocks then currentStocks = stocks end
+		local ok2, closeAt = pcall(function() return GetTravellingResetTime:InvokeServer() end)
+		if ok2 and typeof(closeAt) == "number" then setTimer(true, closeAt) else setTimer(false, nil) end
+		populateShop()
+	else
+		setTimer(false, nil)
+	end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+	root.Visible = false
+end)
+
+----------------------------------------------------------------
+-- ADMIN CHAT BRIDGE (unchanged)
+----------------------------------------------------------------
+local function parseMerchant(text: string): (string?, any?)
+	local msg = string.lower(text)
+	if msg == "!merchant on" then
+		return "open", nil
+	elseif msg == "!merchant off" then
+		return "close", nil
+	else
+		local n, unit = msg:match("^!merchant%s+for%s+(%d+)%s*([sm]?)$")
+		if n then
+			local secs = tonumber(n)
+			unit = unit or ""
+			if unit == "m" or unit == "" then secs = secs * 60 end
+			return "openfor", { Seconds = secs }
+		end
+	end
+	return nil, nil
+end
+
+if TravellingConfig.ADMIN_USER_IDS and TravellingConfig.ADMIN_USER_IDS[LP.UserId] then
+	local function send(action: string, payload: any?)
+		ForceMerchant:FireServer(action, payload)
+	end
+
+	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+		local function hookChannel(ch: TextChannel)
+			ch.MessageReceived:Connect(function(msg: TextChatMessage)
+				local src = msg.TextSource
+				if not src or src.UserId ~= LP.UserId then return end
+				local action, payload = parseMerchant(msg.Text or "")
+				if action then send(action, payload) end
+			end)
+		end
+		local chans = TextChatService:FindFirstChild("TextChannels")
+		if chans then
+			for _, c in ipairs(chans:GetDescendants()) do
+				if c:IsA("TextChannel") then hookChannel(c) end
+			end
+			chans.DescendantAdded:Connect(function(d)
+				if d:IsA("TextChannel") then hookChannel(d) end
+			end)
+		else
+			TextChatService.ChildAdded:Connect(function(child)
+				if child:IsA("Folder") and child.Name == "TextChannels" then
+					for _, c in ipairs(child:GetDescendants()) do
+						if c:IsA("TextChannel") then hookChannel(c) end
+					end
+					child.DescendantAdded:Connect(function(d)
+						if d:IsA("TextChannel") then hookChannel(d) end
+					end)
+				end
+			end)
+		end
+	end
+
+	LP.Chatted:Connect(function(text)
+		local action, payload = parseMerchant(text)
+		if action then send(action, payload) end
+	end)
+end
+
+---
+
+--- StarterGui.ScreenGui.PlotUpgrades.PlotUpgradeHandler (LocalScript) ---
+--!strict
+-- Client UI for Plot Upgrades. Opens when server fires OpenPlotUpgradesUI after .Touched.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- UI refs
+local ScreenGui = LocalPlayer.PlayerGui:WaitForChild("ScreenGui") :: ScreenGui
+local Root = ScreenGui:WaitForChild("PlotUpgrades") :: Frame
+local CloseBtn = Root:WaitForChild("Close") :: TextButton
+local Scroll = Root:WaitForChild("ScrollingFrame") :: ScrollingFrame
+
+-- Avoid odd focus issues with scrolling stealing clicks
+Scroll.Selectable = false
+
+local Row = {
+	TurretLimitTier = Scroll:WaitForChild("TurretLimitFrame") :: Frame,
+	TurretHpTier    = Scroll:WaitForChild("TurretHPFrame")    :: Frame,
+	BlockLimitTier  = Scroll:WaitForChild("BlockLimitFrame")  :: Frame,
+	BlockHpTier     = Scroll:WaitForChild("BlockHpFrame")     :: Frame,
+}
+
+local function g(f: Instance, name: string, class)
+	return (f:WaitForChild(name) :: any) :: typeof(class)
+end
+
+-- Remotes / Config
+local EventsFolder    = ReplicatedStorage:WaitForChild("Events")
+local FunctionsFolder = ReplicatedStorage:WaitForChild("Functions")
+
+local PlotUpgradesUpdated: RemoteEvent        = EventsFolder:WaitForChild("PlotUpgradesUpdated")
+local OpenPlotUpgradesUI: RemoteEvent         = EventsFolder:WaitForChild("OpenPlotUpgradesUI")
+local RequestUpgradePurchase: RemoteFunction  = FunctionsFolder:WaitForChild("RequestUpgradePurchase")
+
+local UpgradePlotConfig = require(ReplicatedStorage.Modules:WaitForChild("UpgradePlotConfig"))
+local NotificationManager = require(ReplicatedStorage.Modules:WaitForChild("NotificationManager"))
+
+local DEV_PRODUCTS: {[string]: number} = {
+	TurretLimitTier = 0,
+	TurretHpTier    = 0,
+	BlockLimitTier  = 0,
+	BlockHpTier     = 0,
+}
+
+local function nfmt(n: number): string
+	if n >= 1e9 then return string.format("%.2fB", n/1e9)
+	elseif n >= 1e6 then return string.format("%.2fM", n/1e6)
+	elseif n >= 1e3 then return string.format("%.2fK", n/1e3)
+	else return tostring(math.floor(n + 0.5)) end
+end
+
+local upgrades: {[string]: number} = { TurretLimitTier=1, TurretHpTier=1, BlockLimitTier=1, BlockHpTier=1 }
+local cash = 0
+
+-- Debounce to prevent double-firing
+local _buyGuard: {[string]: number} = {} -- track -> last click time
+local CLICK_COOLDOWN = 0.25
+
+-- Track cash for button visual state (keep clickability; block in handler)
+task.defer(function()
+	local ls = LocalPlayer:WaitForChild("leaderstats", 10)
+	if not ls then return end
+	local c = ls:FindFirstChild("Cash") :: IntValue?
+	if not c then return end
+	cash = c.Value
+	c:GetPropertyChangedSignal("Value"):Connect(function()
+		cash = c.Value
+		for track, r in pairs(Row) do
+			local btn = g(r, "UpgradeButton", Instance.new("TextButton")) :: TextButton
+			local priceLbl = g(r, "UpgradePrice", Instance.new("TextLabel")) :: TextLabel
+			local tier = upgrades[track] or 1
+			local cost = UpgradePlotConfig.GetNextCost(track, tier)
+			if cost then
+				priceLbl.Text = "$"..nfmt(cost)
+				btn.AutoButtonColor = cash >= cost
+				-- keep Active enabled; handler will early-return with a toast if can't afford
+			else
+				priceLbl.Text = "MAX"
+				btn.Text = "Maxed"
+				btn.AutoButtonColor = false
+			end
+		end
+	end)
+end)
+
+local function computeChangeText(track: string, tier: number): string
+	local maxT = UpgradePlotConfig.MaxTier
+	if tier >= maxT then
+		if track=="TurretLimitTier" then return "+0"
+		elseif track=="BlockLimitTier" then return "+0"
+		else return "+0% HP" end
+	end
+	local cur = UpgradePlotConfig.GetTrackValue(track, tier)
+	local nxt = UpgradePlotConfig.GetTrackValue(track, tier+1)
+	if track=="TurretLimitTier" or track=="BlockLimitTier" then
+		return ("+%d"):format(nxt - cur)
+	else
+		return ("+%d%% HP"):format(math.floor((nxt - cur)*100 + 0.5))
+	end
+end
+
+local TRACK_DISPLAY_NAME: {[string]: string} = {
+	TurretLimitTier = "Turret Limit",
+	TurretHpTier    = "Turret HP",
+	BlockLimitTier  = "Block Limit",
+	BlockHpTier     = "Block HP",
+}
+
+local function renderRow(track: string)
+	local r = Row[track]
+	local tier = upgrades[track] or 1
+	local nameLbl    = g(r, "UpgradeName", Instance.new("TextLabel"))   :: TextLabel
+	local lvlLbl     = g(r, "CurrentLvl", Instance.new("TextLabel"))    :: TextLabel
+	local valueLbl   = g(r, "CurrentUpgrade", Instance.new("TextLabel")):: TextLabel
+	local changeLbl  = g(r, "UpgradeChange", Instance.new("TextLabel")) :: TextLabel
+	local priceLbl   = g(r, "UpgradePrice", Instance.new("TextLabel"))  :: TextLabel
+	local buyBtn     = g(r, "UpgradeButton", Instance.new("TextButton")):: TextButton
+	local robuxBtn   = r:FindFirstChild("RobuxBuy") :: TextButton?
+
+	nameLbl.Text = TRACK_DISPLAY_NAME[track] or track
+	lvlLbl.Text = ("Lvl %d"):format(tier)
+
+	local value = UpgradePlotConfig.GetTrackValue(track, tier)
+	if track == "TurretLimitTier" or track == "BlockLimitTier" then
+		valueLbl.Text = ("Limit : %d"):format(value)
+	else
+		valueLbl.Text = ("+%d%% HP"):format(math.floor((value - 1) * 100 + 0.5))
+	end
+
+	changeLbl.Text = computeChangeText(track, tier)
+
+	local cost = UpgradePlotConfig.GetNextCost(track, tier)
+	if cost then
+		priceLbl.Text = "$"..nfmt(cost)
+		buyBtn.Text = "Upgrade"
+		buyBtn.AutoButtonColor = cash >= cost
+	else
+		priceLbl.Text = "MAX"
+		buyBtn.Text = "Maxed"
+		buyBtn.AutoButtonColor = false
+	end
+
+	if robuxBtn then
+		local prodId = DEV_PRODUCTS[track] or 0
+		robuxBtn.Visible = prodId ~= 0
+	end
+end
+
+local function renderAll()
+	for track,_ in pairs(Row) do renderRow(track) end
+end
+
+-- Unified click handler (uses only Activated; has debounce)
+local function onBuy(track: string)
+	-- debounce per-track to avoid double-press
+	local now = os.clock()
+	local last = _buyGuard[track] or 0
+	if now - last < CLICK_COOLDOWN then return end
+	_buyGuard[track] = now
+
+	local tier = upgrades[track] or 1
+	local cost = UpgradePlotConfig.GetNextCost(track, tier)
+
+	-- MAXED
+	if not cost then
+		NotificationManager.show(
+			string.format("%s is already maxed.", TRACK_DISPLAY_NAME[track] or track),
+			"Normal"
+		)
+		return
+	end
+
+	-- NOT ENOUGH MONEY
+	if cash < cost then
+		NotificationManager.show(
+			string.format("Not enough money for %s (need $%s)", TRACK_DISPLAY_NAME[track] or track, nfmt(cost)),
+			"Error"
+		)
+		return
+	end
+
+	-- Try purchase (send expected tier to server to reject duplicates/races)
+	local ok, rfOk, rfResult = pcall(function()
+		return RequestUpgradePurchase:InvokeServer(track, tier)
+	end)
+
+	if not ok then
+		NotificationManager.show("Purchase failed (network error).", "Error")
+		warn("[Upgrades] InvokeServer error:", rfOk)
+		return
+	end
+
+	-- Success
+	if rfOk and typeof(rfResult) == "table" and rfResult.newTier then
+		upgrades[track] = rfResult.newTier
+		if typeof(rfResult.cash) == "number" then
+			cash = rfResult.cash
+		end
+		renderAll()
+		-- Optional success toast:
+		-- NotificationManager.show(string.format("%s upgraded to Lvl %d!", TRACK_DISPLAY_NAME[track] or track, upgrades[track]), "Success")
+	else
+		-- Server may return a reason string
+		local msg = (type(rfResult) == "string") and rfResult or "Purchase failed."
+		NotificationManager.show(msg, "Error")
+		warn("[Upgrades] Purchase failed:", rfOk, rfResult)
+	end
+end
+
+-- Bind once, use only Activated
+local _buttonsBound = false
+local function bindButtons()
+	if _buttonsBound then return end
+	_buttonsBound = true
+
+	for track, r in pairs(Row) do
+		local buyBtn = g(r, "UpgradeButton", Instance.new("TextButton")) :: TextButton
+		buyBtn.ZIndex = math.max(buyBtn.ZIndex, (r.ZIndex or 1) + 1)
+		buyBtn.Selectable = true
+		buyBtn.Activated:Connect(function()
+			onBuy(track)
+		end)
+
+		local robuxBtn = r:FindFirstChild("RobuxBuy") :: TextButton?
+		if robuxBtn then
+			robuxBtn.ZIndex = math.max(robuxBtn.ZIndex, buyBtn.ZIndex)
+			robuxBtn.Selectable = true
+			robuxBtn.Activated:Connect(function()
+				local prodId = DEV_PRODUCTS[track] or 0
+				if prodId ~= 0 then
+					MarketplaceService:PromptProductPurchase(LocalPlayer, prodId)
+				else
+					NotificationManager.show("No DevProduct is configured for this upgrade.", "Normal")
+				end
+			end)
+		end
+	end
+end
+
+-- Remote from server when we touched our Touch part
+OpenPlotUpgradesUI.OnClientEvent:Connect(function()
+	Root.Visible = true
+	renderAll()
+end)
+
+PlotUpgradesUpdated.OnClientEvent:Connect(function(newUpgrades: {[string]: number})
+	upgrades = newUpgrades
+	renderAll()
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+	Root.Visible = false
+end)
+
+-- Init
+Root.Visible = false
+bindButtons()
+renderAll()
+
+---
+
+--- StarterGui.ScreenGui.Settings.SettingsHandler (LocalScript) ---
+--!strict
+-- SettingsHandler (client)
+-- Binds UI immediately; fetches server settings asynchronously (no blocking).
+
+local Players                = game:GetService("Players")
+local CollectionService      = game:GetService("CollectionService")
+local Lighting               = game:GetService("Lighting")
+local ReplicatedStorage      = game:GetService("ReplicatedStorage")
+local ContextActionService   = game:GetService("ContextActionService")
+local RunService             = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local Root      = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("ScreenGui"):WaitForChild("Settings")
+local OPTIONS   = Root:WaitForChild("Options")
+local CloseBtn  = Root:WaitForChild("Close") :: ImageButton
+
+local GREEN = Color3.fromRGB(38, 238, 35)
+local RED   = Color3.fromRGB(175, 22, 11)
+
+local Events             = ReplicatedStorage:WaitForChild("Events")
+local GetPlayerSettings  = Events:WaitForChild("GetPlayerSettings") :: RemoteFunction
+local SavePlayerSettings = Events:WaitForChild("SavePlayerSettings") :: RemoteEvent
+
+-- ============ UI helpers ============
+local function setPill(btn: TextButton, enabled: boolean)
+	btn.Text = enabled and "Enabled" or "Disabled"
+	btn.BackgroundColor3 = enabled and GREEN or RED
+	local grad = btn:FindFirstChildOfClass("UIGradient")
+	if grad then
+		if enabled then
+			grad.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 160, 18)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(38, 238, 35)),
+			})
+		else
+			grad.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(120, 10, 6)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(175, 22, 11)),
+			})
+		end
+	end
+end
+
+local function rememberBaseVolume(snd: Sound)
+	if snd:GetAttribute("BaseVolume") == nil then
+		snd:SetAttribute("BaseVolume", snd.Volume)
+	end
+end
+
+local function applyWeaponSFX(enabled: boolean)
+	for _, snd: Sound in ipairs(CollectionService:GetTagged("WeaponSound")) do
+		rememberBaseVolume(snd)
+		if enabled then
+			local base = snd:GetAttribute("BaseVolume")
+			if typeof(base) == "number" then snd.Volume = base end
+		else
+			snd.Volume = 0
+		end
+	end
+end
+
+local function hookWeaponSound(snd: Sound, enabled: boolean)
+	rememberBaseVolume(snd)
+	if not enabled then snd.Volume = 0 end
+end
+
+local function applyMusic(enabled: boolean)
+	for _, snd: Sound in ipairs(CollectionService:GetTagged("BGM")) do
+		rememberBaseVolume(snd)
+		if enabled then
+			local base = snd:GetAttribute("BaseVolume")
+			if typeof(base) == "number" then snd.Volume = base end
+			snd.Looped = true
+			if not snd.IsLoaded then snd.Loaded:Wait() end
+			if not snd.Playing then snd:Play() end
+		else
+			snd.Volume = 0
+		end
+	end
+end
+
+local function hookMusicSound(snd: Sound, enabled: boolean)
+	rememberBaseVolume(snd)
+	if not enabled then
+		snd.Volume = 0
+	else
+		local base = snd:GetAttribute("BaseVolume")
+		if typeof(base) == "number" then snd.Volume = base end
+	end
+end
+
+-- ==== SAFE quality toggles (no permission errors) ====
+
+local function setQualityLow()
+	-- Lighting + post FX
+	Lighting.GlobalShadows = false
+	for _, child in ipairs(Lighting:GetChildren()) do
+		if child:IsA("PostEffect") then
+			child.Enabled = false
+		end
+	end
+
+	-- Effects in the world
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") then
+			obj.Enabled = false
+		elseif obj:IsA("SurfaceAppearance") then
+			obj.AlphaMode = Enum.AlphaMode.Overlay
+		end
+	end
+
+	local terrain = workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		terrain.WaterWaveSize = 0
+		terrain.WaterWaveSpeed = 0
+		terrain.WaterReflectance = 0
+		terrain.WaterTransparency = 1
+	end
+end
+
+local function setQualityAuto()
+	Lighting.GlobalShadows = true
+	for _, child in ipairs(Lighting:GetChildren()) do
+		if child:IsA("PostEffect") then
+			child.Enabled = true
+		end
+	end
+
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") then
+			obj.Enabled = true
+		elseif obj:IsA("SurfaceAppearance") then
+			obj.AlphaMode = Enum.AlphaMode.Overlay
+		end
+	end
+
+	local terrain = workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		terrain.WaterWaveSize = 0.15
+		terrain.WaterWaveSpeed = 10
+		terrain.WaterReflectance = 0.25
+		terrain.WaterTransparency = 0.3
+	end
+end
+
+local function applyPerformanceMode(enabled: boolean)
+	if enabled then
+		setQualityLow()
+	else
+		setQualityAuto()
+	end
+end
+
+-- === UI bindings ===
+local GunRow  = OPTIONS:WaitForChild("GunAudio") :: Frame
+local MusicRow= OPTIONS:WaitForChild("MusicAudio") :: Frame
+local QualRow = OPTIONS:WaitForChild("Quality") :: Frame
+local GunBtn  = GunRow:WaitForChild("ActivateButton") :: TextButton
+local MusicBtn= MusicRow:WaitForChild("ActivateButton") :: TextButton
+local QualBtn = QualRow:WaitForChild("ActivateButton") :: TextButton
+
+local function doClose() Root.Visible = false end
+CloseBtn.Active = true
+CloseBtn.MouseButton1Click:Connect(doClose)
+CloseBtn.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		doClose()
+	end
+end)
+ContextActionService:BindAction("CloseSettingsEsc", function(_, state, input)
+	if state == Enum.UserInputState.Begin and Root.Visible then
+		if input.KeyCode == Enum.KeyCode.Escape or input.KeyCode == Enum.KeyCode.ButtonA then
+			doClose()
+		end
+	end
+end, false, Enum.KeyCode.Escape, Enum.KeyCode.ButtonA)
+
+-- === State & application ===
+local state = { WeaponSounds = true, Music = true, Performance = false }
+
+local function pushAttributes()
+	LocalPlayer:SetAttribute("Setting_WeaponSounds", state.WeaponSounds)
+	LocalPlayer:SetAttribute("Setting_Music", state.Music)
+	LocalPlayer:SetAttribute("Setting_PerformanceMode", state.Performance)
+end
+
+local function applyAll()
+	setPill(GunBtn, state.WeaponSounds)
+	setPill(MusicBtn, state.Music)
+	setPill(QualBtn, state.Performance)
+	applyWeaponSFX(state.WeaponSounds)
+	applyMusic(state.Music)
+	applyPerformanceMode(state.Performance)
+	pushAttributes()
+end
+
+GunBtn.MouseButton1Click:Connect(function()
+	state.WeaponSounds = not state.WeaponSounds
+	setPill(GunBtn, state.WeaponSounds)
+	applyWeaponSFX(state.WeaponSounds)
+	pushAttributes()
+	SavePlayerSettings:FireServer(state)
+end)
+
+MusicBtn.MouseButton1Click:Connect(function()
+	state.Music = not state.Music
+	setPill(MusicBtn, state.Music)
+	applyMusic(state.Music)
+	pushAttributes()
+	SavePlayerSettings:FireServer(state)
+end)
+
+QualBtn.MouseButton1Click:Connect(function()
+	state.Performance = not state.Performance
+	setPill(QualBtn, state.Performance)
+	applyPerformanceMode(state.Performance)
+	pushAttributes()
+	SavePlayerSettings:FireServer(state)
+end)
+
+-- React to new sounds created after opening
+CollectionService:GetInstanceAddedSignal("WeaponSound"):Connect(function(obj)
+	if obj:IsA("Sound") then hookWeaponSound(obj, state.WeaponSounds) end
+end)
+CollectionService:GetInstanceAddedSignal("BGM"):Connect(function(obj)
+	if obj:IsA("Sound") then hookMusicSound(obj, state.Music) end
+end)
+
+-- Apply defaults immediately so the menu is responsive
+applyAll()
+
+task.spawn(function()
+	local ok, result = pcall(function()
+		return GetPlayerSettings:InvokeServer()
+	end)
+	if ok and typeof(result) == "table" then
+		state = result
+		applyAll()
+	else
+		warn("[Settings] GetPlayerSettings failed/timed out; using defaults")
+	end
+end)
+
+---
