@@ -1834,10 +1834,7 @@ ProximityPromptService.PromptHidden:Connect(onPromptHidden)
 
 --- StarterPlayer.StarterPlayerScripts.ClientFXController (LocalScript) ---
 --!strict
--- LOCATION: StarterPlayerScripts/ClientFXController.lua
--- DESCRIPTION: Manages all client-side visual effects, including UI, cash, and in-world FX.
 
--- Services
 local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
@@ -1847,32 +1844,28 @@ local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local Debris = game:GetService("Debris")
 
--- Player and UI
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
--- Modules
 local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
 local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
 
--- Templates
-local shineTemplate: ImageLabel? = ReplicatedStorage.Templates:WaitForChild("ShineEffectTemplate")
+local shineTemplate = ReplicatedStorage.Templates:WaitForChild("ShineEffectTemplate")
 
---================================================================
--- ## UI ELEMENT EFFECTS ##
---================================================================
+local Events = ReplicatedStorage:WaitForChild("Events")
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local CashUpdated = Events:WaitForChild("CashUpdated")
+local GetPlayerCash = Functions:WaitForChild("GetPlayerCash")
 
-local activeHoverTweens: {[GuiObject]: {Tween}} = {}
-local activeShineThreads: {[GuiObject]: thread} = {}
-local sunburstObjects: {[GuiObject]: boolean} = {}
+local activeHoverTweens = {}
+local activeShineThreads = {}
+local sunburstObjects = {}
 
--- We keep the table for potential color restore, but sizing is now via UIScale
-local buttonStates: {[GuiObject]: {originalSize: UDim2, originalColor: Color3?}} = {}
-local partButtonStates: {[BasePart]: {Debounce: boolean, Connections: {RBXScriptConnection}}} = {}
+local buttonStates = {}
+local partButtonStates = {}
 
--- ===== Helpers for UIScale-based animations (prevents layout shrink) =====
-local function getUIScale(gui: GuiObject): UIScale
-	local s = gui:FindFirstChildOfClass("UIScale") :: UIScale?
+local function getUIScale(gui)
+	local s = gui:FindFirstChildOfClass("UIScale")
 	if not s then
 		s = Instance.new("UIScale")
 		s.Scale = 1
@@ -1881,41 +1874,36 @@ local function getUIScale(gui: GuiObject): UIScale
 	return s
 end
 
--- (Optional) If you want to skip FX inside the RobuxStore entirely, set this to true.
 local SKIP_ROBUX_STORE_BUTTON_FX = false
-local function isInsideRobuxStore(inst: Instance): boolean
+local function isInsideRobuxStore(inst)
 	local p = inst
 	while p and not p:IsA("ScreenGui") do p = p.Parent end
 	return p ~= nil and p.Name == "RobuxStore"
 end
 
--- ----- Button hover/click using UIScale (no Size tweening) -----
-local HOVER_TWEEN_INFO: TweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-local CLICK_TWEEN_INFO: TweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)
-local HOVER_SCALE: number = 1.05
-local CLICK_SCALE: number = 0.95
+local HOVER_TWEEN_INFO = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local CLICK_TWEEN_INFO = TweenInfo.new(0.1, Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)
+local HOVER_SCALE = 1.05
+local CLICK_SCALE = 0.95
 
-local function getButtonColor(button: GuiButton): Color3?
+local function getButtonColor(button)
 	if button:IsA("TextButton") then return button.BackgroundColor3 end
 	if button:IsA("ImageButton") then return button.ImageColor3 end
 	return nil
 end
 
-local function tweenColor(button: GuiButton, tweenInfo: TweenInfo, color: Color3)
+local function tweenColor(button, tweenInfo, color)
 	local prop = button:IsA("TextButton") and "BackgroundColor3" or "ImageColor3"
 	TweenService:Create(button, tweenInfo, {[prop] = color}):Play()
 end
 
-local function applyButtonAnimation(button: GuiButton)
-	-- Skip if already bound
+local function applyButtonAnimation(button)
 	if buttonStates[button] then return end
-	-- (Optional) don’t animate anything inside the RobuxStore
 	if SKIP_ROBUX_STORE_BUTTON_FX and isInsideRobuxStore(button) then return end
 
-	-- Prepare state + UIScale (safe for any Size/Offset layout)
 	local scaleObj = getUIScale(button)
 	buttonStates[button] = {
-		originalSize = button.Size, -- kept for compatibility
+		originalSize = button.Size, 
 		originalColor = getButtonColor(button),
 	}
 
@@ -1944,13 +1932,12 @@ local function applyButtonAnimation(button: GuiButton)
 	end)
 end
 
--- ----- Sunburst rotation -----
 local SUNBURST_ROTATION_SPEED = 20
-local function applySunburstEffect(guiObject: GuiObject)
+local function applySunburstEffect(guiObject)
 	sunburstObjects[guiObject] = true
 end
 
-RunService.Heartbeat:Connect(function(dt: number)
+RunService.Heartbeat:Connect(function(dt)
 	for guiObject, _ in pairs(sunburstObjects) do
 		if guiObject.Parent then
 			guiObject.Rotation += SUNBURST_ROTATION_SPEED * dt
@@ -1960,12 +1947,11 @@ RunService.Heartbeat:Connect(function(dt: number)
 	end
 end)
 
--- ----- Gentle hover bob -----
 local HOVER_OFFSET = 5
 local HOVER_DURATION = 1.5
 local HOVER_TWEEN_INFO_EFFECT = TweenInfo.new(HOVER_DURATION / 2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
 
-local function applyHoverEffect(guiObject: GuiObject)
+local function applyHoverEffect(guiObject)
 	local originalPosition = guiObject.Position
 	local targetPositionUp = originalPosition + UDim2.fromOffset(0, -HOVER_OFFSET)
 	local tweenUp = TweenService:Create(guiObject, HOVER_TWEEN_INFO_EFFECT, {Position = targetPositionUp})
@@ -1988,12 +1974,10 @@ local function applyHoverEffect(guiObject: GuiObject)
 	end)
 end
 
--- ----- Shine pings -----
 local SHINE_MIN_DELAY, SHINE_MAX_DELAY = 1, 4
 local SHINE_FADE_IN_TIME, SHINE_FADE_OUT_TIME = 0.3, 0.7
 
-local function applyShineEffect(guiObject: GuiObject)
-	if not shineTemplate then return end
+local function applyShineEffect(guiObject)
 	activeShineThreads[guiObject] = task.spawn(function()
 		while guiObject.Parent do
 			task.wait(math.random() * (SHINE_MAX_DELAY - SHINE_MIN_DELAY) + SHINE_MIN_DELAY)
@@ -2018,13 +2002,12 @@ local function applyShineEffect(guiObject: GuiObject)
 	end)
 end
 
--- ----- 3D part press effect -----
 local PRESS_DEPTH = 0.4
 local PRESS_TWEEN_INFO = TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local POP_UP_TWEEN_INFO = TweenInfo.new(1, Enum.EasingStyle.Elastic, Enum.EasingDirection.Out)
 
-local function applyPressEffect(part: BasePart)
-	if not part:IsA("BasePart") or partButtonStates[part] then return end
+local function applyPressEffect(part)
+	if partButtonStates[part] then return end
 
 	local originalPosition = part.Position
 	partButtonStates[part] = { Debounce = false, Connections = {} }
@@ -2048,20 +2031,14 @@ local function applyPressEffect(part: BasePart)
 	table.insert(partButtonStates[part].Connections, conn)
 end
 
---================================================================
--- ## MODEL HOVER EFFECT ##
---================================================================
-
 local activeModelHoverTweens = {}
 local MODEL_HOVER_OFFSET = 0.5
 local MODEL_HOVER_DURATION = 2
 local MODEL_HOVER_TWEEN_INFO = TweenInfo.new(MODEL_HOVER_DURATION / 2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
 
-local function applyModelHoverEffect(model: Model)
-	-- ## MODIFIED ## Added a 1-second delay
+local function applyModelHoverEffect(model)
 	task.wait(1)
 
-	-- Added model.Parent check in case the model is destroyed during the delay
 	if not model:IsA("Model") or not model.Parent or not model.PrimaryPart then
 		return
 	end
@@ -2088,24 +2065,19 @@ local function applyModelHoverEffect(model: Model)
 			activeModelHoverTweens[model] = nil
 		end
 	end)
-end
 
-local function cleanupModelHoverEffect(model: Model)
+	local function cleanupModelHoverEffect(model)
 	if activeModelHoverTweens[model] then
 		for _, tween in ipairs(activeModelHoverTweens[model]) do tween:Cancel() end
 		activeModelHoverTweens[model] = nil
 	end
-end
+	end
 
---================================================================
--- ## CASH ANIMATION, ITEM DAMAGE, TURRET FX, ZOMBIE HIGHLIGHTS ##
---================================================================
-
-local cashAmountLabel = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Cash"):WaitForChild("Amount")
+	local cashAmountLabel = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Cash"):WaitForChild("Amount")
 local oldCashValue = 0
-local cashAnimConnection: RBXScriptConnection?
+local cashAnimConnection
 
-local function animateCashIncrease(startValue: number, endValue: number)
+local function animateCashIncrease(startValue, endValue)
 	local duration, startTime, delta = 0.5, os.clock(), endValue - startValue
 	if cashAnimConnection then cashAnimConnection:Disconnect() end
 	cashAnimConnection = RunService.Heartbeat:Connect(function()
@@ -2116,28 +2088,36 @@ local function animateCashIncrease(startValue: number, endValue: number)
 			if cashAnimConnection then cashAnimConnection:Disconnect() cashAnimConnection = nil end
 		end
 	end)
-end
+	end
 
-task.spawn(function()
-	local leaderstats = localPlayer:WaitForChild("leaderstats")
-	local cash = leaderstats:WaitForChild("Cash")
-	oldCashValue = cash.Value
-	cashAmountLabel.Text = NumberFormatter.formatNumber(cash.Value, "$")
-	cash.Changed:Connect(function(newValue)
-		if newValue > oldCashValue then
-			animateCashIncrease(oldCashValue, newValue)
-		else
-			cashAmountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
-		end
-		oldCashValue = newValue
-	end)
+	local function onCashValueReceived(newValue)
+	newValue = tonumber(newValue) or 0
+	if newValue > oldCashValue then
+		animateCashIncrease(oldCashValue, newValue)
+	else
+		cashAmountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
+	end
+	oldCashValue = newValue
+	end
+
+	task.spawn(function()
+
+	CashUpdated.OnClientEvent:Connect(onCashValueReceived)
+
+	local success, initialCash = pcall(GetPlayerCash.InvokeServer, GetPlayerCash)
+
+	if success and typeof(initialCash) == "number" then
+		onCashValueReceived(initialCash)
+	else
+		warn("[ClientFXController] Failed to get initial cash from server.")
+		onCashValueReceived(0)
+	end
 end)
 
 local itemDamageData = {}
 
-local function updateItemColor(itemModel: Instance)
+local function updateItemColor(itemModel)
 	local data = itemDamageData[itemModel]
-	if not data then return end
 	local config = ItemConfigurations[itemModel.Name]
 	local currentHealth = itemModel:GetAttribute("Health")
 	if not (config and config.Health and typeof(currentHealth) == "number") then return end
@@ -2149,9 +2129,9 @@ local function updateItemColor(itemModel: Instance)
 			part.Color = originalColor:Lerp(Color3.new(0, 0, 0), lerpAlpha)
 		end
 	end
-end
+	end
 
-local function setupItemVFX(itemModel: Instance)
+	local function setupItemVFX(itemModel)
 	if itemDamageData[itemModel] or not itemModel:GetAttribute("IsPlacedItem") then return end
 	local config = ItemConfigurations[itemModel.Name]
 	if not (itemModel:IsA("Model") and config and config.Health) then return end
@@ -2167,18 +2147,18 @@ local function setupItemVFX(itemModel: Instance)
 	end)
 	itemDamageData[itemModel] = data
 	updateItemColor(itemModel)
-end
+	end
 
-local function cleanupItemVFX(itemModel: Instance)
+	local function cleanupItemVFX(itemModel)
 	local data = itemDamageData[itemModel]
 	if data then
 		if data.healthConnection then data.healthConnection:Disconnect() end
 		itemDamageData[itemModel] = nil
 	end
-end
+	end
 
-task.spawn(function()
-	local playerPlot: Model?
+	task.spawn(function()
+	local playerPlot
 	while not playerPlot do
 		for _, plot in ipairs(Workspace.Plots:GetChildren()) do
 			if plot:IsA("Model") and plot:GetAttribute("OwnerId") == localPlayer.UserId then
@@ -2200,7 +2180,7 @@ local turretFiredEvent = ReplicatedStorage.Events:WaitForChild("TurretFiredFX")
 local effectsFolder = Workspace:FindFirstChild("Effects") or Instance.new("Folder", Workspace)
 effectsFolder.Name = "Effects"
 
-turretFiredEvent.OnClientEvent:Connect(function(turretModel: Model, startPos: Vector3, endPos: Vector3)
+turretFiredEvent.OnClientEvent:Connect(function(turretModel, startPos, endPos)
 	local distance = (startPos - endPos).Magnitude
 	local tracer = Instance.new("Part")
 	tracer.Anchored, tracer.CanCollide, tracer.CanTouch, tracer.CastShadow = true, false, false, false
@@ -2217,7 +2197,7 @@ turretFiredEvent.OnClientEvent:Connect(function(turretModel: Model, startPos: Ve
 end)
 
 local highlightZombieEvent = ReplicatedStorage.Events:WaitForChild("HighlightZombie")
-highlightZombieEvent.OnClientEvent:Connect(function(zombieModel: Model)
+highlightZombieEvent.OnClientEvent:Connect(function(zombieModel)
 	if not zombieModel or not zombieModel.Parent then return end
 	local highlight = Instance.new("Highlight")
 	highlight.FillColor = Color3.fromRGB(255, 0, 0)
@@ -2227,11 +2207,7 @@ highlightZombieEvent.OnClientEvent:Connect(function(zombieModel: Model)
 	Debris:AddItem(highlight, 0.2)
 end)
 
---================================================================
--- ## INITIALIZATION ##
---================================================================
-
-local function setupTag(tagName: string, applyFn: (Instance) -> (), cleanupFn: (Instance) -> ())
+local function setupTag(tagName, applyFn, cleanupFn)
 	for _, instance in ipairs(CollectionService:GetTagged(tagName)) do
 		task.spawn(applyFn, instance)
 	end
@@ -2257,7 +2233,7 @@ setupTag("PartButton", applyPressEffect, function(inst)
 	end
 end)
 setupTag("ModelHoverEffect", applyModelHoverEffect, cleanupModelHoverEffect)
-
+end
 ---
 
 --- StarterPlayer.StarterPlayerScripts.ClientCrateHandler (LocalScript) ---

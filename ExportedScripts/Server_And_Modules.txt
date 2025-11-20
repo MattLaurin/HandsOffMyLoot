@@ -4738,6 +4738,7 @@ local PlayerController      : any
 local CrateController       : any
 local BlocksShopController  : any
 local GlobalShopController  : any
+local RepairSignController  : any
 
 local MAX_CRATES = 3
 
@@ -4861,35 +4862,6 @@ local function processReceipt(receiptInfo: {[string]: any})
 	end
 	-- ================================================
 
-	-- ===== Mutation skip (no marketplace elsewhere) =====
-	if productId == PRODUCT_MUTATION_SKIP then
-		if MutationController and MutationController.SkipActiveJob then
-			pcall(function() MutationController:SkipActiveJob(player) end)
-			showNotificationEvent:FireClient(player, "Mutation skipped!", "Success")
-			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
-		else
-			return Enum.ProductPurchaseDecision.NotProcessedYet
-		end
-	end
-
-	-- ===== Repair all (receipt only here) =====
-	if productId == PRODUCT_REPAIR_ALL then
-		if RepairSignController and RepairSignController.ConfirmPurchase then
-			pcall(function() RepairSignController:ConfirmPurchase(playerId) end)
-			showNotificationEvent:FireClient(player, "Repair complete!", "Success")
-			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
-		else
-			return Enum.ProductPurchaseDecision.NotProcessedYet
-		end
-	end
-
-	-- ===== Starter Pack =====
-	if productId == AdsRewards.STARTERPACK_PRODUCT_ID then
-		AdsRewards.GrantStarterPack(player)
-		if PlayerController.MarkStarterPackOwned then PlayerController:MarkStarterPackOwned(player) end
-		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
-	end
-
 	-- ===== Config-mapped products =====
 	local itemId, config, productType = getProductConfig(productId)
 	if not itemId or not config or not productType then
@@ -4908,13 +4880,14 @@ local function processReceipt(receiptInfo: {[string]: any})
 		end
 
 	elseif productType == "Cash" then
-		local leaderstats = player:FindFirstChild("leaderstats")
-		local cash = leaderstats and leaderstats:FindFirstChild("Cash")
-		if cash then
-			cash.Value += config.CashAmount
-			showNotificationEvent:FireClient(player, `You received ${NumberFormatter.formatNumber(config.CashAmount)} cash!`, "Success")
-			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
-		end
+		-- Use centralized cash handling
+		PlayerController.AddCash(player, config.CashAmount)
+		showNotificationEvent:FireClient(
+			player,
+			`You received ${NumberFormatter.formatNumber(config.CashAmount)} cash!`,
+			"Success"
+		)
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
 
 	elseif productType == "BlockOrTurret" then
 		local profile = PlayerController:GetProfile(player)
@@ -4923,7 +4896,6 @@ local function processReceipt(receiptInfo: {[string]: any})
 		inv[itemId] = (inv[itemId] or 0) + 1
 		ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, inv)
 		showNotificationEvent:FireClient(player, `Purchased {config.DisplayName}!`, "Success")
-		-- 🔔 Auto-badge for turrets/cowboys purchased via product
 		if config.Type == "Turrets" then
 			BadgeController.SyncForNewItem(player, itemId)
 		end
@@ -4948,7 +4920,6 @@ local function processReceipt(receiptInfo: {[string]: any})
 			ReplicatedStorage.Events.WeaponInventoryUpdated:FireClient(player, profile.Data.WeaponInventory)
 			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
 
-			-- Crate “skip timer” product
 		elseif config.SkipTimerProductID and productId == config.SkipTimerProductID then
 			local crate = pendingSkips[player]
 			if crate and crate.Parent then
@@ -4985,19 +4956,23 @@ local function onPurchaseRequest(player: Player, itemId: string)
 		return
 	end
 
-	local leaderstats = player:FindFirstChild("leaderstats")
-	local cash = leaderstats and leaderstats:FindFirstChild("Cash")
-	if not (cash and cash.Value >= config.Price) then
+	local currentCash = profile.Data.Cash or 0
+	if currentCash < config.Price then
 		showNotificationEvent:FireClient(player, "Not enough cash!", "Error")
 		return
 	end
 
 	while not CrateController do task.wait() end
 	if CrateController:PurchaseCrate(player, itemId) then
-		cash.Value -= config.Price
+		local ok = PlayerController.RemoveCash(player, config.Price)
+		if not ok then
+			showNotificationEvent:FireClient(player, "This crate just went out of stock!", "Error")
+			return
+		end
+
 		if not config.Unlimited then
-			local ok = GlobalShopController:ConsumeWeapons(player, itemId)
-			if not ok then
+			local consumed = GlobalShopController:ConsumeWeapons(player, itemId)
+			if not consumed then
 				showNotificationEvent:FireClient(player, "This crate just went out of stock!", "Error")
 			end
 		end
@@ -5018,7 +4993,7 @@ function ShopController:Init(controllers: {[string]: any})
 	CrateController       = controllers.CrateController
 	BlocksShopController  = controllers.BlocksShopController
 	GlobalShopController  = controllers.GlobalShopController
-	RepairSignController  = controllers.RepairSignController -- no receipt logic inside it
+	RepairSignController  = controllers.RepairSignController
 end
 
 function ShopController:Start()
