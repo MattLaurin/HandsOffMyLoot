@@ -2543,10 +2543,6 @@ function NotificationManager.show(message: string, messageType: string?)
 		elseif messageType == "Error" then
 			stroke.Color = errorStrokeColor
 			gradient.Color = errorGradient
-		elseif messageType == "Gemstone" then 
-			stroke.Color = Color3.fromRGB(73, 17, 13)
-			gradient.Color = ColorSequence.new(Color3.fromRGB(253, 13, 13), Color3.fromRGB(253, 86, 99))
-			lifetime = 5
 		elseif messageType == "Legendary" then
 			stroke.Color = legendaryStrokeColor
 			gradient.Color = legendaryGradient
@@ -6525,13 +6521,14 @@ return UpgradePlotConfig
 --!strict
 -- TopUpModule: pick nearest cash devproduct and prompt player if short on money.
 -- Non-blocking API with a callback invoked as soon as the prompt closes.
-
 local ReplicatedStorage    = game:GetService("ReplicatedStorage")
 local Players              = game:GetService("Players")
 local MarketplaceService   = game:GetService("MarketplaceService")
 
 local ModulesFolder        = ReplicatedStorage:WaitForChild("Modules")
 local WeaponConfigurations = require(ModulesFolder:WaitForChild("WeaponConfigurations"))
+-- << ADDED >>
+local Functions = ReplicatedStorage:WaitForChild("Functions")
 
 local TopUp = {}
 
@@ -6541,16 +6538,31 @@ type ResultCb = (purchased: boolean) -> ()
 local function allCashProducts(): { CashProduct }
 	local arr: { CashProduct } = {}
 	for _, entry in pairs(WeaponConfigurations.CashProducts) do
-		if typeof(entry.ProductID) == "number" and typeof(entry.CashAmount) == "number" then
+		if typeof(entry.ProductID) == "number" and typeof(entry.Amount) == "number" then
 			table.insert(arr, { ProductID = entry.ProductID, CashAmount = entry.CashAmount })
 		end
 	end
 	return arr
 end
 
+-- << NEW FUNCTION >> Get the player's current cash directly from the server
+local function getLocalBalance(p: Player): number
+	local getCashFunc = Functions:FindFirstChild("GetPlayerCash")
+	if getCashFunc and getCashFunc:IsA("RemoteFunction") then
+		local ok, cash = pcall(getCashFunc.InvokeServer, getCashFunc)
+		if ok and typeof(cash) == "number" then
+			return cash
+		end
+	end
+	-- Fallback to 0 if server can't be reached
+	return 0
+end
+
+
 function TopUp.getNearestProductId(missingAmount: number): number?
 	if typeof(missingAmount) ~= "number" or missingAmount <= 0 then return nil end
-	local bestId: number? = nil
+	local bestId: number?
+		= nil
 	local bestDiff = math.huge
 	local bestAmt  = -math.huge
 	for _, p in ipairs(allCashProducts()) do
@@ -6568,6 +6580,11 @@ end
 -- Returns: promptOpened:boolean
 -- onResult(purchased:boolean) is called as soon as the dialog closes.
 function TopUp.PromptIfShort(costOrMissing: number, balance: number?, onResult: ResultCb?): boolean
+	-- Use the server to get the current balance if not provided, since leaderstats are gone
+	if balance == nil then
+		balance = getLocalBalance(Players.LocalPlayer) -- Use the new local getter
+	end
+
 	local missing = (typeof(balance) == "number") and (costOrMissing - balance) or costOrMissing
 	if typeof(missing) ~= "number" or missing <= 0 then
 		return false
@@ -6585,7 +6602,8 @@ function TopUp.PromptIfShort(costOrMissing: number, balance: number?, onResult: 
 		return false
 	end
 
-	local conn: RBXScriptConnection? = nil
+	local conn: RBXScriptConnection?
+		= nil
 	conn = MarketplaceService.PromptProductPurchaseFinished:Connect(function(player, purchasedProductId, wasPurchased)
 		if player == lp and purchasedProductId == productId then
 			if conn then conn:Disconnect() end
@@ -6608,7 +6626,6 @@ function TopUp.PromptIfShort(costOrMissing: number, balance: number?, onResult: 
 end
 
 return TopUp
-
 ---
 
 --- ReplicatedStorage.Modules.BadgeConfigurations (ModuleScript) ---
