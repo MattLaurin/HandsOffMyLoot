@@ -2409,6 +2409,4564 @@ Extensions.Controller = Controller
 return Extensions
 ---
 
+--- ServerScriptService.Controllers.BlocksShopController (ModuleScript) ---
+--!strict
+-- BLOCKS / TURRETS CASH SHOP CONTROLLER (uses personal stocks seeded from global baseline)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local BadgeController = require(ServerScriptService.Controllers:WaitForChild("BadgeController"))
+
+local PlayerController
+local GlobalShopController
+local ShopController = {}
+
+local purchaseItemEvent = ReplicatedStorage.Events:WaitForChild("PurchaseBlockItem")
+local showNotificationEvent = ReplicatedStorage.Events:WaitForChild("ShowNotification")
+local blockInventoryUpdatedEvent = ReplicatedStorage.Events:WaitForChild("BlockInventoryUpdated")
+
+local function onPurchaseRequest(player: Player, itemId: string)
+	-- wait until controllers are injected (defensive)
+	while not GlobalShopController do task.wait() end
+	while not PlayerController do task.wait() end
+
+	local profile = PlayerController:GetProfile(player)
+	local config = ItemConfigurations[itemId]
+	if not profile or not config then return end
+	if config.Price == nil then
+		-- not a cash-sellable item in this shop
+		return
+	end
+
+	-- check personal stock (global baseline -> personal counters)
+	if not config.Unlimited then
+		local myStock = GlobalShopController:GetPlayerBlocks(player)
+		if (myStock[itemId] or 0) <= 0 then
+			showNotificationEvent:FireClient(player, "This item is out of stock!", "Error")
+			return
+		end
+	end
+
+	-- funds
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local cash = leaderstats and leaderstats:FindFirstChild("Cash")
+	if not (cash and cash.Value >= config.Price) then
+		showNotificationEvent:FireClient(player, "Not enough cash!", "Error")
+		return
+	end
+
+	-- purchase
+	cash.Value -= config.Price
+	if not config.Unlimited then
+		local ok = GlobalShopController:ConsumeBlocks(player, itemId)
+		if not ok then
+			showNotificationEvent:FireClient(player, "This item just went out of stock!", "Error")
+			return
+		end
+	end
+
+	local inv = profile.Data.BlockInventory
+	inv[itemId] = (inv[itemId] or 0) + 1
+
+	-- 🔔 Auto-award badges when buying turrets/cowboys
+	if config.Type == "Turrets" then
+		BadgeController.SyncForNewItem(player, itemId)
+	end
+
+	showNotificationEvent:FireClient(player, `Purchased {config.DisplayName}!`, "Success")
+	blockInventoryUpdatedEvent:FireClient(player, inv)
+
+	if not profile.Data.HasCompletedOnboarding and config.Type == "Turrets" then
+		ReplicatedStorage.Events.UpdateOnboardingStep:FireClient(player, "Step2_PlaceTurret")
+	end
+end
+
+function ShopController:PersonalRestock(player: Player)
+	GlobalShopController:AddPersonalBlocks(player)
+end
+
+function ShopController:Init(controllers: {[string]: any})
+	PlayerController        = controllers.PlayerController
+	GlobalShopController    = controllers.GlobalShopController
+end
+
+function ShopController:Start()
+	purchaseItemEvent.OnServerEvent:Connect(onPurchaseRequest)
+end
+
+return ShopController
+
+---
+
+--- ServerScriptService.Controllers.ShopController (ModuleScript) ---
+--[[
+	ShopController Script
+	
+	Description: Manages interactions with in-world shop trigger parts.
+	Detects when a player touches a shop part and fires a remote event
+	to that player's client, instructing it to open the correct UI frame.
+	
+	Location: ServerScriptService/Controllers
+--]]
+--!strict
+
+-- Services
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Define the Controller Module
+local ShopController = {}
+
+-- Events
+local openShopFrameEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild("OpenShopFrame")
+
+-- Configuration
+local shops = {
+	WeaponsShop = Workspace:WaitForChild("WeaponsShop"),
+	BlocksShop = Workspace:WaitForChild("BlocksShop"),
+}
+
+-- State
+local debounce = {} -- To prevent spamming the event
+
+-- This function sets up the .Touched event for a given shop part.
+local function setupShopTrigger(shopName: string, shopModel: Model)
+	local touchPart = shopModel:FindFirstChild("Touch")
+
+	if not (touchPart and touchPart:IsA("BasePart")) then
+		warn(`Shop trigger part not found for '{shopName}'. Please add a BasePart named "Touch" to the model.`)
+		return
+	end
+
+	touchPart.Touched:Connect(function(hit)
+		local character = hit.Parent
+		local player = Players:GetPlayerFromCharacter(character)
+
+		if not player then return end
+		if debounce[player] then return end
+
+		debounce[player] = true
+
+		print(`Player {player.Name} touched the {shopName} trigger.`)
+		openShopFrameEvent:FireClient(player, shopName)
+
+		task.delay(1, function()
+			debounce[player] = nil
+		end)
+	end)
+
+	--print(`Successfully set up trigger for {shopName}.`)
+end
+
+-- This method will be called by the Bootstrap script.
+function ShopController:Start()
+	for name, model in pairs(shops) do
+		setupShopTrigger(name, model)
+	end
+end
+
+return ShopController
+
+---
+
+--- ServerScriptService.Controllers.PlotController (ModuleScript) ---
+--!strict
+-- Grid unlocking system removed. Plot claim + protection model + crates + load items are kept.
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local ModelProgression = require(ReplicatedStorage.Modules.ModelProgression)
+
+-- Controllers (wired by :Init)
+local PlacementController: any
+local PlayerController: any
+local CrateController: any
+
+-- Refs
+local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
+local CRATE_MODELS = ReplicatedStorage:WaitForChild("Crates")
+local Events = ReplicatedStorage:WaitForChild("Events")
+local ResetPlotEvent = Events:WaitForChild("ResetPlot")
+local UpdateProtectionModelFX = Events:WaitForChild("UpdateProtectionModelFX")
+
+local function spawnPromotionalCrate(plot: Model)
+	local spawnPart = plot:FindFirstChild("RobuxCrateSpawn"); if not spawnPart then return end
+	local tpl = CRATE_MODELS:FindFirstChild("GoldCrate"); if not (tpl and tpl.PrimaryPart) then return end
+	local m = tpl:Clone(); m.Name = "PromotionalGoldCrate"
+	m:SetPrimaryPartCFrame(spawnPart.CFrame * CFrame.new(0,3,0))
+	m.Parent = plot
+end
+
+local PlotController = {}
+
+function PlotController:UpdateProtectionModel(player: Player, plot: Model)
+	local profile = PlayerController:GetProfile(player); if not profile then return end
+	local modelIndex = profile.Data.UnlockedModelIndex
+	local modelData = ModelProgression[modelIndex]; if not modelData then return end
+
+	local ph = plot:FindFirstChild("PlotHealth"); if not ph then return end
+	for _, ch in ipairs(ph:GetChildren()) do if ch:IsA("Model") then ch:Destroy() end end
+
+	local tpl = ReplicatedStorage.Models:FindFirstChild(modelData.ModelName)
+	if tpl then
+		local newM = tpl:Clone()
+		if newM.PrimaryPart then newM:SetPrimaryPartCFrame(ph.CFrame) end
+		newM.Parent = ph
+	end
+	ph:SetAttribute("Health", modelData.PlotHealth)
+	UpdateProtectionModelFX:FireClient(player, modelData.ImageId, modelData.PlotHealth, modelIndex)
+end
+
+-- Plot claiming / lifecycle
+local function findAvailablePlot(): Model?
+	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do
+		if plot:IsA("Model") and not plot:GetAttribute("OwnerId") then return plot end
+	end
+	return nil
+end
+
+function PlotController:OnPlayerProfileLoaded(player: Player)
+	while not PlacementController or not CrateController or not PlayerController do task.wait() end
+
+	local plot = findAvailablePlot()
+	if plot then
+		plot:SetAttribute("OwnerId", player.UserId)
+		player:SetAttribute("PlotNumber", tonumber(string.match(plot.Name, "%d+")))
+
+		local ph = plot:FindFirstChild("PlotHealth")
+		if ph then CollectionService:AddTag(ph, "Damageable") end
+
+		spawnPromotionalCrate(plot)
+		self:UpdateProtectionModel(player, plot)
+
+		PlacementController:LoadPlacedItems(player, plot)
+		CrateController:LoadPlayerCrates(player, plot)
+
+		local spawnLocation = plot:FindFirstChild("SpawnPart")
+		if spawnLocation and spawnLocation:IsA("SpawnLocation") then
+			player.RespawnLocation = spawnLocation
+			if player.Character then player.Character:SetPrimaryPartCFrame(spawnLocation.CFrame * CFrame.new(0,3,0)) end
+		end
+	else
+		player:Kick("Sorry, all plots are currently taken! Please try a different server.")
+	end
+end
+
+local function onPlayerRemoving(player: Player)
+	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			player.RespawnLocation = nil
+			local ph = plot:FindFirstChild("PlotHealth"); if ph then CollectionService:RemoveTag(ph, "Damageable") end
+			plot:SetAttribute("OwnerId", nil)
+
+			local toDestroy: {Instance} = {}
+			for _, ch in ipairs(plot:GetChildren()) do
+				if ch:GetAttribute("IsPlacedItem") == true or ch.Name == "PromotionalGoldCrate" then table.insert(toDestroy, ch) end
+			end
+			local crateFolder = plot:FindFirstChild("Crate")
+			if crateFolder then
+				for _, m in ipairs(crateFolder:GetChildren()) do if m:IsA("Model") then table.insert(toDestroy, m) end end
+			end
+			local pol = plot:FindFirstChild("PlotHealth")
+			if pol then for _, m in ipairs(pol:GetChildren()) do if m:IsA("Model") then table.insert(toDestroy, m) end end end
+			for _, inst in ipairs(toDestroy) do inst:Destroy() end
+			return
+		end
+	end
+end
+
+local function setupPlot(plot: Model)
+	if not plot:IsA("Model") then return end
+	plot:SetAttribute("OwnerId", nil)
+end
+
+function PlotController:Init(controllers: {[string]: any})
+	PlacementController = controllers.PlacementController
+	PlayerController = controllers.PlayerController
+	CrateController = controllers.CrateController
+end
+
+function PlotController:Start()
+	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do setupPlot(plot) end
+	PLOTS_FOLDER.ChildAdded:Connect(setupPlot)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+	Players.PlayerAdded:Connect(function(player)
+		player.CharacterAdded:Connect(function(character)
+			task.wait(0.5)
+			local n = player:GetAttribute("PlotNumber"); if not n then return end
+			local plot = Workspace.Plots:FindFirstChild("Plot" .. tostring(n)); if not plot then return end
+			local spawnPart = plot:FindFirstChild("SpawnPart")
+			if spawnPart and character:FindFirstChild("HumanoidRootPart") then
+				if spawnPart:IsA("SpawnLocation") then player.RespawnLocation = spawnPart end
+				character:SetPrimaryPartCFrame(spawnPart.CFrame * CFrame.new(0,3,0))
+			end
+		end)
+	end)
+
+	ResetPlotEvent.OnServerEvent:Connect(function(player)
+		PlacementController:ResetPlotItems(player)
+	end)
+end
+
+return PlotController
+
+---
+
+--- ServerScriptService.Controllers.PlayerController (ModuleScript) ---
+--!strict
+
+local Players = game:GetService("Players")
+local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local ProfileService = require(ServerScriptService.Modules:WaitForChild("ProfileService"))
+local BadgeController = require(game.ServerScriptService.Controllers:WaitForChild("BadgeController"))
+
+local PlayerController = {}
+
+local GAMEPASS_ID_FASTFORWARD = 1542612384
+local GAMEPASS_ID_EXTRA_CRATES = 1572988194
+local STARTERPACK_OFFER_SECONDS = 172740
+
+local ProfileTemplate = {
+	Cash = 250,
+	Strength = 0,
+	BlockInventory = {},
+	PlacedItems = {},
+	HighestWave = 0,
+	StartingWave = 1,
+	UnlockedModelIndex = 1,
+	Crates = {},
+	WeaponInventory = { "Heizer" },
+	LastEquippedWeapon = "Heizer",
+	HasCompletedOnboarding = false,
+
+	BlockShopStock = {},
+	WeaponShopStock = {},
+
+	HasClaimedGroupReward = false,
+
+	StarterPackOwned = false,
+	Minigun = false,
+	StarterPackOfferEndsAt = 0,
+
+	FastForwardUnlocked = false,
+
+	PlotUpgrades = {
+		TurretLimitTier = 1,
+		TurretHpTier = 1,
+		BlockLimitTier = 1,
+		BlockHpTier = 1,
+	},
+
+	RobuxSpentTotal = 0,
+
+	Settings = {
+		WeaponSounds = true,
+		Music = true,
+		Performance = false,
+	},
+
+	ShopState = {
+		Bucket = 0,
+		Blocks = {},
+		Weapons = {},
+	},
+
+	Gemstone = 0, 
+	GuardsInventory = {},
+	ActiveMutationJob = nil,
+	OwnsExtraCrateGP = false,
+
+	LuckBoostUntil = 0, 
+	UnlockedTiles = {},
+	HasAppliedTileMigration = false,
+
+	DailyReward = {
+		lastDayIndex = 0,
+		streak = 0,
+		lastClaimAt = 0,
+	},
+}
+
+local GameProfileStore = ProfileService.New("LiveData", ProfileTemplate)
+local _profiles: {[Player]: any} = {}
+local _controllers = {}
+
+local _remotes: {[string]: any} = {}
+
+--------------------------
+-- CORE PROFILE HANDLING
+--------------------------
+
+function PlayerController:GetProfile(player: Player)
+	return _profiles[player]
+end
+
+
+function PlayerController:SetupSharedInstances() end
+
+local function ensureEvents()
+	local events = ReplicatedStorage:FindFirstChild("Events")
+	if not events then
+		events = Instance.new("Folder")
+		events.Name = "Events"
+		events.Parent = ReplicatedStorage
+	end
+
+	local functions = ReplicatedStorage:FindFirstChild("Functions")
+	if not functions then
+		functions = Instance.new("Folder")
+		functions.Name = "Functions"
+		functions.Parent = ReplicatedStorage
+	end
+
+	local function ensureRemoteEvent(name: string, parent: Instance): RemoteEvent
+		local ev = parent:FindFirstChild(name) :: RemoteEvent?
+		if not ev then
+			ev = Instance.new("RemoteEvent")
+			ev.Name = name
+			ev.Parent = parent
+		end
+		_remotes[name] = ev
+		return ev
+	end
+	local function ensureRemoteFunction(name: string, parent: Instance): RemoteFunction
+		local fn = parent:FindFirstChild(name) :: RemoteFunction?
+		if not fn then
+			fn = Instance.new("RemoteFunction")
+			fn.Name = name
+			fn.Parent = parent
+		end
+		_remotes[name] = fn
+		return fn
+	end
+
+	ensureRemoteEvent("CashUpdated", events)
+	ensureRemoteFunction("GetPlayerCash", functions)
+
+	ensureRemoteEvent("StarterPackOwned", events)
+	ensureRemoteEvent("StarterPackOfferEndsAtUpdated", events)
+	ensureRemoteEvent("FastForwardUnlocked", events)
+	ensureRemoteEvent("RefreshFastForwardOwnership", events)
+
+	ensureRemoteFunction("GetStarterPackOwned", functions)
+	ensureRemoteFunction("GetStarterPackOfferEndsAt", functions)
+
+	ensureRemoteFunction("GetPlayerSettings", events)
+	ensureRemoteEvent("SavePlayerSettings", events)
+
+	ensureRemoteEvent("WeaponInventoryUpdated", events)
+	ensureRemoteEvent("BlockInventoryUpdated", events)
+	ensureRemoteEvent("CrateDataUpdated", events)
+	ensureRemoteEvent("PlotUpgradesUpdated", events)
+	ensureRemoteEvent("StartOnboarding", events)
+
+	ensureRemoteEvent("GuardsInventoryUpdated", events)
+	ensureRemoteEvent("TileUnlocked", events)
+	ensureRemoteEvent("PlotResetNotice", events)
+
+	return events
+end
+
+local function fireOwned(player: Player)
+	local ev = _remotes["FastForwardUnlocked"]
+	if ev and ev:IsA("RemoteEvent") then
+		ev:FireClient(player)
+	end
+end
+
+local function checkAndApplyGamePass(player: Player, profile: any)
+	local ok, owns = pcall(function()
+		return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID_FASTFORWARD)
+	end)
+	if ok and owns then
+		if not profile.Data.FastForwardUnlocked then
+			profile.Data.FastForwardUnlocked = true
+		end
+		fireOwned(player)
+	end
+end
+
+local function onPlayerAdded(player: Player)
+	local profileKey = tostring(player.UserId)
+	local profile = GameProfileStore:StartSessionAsync(profileKey, { Steal = true })
+	if not profile then
+		player:Kick("Failed to load your data. Please rejoin.")
+		return
+	end
+
+	profile:Reconcile()
+	profile:AddUserId(player.UserId)
+	_profiles[player] = profile
+
+	do
+		local ok, owns = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, player.UserId, GAMEPASS_ID_EXTRA_CRATES)
+		owns = ok and owns == true
+		profile.Data.OwnsExtraCrateGP = owns
+		player:SetAttribute("HasCrateSlotsPass", owns)
+	end
+
+
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+
+	local cash = Instance.new("IntValue")
+	cash.Name = "Cash"
+	cash.Value = profile.Data.Cash
+	cash.Parent = leaderstats
+
+	local highestWave = Instance.new("IntValue")
+	highestWave.Name = "Highest Wave"
+	highestWave.Value = profile.Data.HighestWave
+	highestWave.Parent = leaderstats
+
+	player:SetAttribute("Gemstone", profile.Data.Gemstone or 0)
+
+
+	if not profile.Data.StarterPackOwned and (profile.Data.StarterPackOfferEndsAt or 0) == 0 then
+		profile.Data.StarterPackOfferEndsAt = os.time() + STARTERPACK_OFFER_SECONDS
+	end
+
+	if _remotes["CashUpdated"] then
+		_remotes["CashUpdated"]:FireClient(player, profile.Data.Cash)
+	end
+
+
+	if profile.Data.LastEquippedWeapon then
+		player:SetAttribute("LastEquippedWeapon", profile.Data.LastEquippedWeapon)
+	end
+
+	do
+		local s = profile.Data.Settings or {}
+		local ws = (typeof(s.WeaponSounds) == "boolean") and s.WeaponSounds or true
+		local mu = (typeof(s.Music) == "boolean") and s.Music or true
+		local pf = (typeof(s.Performance) == "boolean") and s.Performance or false
+		player:SetAttribute("Setting_WeaponSounds", ws)
+		player:SetAttribute("Setting_Music", mu)
+		player:SetAttribute("Setting_PerformanceMode", pf)
+
+		BadgeController.SyncFor(player, profile.Data)
+	end
+
+	_remotes["WeaponInventoryUpdated"]:FireClient(player, profile.Data.WeaponInventory)
+	_remotes["BlockInventoryUpdated"]:FireClient(player, profile.Data.BlockInventory)
+	_remotes["CrateDataUpdated"]:FireClient(player, profile.Data.Crates)
+	_remotes["PlotUpgradesUpdated"]:FireClient(player, profile.Data.PlotUpgrades)
+
+	local gi = _remotes["GuardsInventoryUpdated"]
+	if gi and gi:IsA("RemoteEvent") then gi:FireClient(player, profile.Data.GuardsInventory) end
+
+
+	if _controllers.GlobalShopController then
+		_controllers.GlobalShopController:GetPlayerBlocks(player)
+		_controllers.GlobalShopController:GetPlayerWeapons(player)
+	end
+
+	checkAndApplyGamePass(player, profile)
+
+	local offerEv = _remotes["StarterPackOfferEndsAtUpdated"]
+	if offerEv and offerEv:IsA("RemoteEvent") then
+		offerEv:FireClient(player, profile.Data.StarterPackOfferEndsAt or 0)
+	end
+	if profile.Data.StarterPackOwned then
+		local ownedEv = _remotes["StarterPackOwned"]
+		if ownedEv and ownedEv:IsA("RemoteEvent") then ownedEv:FireClient(player) end
+	end
+
+	if not profile.Data.HasCompletedOnboarding then
+		_remotes["StartOnboarding"]:FireClient(player)
+	end
+
+	if _controllers.PlotController and _controllers.PlotController.OnPlayerProfileLoaded then
+		_controllers.PlotController:OnPlayerProfileLoaded(player)
+	end
+
+	print(`Player {player.Name} joined and data was loaded successfully.`)
+end
+
+local function onPlayerRemoving(player: Player)
+	local profile = _profiles[player]
+	if profile then
+		profile:EndSession()
+		_profiles[player] = nil
+		print(`Player {player.Name} left. Data session ended.`)
+	end
+end
+
+--------------------------
+-- NEW CENTRALIZED CASH FUNCTIONS
+--------------------------
+
+local function syncLeaderstats(player: Player, cashValue: number)
+	local ls = player:FindFirstChild("leaderstats")
+	local cash = ls and ls:FindFirstChild("Cash")
+	if cash and cash:IsA("IntValue") then
+		cash.Value = cashValue
+	end
+end
+
+function PlayerController.AddCash(player: Player, amount: number)
+	local profile = PlayerController:GetProfile(player)
+	amount = tonumber(amount) or 0
+	if not profile or amount <= 0 then return end
+
+	local newCash = (profile.Data.Cash or 0) + amount
+	profile.Data.Cash = newCash
+	profile:Save()
+
+	syncLeaderstats(player, newCash)
+
+	if _remotes["CashUpdated"] then
+		_remotes["CashUpdated"]:FireClient(player, newCash)
+	end
+end
+
+function PlayerController.RemoveCash(player: Player, amount: number): boolean
+	local profile = PlayerController:GetProfile(player)
+	amount = tonumber(amount) or 0
+	if not profile or amount <= 0 then return false end
+
+	if (profile.Data.Cash or 0) >= amount then
+		local newCash = profile.Data.Cash - amount
+
+		profile.Data.Cash = newCash
+		profile:Save()
+
+		syncLeaderstats(player, newCash)
+
+		if _remotes["CashUpdated"] then
+			_remotes["CashUpdated"]:FireClient(player, newCash)
+		end
+		return true
+	end
+
+	return false
+end
+
+local function onPlayerCashRequested(player: Player): number?
+	local profile = PlayerController:GetProfile(player)
+	if profile then
+		return profile.Data.Cash
+	end
+	return nil
+end
+
+--------------------------
+-- GEMSTONE FUNCTIONS (RETAINED DATA ONLY)
+--------------------------
+
+function PlayerController.AddGems(player: Player, amount: number)
+	amount = tonumber(amount) or 0
+	if amount <= 0 then return end
+	local profile = _profiles[player]; if not profile then return end
+
+	profile.Data.Gemstone = (profile.Data.Gemstone or 0) + amount
+	player:SetAttribute("Gemstone", profile.Data.Gemstone)
+end
+
+
+function PlayerController.GetGems(player: Player): number
+	local profile = _profiles[player]
+	if not profile then return 0 end
+	return tonumber(profile.Data.Gemstone) or 0
+end
+
+function PlayerController._SetGemsAbsolute(player: Player, newAmount: number)
+	newAmount = math.max(0, math.floor(tonumber(newAmount) or 0))
+	local profile = _profiles[player]; if not profile then return end
+
+	profile.Data.Gemstone = newAmount
+	player:SetAttribute("Gemstone", newAmount)
+end
+
+
+function PlayerController.TrySpendGems(player: Player, cost: number): boolean
+	cost = math.max(0, math.floor(tonumber(cost) or 0))
+	if cost <= 0 then return true end
+
+	local have = PlayerController.GetGems(player)
+	if have < cost then return false end
+
+	PlayerController._SetGemsAbsolute(player, have - cost)
+	return true
+end
+
+
+--------------------------
+-- INITIALIZATION
+--------------------------
+
+function PlayerController:Init(controllers: {[string]: any})
+	ensureEvents() 
+
+	_controllers = controllers
+
+	if _remotes["GetPlayerCash"] then
+		_remotes["GetPlayerCash"].OnServerInvoke = onPlayerCashRequested
+	end
+end
+
+function PlayerController:Start()
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+	local refresh = _remotes["RefreshFastForwardOwnership"]
+	if refresh and refresh:IsA("RemoteEvent") then
+		refresh.OnServerEvent:Connect(function(player: Player)
+			local profile = _profiles[player]
+			if not profile then return end
+			checkAndApplyGamePass(player, profile)
+		end)
+	end
+
+	local defaults = { WeaponSounds = true, Music = true, Performance = false }
+	local function sanitize(t)
+		if typeof(t) ~= "table" then return nil end
+		local ws, mu, pf = t.WeaponSounds, t.Music, t.Performance
+		if typeof(ws) ~= "boolean" or typeof(mu) ~= "boolean" or typeof(pf) ~= "boolean" then return nil end
+		return { WeaponSounds = ws, Music = mu, Performance = pf }
+	end
+
+	local getSettingsFn = _remotes["GetPlayerSettings"]
+	if getSettingsFn and getSettingsFn:IsA("RemoteFunction") then
+		getSettingsFn.OnServerInvoke = function(plr: Player)
+			local p = _profiles[plr]
+			while not p do task.wait(); p = _profiles[plr] end
+			p.Data.Settings = p.Data.Settings or table.clone(defaults)
+			return p.Data.Settings
+		end
+	end
+
+	local saveSettingsEv = _remotes["SavePlayerSettings"]
+	if saveSettingsEv and saveSettingsEv:IsA("RemoteEvent") then
+		saveSettingsEv.OnServerEvent:Connect(function(plr: Player, payload)
+			local p = _profiles[plr]
+			if not p then return end
+			local v = sanitize(payload)
+			if not v then return end
+			p.Data.Settings = v
+			plr:SetAttribute("Setting_WeaponSounds", v.WeaponSounds)
+			plr:SetAttribute("Setting_Music", v.Music)
+			plr:SetAttribute("Setting_PerformanceMode", v.Performance)
+		end)
+	end
+
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, gamePassId: number, wasPurchased: boolean)
+		if gamePassId ~= GAMEPASS_ID_EXTRA_CRATES then return end
+		local p = _profiles[player]
+		if not p then return end
+		if wasPurchased then
+			p.Data.OwnsExtraCrateGP = true
+			player:SetAttribute("HasCrateSlotsPass", true)
+		end
+	end)
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		task.spawn(onPlayerAdded, plr)
+	end
+end
+
+function PlayerController:MarkStarterPackOwned(player: Player)
+	local profile = _profiles[player]
+	if not profile then return end
+	if profile.Data.StarterPackOwned then return end
+	profile.Data.StarterPackOwned = true
+	local ev = _remotes["StarterPackOwned"]
+	if ev and ev:IsA("RemoteEvent") then ev:FireClient(player) end
+end
+
+function PlayerController:GrantFastForward(player: Player)
+	local profile = _profiles[player]
+	if not profile then return end
+	if profile.Data.FastForwardUnlocked then return end
+	profile.Data.FastForwardUnlocked = true
+	fireOwned(player)
+end
+
+function PlayerController:GetPlotUpgrades(player: Player)
+	local profile = _profiles[player]
+	if not profile then return nil end
+	return profile.Data.PlotUpgrades
+end
+
+return PlayerController
+---
+
+--- ServerScriptService.Controllers.PlacementController (ModuleScript) ---
+--!strict
+-- Server placement/removal with contiguous stacking and anti-floating TURRETS only.
+-- Rules:
+--  - Blocks stack on blocks up to MAX_HEIGHT (never on a turret), must TOUCH valid support at placement time.
+--  - Turrets can sit on plot base or on a block (never on a turret), must TOUCH valid support.
+--  - If support is removed:
+--      * Blocks: do NOTHING (they can float).
+--      * Turrets: remove if unsupported (refund on player removals; no refund on NPC).
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+
+-- Controllers (wired by :Init)
+local PlayerController: any
+local TurretController: any
+
+-- Events
+local EventsFolder = ReplicatedStorage:WaitForChild("Events")
+local PlaceItemEvent = EventsFolder:WaitForChild("PlaceItemEvent")
+local RemoveItemEvent = EventsFolder:WaitForChild("RemoveItemEvent")
+local ItemPlacedFX = EventsFolder:WaitForChild("ItemPlacedFX")
+local ItemRemovedFX = EventsFolder:WaitForChild("ItemRemovedFX")
+
+local PlacementDenied = EventsFolder:FindFirstChild("PlacementDenied")
+if not PlacementDenied then
+	local e = Instance.new("RemoteEvent")
+	e.Name = "PlacementDenied"
+	e.Parent = EventsFolder
+	PlacementDenied = e
+end
+
+local BLOCKS_MODELS = ReplicatedStorage:WaitForChild("Blocks")
+local TURRETS_MODELS = ReplicatedStorage:WaitForChild("Turrets")
+
+local PlacementController = {}
+local placementDebounce: {[Player]: boolean} = {}
+
+-- ====== CONFIG ======
+local MAX_HEIGHT = 4 -- contiguous blocks from base
+local EPS = 0.05
+
+-- ====== Utilities ======
+local function getModelTemplate(itemId: string)
+	local cfg = ItemConfigurations[itemId]
+	if not cfg then return nil end
+	if cfg.Type == "Blocks" then return BLOCKS_MODELS:FindFirstChild(itemId) end
+	if cfg.Type == "Turrets" then return TURRETS_MODELS:FindFirstChild(itemId) end
+	return nil
+end
+
+local function getPlacementBox(model: Model): BasePart?
+	local pb = model:FindFirstChild("PlacementBox")
+	return (pb and pb:IsA("BasePart")) and pb or nil
+end
+
+local function isBlock(itemId: string): boolean
+	local cfg = ItemConfigurations[itemId]
+	return (cfg and cfg.Type == "Blocks") == true
+end
+
+local function isTurret(itemId: string): boolean
+	local cfg = ItemConfigurations[itemId]
+	return (cfg and cfg.Type == "Turrets") == true
+end
+
+local function cframeToPositionTable(cf: CFrame)
+	local _, ry, _ = cf:ToOrientation()
+	return {cf.X, cf.Y, cf.Z, math.deg(ry)}
+end
+
+local function positionTableToCFrame(pos: {number})
+	return CFrame.new(pos[1], pos[2], pos[3]) * CFrame.Angles(0, math.rad(pos[4]), 0)
+end
+
+local function baseTopY(plot: Model): number
+	local base = (plot and plot:FindFirstChild("Base")) :: BasePart?
+	return base and (base.Position.Y + base.Size.Y/2) or 0
+end
+
+local function fitsXZ(pb: BasePart, xz: Vector3, footprint: Vector3): boolean
+	local dx = math.abs(pb.Position.X - xz.X)
+	local dz = math.abs(pb.Position.Z - xz.Z)
+	return (dx <= math.max(pb.Size.X, footprint.X) / 2 + EPS)
+		and (dz <= math.max(pb.Size.Z, footprint.Z) / 2 + EPS)
+end
+
+-- Find touching support below bottomY (must be top face within EPS)
+local function findTouchingSupportBelow(plot: Model, xz: Vector3, footprint: Vector3, bottomY: number): (Model?, BasePart?, number)
+	local bestModel: Model? = nil
+	local bestPB: BasePart? = nil
+	local bestTopY = -math.huge
+	for _, ch in ipairs(plot:GetChildren()) do
+		if not CollectionService:HasTag(ch, "PlacedItem") then continue end
+		local pb = ch:FindFirstChild("PlacementBox")
+		if not (pb and pb:IsA("BasePart")) then continue end
+		if not fitsXZ(pb, xz, footprint) then continue end
+
+		local topY = pb.Position.Y + pb.Size.Y/2
+		if topY <= (bottomY + EPS) and math.abs(bottomY - topY) <= (EPS * 2) and topY > bestTopY then
+			bestTopY = topY
+			bestModel = ch
+			bestPB = pb
+		end
+	end
+	return bestModel, bestPB, bestTopY
+end
+
+-- Count contiguous blocks from base up to (and including) 'startModel' (0 if touching base)
+local function countContiguousHeightFromBase(plot: Model, startModel: Model?, startPB: BasePart?, baseTop: number, xz: Vector3, footprint: Vector3): number
+	if not startModel then
+		return 0
+	end
+	local cfg = ItemConfigurations[startModel.Name]
+	if not (cfg and cfg.Type == "Blocks") then
+		return 0
+	end
+
+	local count = 1
+	local currentModel = startModel
+	local currentPB = startPB
+	while currentModel and currentPB do
+		local currentBottomY = currentPB.Position.Y - currentPB.Size.Y/2
+		if math.abs(currentBottomY - baseTop) <= (EPS * 2) then
+			return count
+		end
+		-- find touching block immediately below
+		local foundBelowModel: Model? = nil
+		local foundBelowPB: BasePart? = nil
+		local foundBelowTopY = -math.huge
+		for _, ch in ipairs(plot:GetChildren()) do
+			if not CollectionService:HasTag(ch, "PlacedItem") then continue end
+			if ch == currentModel then continue end
+			local pb = ch:FindFirstChild("PlacementBox")
+			if not (pb and pb:IsA("BasePart")) then continue end
+			if not fitsXZ(pb, xz, footprint) then continue end
+			local cfgB = ItemConfigurations[ch.Name]
+			if not (cfgB and cfgB.Type == "Blocks") then continue end
+			local topY = pb.Position.Y + pb.Size.Y/2
+			if math.abs(currentBottomY - topY) <= (EPS * 2) and topY > foundBelowTopY then
+				foundBelowTopY = topY
+				foundBelowModel = ch
+				foundBelowPB = pb
+			end
+		end
+		if foundBelowModel and foundBelowPB then
+			count += 1
+			currentModel = foundBelowModel
+			currentPB = foundBelowPB
+		else
+			-- chain broken (not attached to base) -> treat as invalid (infinite height)
+			return math.huge
+		end
+	end
+	return count
+end
+
+-- Is a turret model supported (by base or a block) right under its bottom?
+local function turretIsSupported(turret: Model, plot: Model): boolean
+	local tPB = getPlacementBox(turret); if not tPB then return false end
+	local bottomY = tPB.Position.Y - tPB.Size.Y/2
+	local base = plot:FindFirstChild("Base")
+	if base and base:IsA("BasePart") then
+		local baseTop = base.Position.Y + base.Size.Y/2
+		if math.abs(bottomY - baseTop) <= (EPS * 2) then
+			return true
+		end
+	end
+	for _, ch in ipairs(plot:GetChildren()) do
+		if not CollectionService:HasTag(ch, "PlacedItem") then continue end
+		if ch == turret then continue end
+		local cfg = ItemConfigurations[ch.Name]
+		if not (cfg and cfg.Type == "Blocks") then continue end
+		local pb = getPlacementBox(ch); if not pb then continue end
+		if not fitsXZ(pb, tPB.Position, tPB.Size) then continue end
+		local topY = pb.Position.Y + pb.Size.Y/2
+		if math.abs(bottomY - topY) <= (EPS * 2) then
+			return true
+		end
+	end
+	return false
+end
+
+-- ====== Validation ======
+
+local function validatePlacement(plot: Model, itemId: string, targetCFrame: CFrame): (boolean, string?)
+	local placingBlock = isBlock(itemId)
+	local placingTurret = isTurret(itemId)
+	if not (placingBlock or placingTurret) then return false, "Unknown item." end
+
+	local tpl = getModelTemplate(itemId); if not tpl then return false, "No template." end
+	local pb = getPlacementBox(tpl); if not pb then return false, "Missing PlacementBox." end
+
+	local pos = targetCFrame.Position
+	local xz = Vector3.new(pos.X, 0, pos.Z)
+	local bottomY = pos.Y - tpl.PrimaryPart.Size.Y/2
+	local baseTop = baseTopY(plot)
+
+	-- Must TOUCH valid support: base OR touching block under
+	local supportModel, supportPB, _ = findTouchingSupportBelow(plot, xz, pb.Size, bottomY)
+	local touchingBase = math.abs(bottomY - baseTop) <= (EPS * 2)
+
+	if not touchingBase and not supportModel then
+		return false, "Must be on base or a block."
+	end
+
+	-- never sit on turret
+	if supportModel then
+		local cfgS = ItemConfigurations[supportModel.Name]
+		if cfgS and cfgS.Type == "Turrets" then
+			return false, placingBlock and "Cannot place a block on a turret." or "Cannot place a turret on a turret."
+		end
+	end
+
+	-- height cap uses CONTIGUOUS chain from base
+	if placingBlock then
+		local contiguous = countContiguousHeightFromBase(plot, supportModel, supportPB, baseTop, xz, pb.Size)
+		if (contiguous + 1) > MAX_HEIGHT then
+			return false, "Max block height reached."
+		end
+	elseif placingTurret then
+		-- touching support is already enforced; turret cannot sit on turret handled above
+	end
+
+	return true, nil
+end
+
+local function sideOverlapDenied(plot: Model, tpl: Model, targetCFrame: CFrame, supportModel: Model?)
+	local placementBox = getPlacementBox(tpl); if not placementBox then return true end
+	local temp = placementBox:Clone()
+	temp.CFrame = targetCFrame * tpl.PrimaryPart.CFrame:ToObjectSpace(placementBox.CFrame)
+	temp.Parent = Workspace
+	task.wait()
+
+	local deny = false
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = { temp }
+	for _, part in ipairs(Workspace:GetPartsInPart(temp, params)) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and model.Parent == plot and CollectionService:HasTag(model, "PlacedItem") then
+			-- allow small contact with the one directly below
+			if not (supportModel and model == supportModel) then
+				deny = true
+				break
+			end
+		end
+	end
+	temp:Destroy()
+	return deny
+end
+
+-- ====== Core ======
+
+function PlacementController:LoadPlacedItems(player: Player, plot: Model)
+	local profile = PlayerController:GetProfile(player)
+	if not (profile and profile.Data.PlacedItems) then return end
+
+	local plotBase = plot:FindFirstChild("Base")
+	if not plotBase then warn("LoadPlacedItems: plot missing Base"); return end
+
+	for _, data in ipairs(profile.Data.PlacedItems) do
+		local tpl = getModelTemplate(data.ItemId); if not tpl then continue end
+		local newItem = tpl:Clone()
+		local cfg = ItemConfigurations[newItem.Name]
+
+		newItem:SetAttribute("UniqueId", data.UniqueId)
+		newItem:SetAttribute("IsPlacedItem", true)
+		if cfg and cfg.Health then newItem:SetAttribute("Health", cfg.Health) end
+
+		local rel = positionTableToCFrame(data.Position)
+		local worldCF = plotBase.CFrame * rel
+
+		newItem:SetPrimaryPartCFrame(worldCF)
+		newItem.Parent = plot
+		CollectionService:AddTag(newItem, "PlacedItem")
+		CollectionService:AddTag(newItem, "Damageable")
+
+		if cfg and cfg.Type == "Turrets" then
+			TurretController:AddTurret(newItem, plot)
+		end
+	end
+end
+
+-- Reset (returns all items to inventory)
+function PlacementController:ResetPlotItems(player: Player)
+	local profile = PlayerController:GetProfile(player); if not profile then return end
+
+	local playerPlot: Model?
+	for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then playerPlot = plot; break end
+	end
+	if not playerPlot then return end
+
+	local items: {Model} = {}
+	for _, ch in ipairs(playerPlot:GetChildren()) do
+		if CollectionService:HasTag(ch, "PlacedItem") then table.insert(items, ch) end
+	end
+	if #items == 0 then return end
+
+	for _, m in ipairs(items) do
+		local id = m.Name
+		local uid = m:GetAttribute("UniqueId")
+		local cfg = ItemConfigurations[id]
+
+		-- remove data entry
+		for i = #profile.Data.PlacedItems, 1, -1 do
+			if profile.Data.PlacedItems[i].UniqueId == uid then table.remove(profile.Data.PlacedItems, i); break end
+		end
+
+		-- refund
+		profile.Data.BlockInventory[id] = (profile.Data.BlockInventory[id] or 0) + 1
+
+		-- unregister turret
+		if cfg and cfg.Type == "Turrets" then TurretController:RemoveTurret(m) end
+		m:Destroy()
+	end
+
+	ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, profile.Data.BlockInventory)
+	ItemRemovedFX:FireClient(player)
+end
+
+local function denyPlacement(player: Player, reason: string)
+	PlacementDenied:FireClient(player, reason)
+end
+
+local function onPlaceItem(player: Player, itemId: string, targetCFrame: CFrame, plot: Model)
+	if placementDebounce[player] then return end
+	placementDebounce[player] = true
+
+	local profile = PlayerController:GetProfile(player)
+	local cfg = ItemConfigurations[itemId]
+	if not (profile and cfg and plot and plot:GetAttribute("OwnerId") == player.UserId) then
+		placementDebounce[player] = nil
+		return
+	end
+
+	-- Inventory check
+	local owned = profile.Data.BlockInventory[itemId] or 0
+	if owned <= 0 then placementDebounce[player] = nil; return end
+
+	local tpl = getModelTemplate(itemId)
+	if not (tpl and tpl.PrimaryPart) then placementDebounce[player] = nil; return end
+
+	-- Stacking rules (contiguous + touching)
+	local okStack, why = validatePlacement(plot, itemId, targetCFrame)
+	if not okStack then
+		placementDebounce[player] = nil
+		denyPlacement(player, why or "Invalid placement.")
+		return
+	end
+
+	-- Overlap check (allow side contact with the touching support only)
+	local pb = getPlacementBox(tpl)
+	local supportModel: Model? = nil
+	if pb then
+		local xz = Vector3.new(targetCFrame.X, 0, targetCFrame.Z)
+		local bottomY = targetCFrame.Y - tpl.PrimaryPart.Size.Y/2
+		local sm = select(1, findTouchingSupportBelow(plot, xz, pb.Size, bottomY))
+		supportModel = sm
+	end
+	if sideOverlapDenied(plot, tpl, targetCFrame, supportModel) then
+		placementDebounce[player] = nil
+		denyPlacement(player, "Not enough space!")
+		return
+	end
+
+	-- Consume + save
+	profile.Data.BlockInventory[itemId] = owned - 1
+	local uid = HttpService:GenerateGUID(false)
+
+	local plotBase = plot:FindFirstChild("Base"); if not plotBase then placementDebounce[player] = nil; return end
+	local rel = plotBase.CFrame:ToObjectSpace(targetCFrame)
+	table.insert(profile.Data.PlacedItems, {
+		UniqueId = uid,
+		ItemId = itemId,
+		Position = cframeToPositionTable(rel),
+	})
+
+	-- Spawn
+	local newItem = tpl:Clone()
+	newItem:SetAttribute("UniqueId", uid)
+	newItem:SetAttribute("IsPlacedItem", true)
+	if cfg.Health then newItem:SetAttribute("Health", cfg.Health) end
+	newItem:SetPrimaryPartCFrame(targetCFrame)
+	newItem.Parent = plot
+	CollectionService:AddTag(newItem, "PlacedItem")
+	CollectionService:AddTag(newItem, "Damageable")
+	if cfg.Type == "Turrets" then
+		TurretController:AddTurret(newItem, plot)
+	end
+
+	ItemPlacedFX:FireClient(player)
+	ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, profile.Data.BlockInventory)
+
+	task.delay(0.2, function()
+		placementDebounce[player] = nil
+	end)
+end
+
+local function onRemoveItem(player: Player, itemToRemove: Model)
+	local profile = PlayerController:GetProfile(player)
+	local uid = itemToRemove:GetAttribute("UniqueId")
+	if not (profile and uid and itemToRemove.Parent and itemToRemove.Parent:GetAttribute("OwnerId") == player.UserId) then return end
+
+	local plot = itemToRemove.Parent :: Model
+	local itemId = itemToRemove.Name
+	local cfg = ItemConfigurations[itemId]; if not cfg then return end
+
+	-- remove from data
+	for i, data in ipairs(profile.Data.PlacedItems) do
+		if data.UniqueId == uid then table.remove(profile.Data.PlacedItems, i); break end
+	end
+	-- refund removed item
+	profile.Data.BlockInventory[itemId] = (profile.Data.BlockInventory[itemId] or 0) + 1
+
+	-- unregister if turret
+	if cfg.Type == "Turrets" then TurretController:RemoveTurret(itemToRemove) end
+	itemToRemove:Destroy()
+
+	-- DO NOT touch blocks; but remove any turrets now left unsupported (refund since player action)
+	for _, ch in ipairs(plot:GetChildren()) do
+		if not CollectionService:HasTag(ch, "PlacedItem") then continue end
+		local cfg2 = ItemConfigurations[ch.Name]
+		if cfg2 and cfg2.Type == "Turrets" and not turretIsSupported(ch, plot) then
+			-- remove turret + refund
+			local tUid = ch:GetAttribute("UniqueId")
+			for i = #profile.Data.PlacedItems, 1, -1 do
+				if profile.Data.PlacedItems[i].UniqueId == tUid then
+					table.remove(profile.Data.PlacedItems, i)
+					break
+				end
+			end
+			profile.Data.BlockInventory[ch.Name] = (profile.Data.BlockInventory[ch.Name] or 0) + 1
+			TurretController:RemoveTurret(ch)
+			ch:Destroy()
+		end
+	end
+
+	ItemRemovedFX:FireClient(player)
+	ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, profile.Data.BlockInventory)
+end
+
+local function onItemDestroyedByNPC(player: Player, uniqueId: string)
+	local profile = PlayerController:GetProfile(player); if not profile then return end
+
+	-- remove entry from placed list (the physical model was already destroyed by NPC)
+	for i = #profile.Data.PlacedItems, 1, -1 do
+		if profile.Data.PlacedItems[i].UniqueId == uniqueId then
+			table.remove(profile.Data.PlacedItems, i)
+			break
+		end
+	end
+
+	-- If turrets became unsupported because of NPC action, remove them (no refund)
+	local playerPlot: Model?
+	for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			playerPlot = plot; break
+		end
+	end
+	if not playerPlot then return end
+
+	for _, ch in ipairs(playerPlot:GetChildren()) do
+		if not CollectionService:HasTag(ch, "PlacedItem") then continue end
+		local cfg2 = ItemConfigurations[ch.Name]
+		if cfg2 and cfg2.Type == "Turrets" and not turretIsSupported(ch, playerPlot) then
+			-- remove turret without refund
+			local tUid = ch:GetAttribute("UniqueId")
+			for i = #profile.Data.PlacedItems, 1, -1 do
+				if profile.Data.PlacedItems[i].UniqueId == tUid then
+					table.remove(profile.Data.PlacedItems, i)
+					break
+				end
+			end
+			TurretController:RemoveTurret(ch)
+			ch:Destroy()
+		end
+	end
+end
+
+function PlacementController:Init(controllers: {[string]: any})
+	PlayerController = controllers.PlayerController
+	TurretController  = controllers.TurretController
+end
+
+function PlacementController:Start()
+	PlaceItemEvent.OnServerEvent:Connect(onPlaceItem)
+	RemoveItemEvent.OnServerEvent:Connect(onRemoveItem)
+	ReplicatedStorage.Events:WaitForChild("ItemDestroyedByNPC").Event:Connect(onItemDestroyedByNPC)
+end
+
+return PlacementController
+
+---
+
+--- ServerScriptService.Controllers.WaveController (ModuleScript) ---
+--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+
+local PlayerController
+local TurretController
+local PlacementController
+local WeaponController
+local PlotController
+
+
+local WaveConfigurations = require(ReplicatedStorage.Modules.WaveConfigurations)
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local EnemyConfigurations = require(ReplicatedStorage.Modules.EnemyConfigurations)
+local ModelProgression = require(ReplicatedStorage.Modules.ModelProgression)
+
+local INTERMISSION_TIME = 1
+local NO_ACTIVITY_TIMEOUT = 40 -- seconds of no spawns/kills to skip non-boss waves
+
+local BossGemDrop = {
+	BaseChance = .25,
+	Amount     = { Min = 1, Max = 4 },
+	MaxPerKill = 6,
+	MaxFinalChance = 1,
+}
+
+local RNG = Random.new()
+
+local WaveController = {}
+local _plotStates: {[Model]: {
+	IsActive: boolean,
+	CurrentWave: number,
+	EnemiesKilledInWave: number,
+	TotalEnemiesInWave: number,
+	IsStartingNextWave: boolean,
+	WaveSpeedMultiplier: number,
+	HealthConnection: RBXScriptConnection?,
+	AliveEnemies: number,
+}} = {}
+local _fightToggleDebounce: {[Player]: boolean} = {}
+local _autoWaveStates: {[Player]: boolean} = {}
+local _preferredMultiplier: {[Player]: number} = {}
+
+local activeEnemiesFolder = Workspace:FindFirstChild("ActiveEnemies") or Instance.new("Folder")
+activeEnemiesFolder.Name = "ActiveEnemies"
+activeEnemiesFolder.Parent = Workspace
+
+local function isMilestoneWave(n: number): boolean
+	return n % 15 == 0
+end
+
+local function getPlotForPlayer(player: Player): Model?
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = Workspace.Plots:FindFirstChild("Plot"..tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+	for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function getRandomSpawnCFrame(spawnPart: BasePart): CFrame
+	local s = spawnPart.Size
+	return spawnPart.CFrame * CFrame.new((RNG:NextNumber()-0.5)*s.X, s.Y/2+3, (RNG:NextNumber()-0.5)*s.Z)
+end
+
+local function getWaveSpeed(state): number
+	return math.clamp((state and state.WaveSpeedMultiplier) or 1, 0.25, 4)
+end
+
+local function hasFastForwardUnlocked(player: Player): boolean
+	local profile = PlayerController and PlayerController:GetProfile(player)
+	return profile and profile.Data and profile.Data.FastForwardUnlocked == true or false
+end
+
+function WaveController:IsPlayerFighting(player: Player): boolean
+	local plot = getPlotForPlayer(player)
+	if not plot or not _plotStates[plot] then return false end
+	return _plotStates[plot].IsActive
+end
+
+local startNextWave
+local stopFight
+local startFight
+
+startNextWave = function(player: Player, plot: Model)
+	local state = _plotStates[plot]
+	if not state or not state.IsActive then return end
+	state.IsStartingNextWave = false
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then stopFight(plot, "manual") return end
+	state.CurrentWave += 1
+
+	local waveConfig = WaveConfigurations.ResolveWave(state.CurrentWave)
+	if not waveConfig then stopFight(plot, "win") return end
+
+	if state.CurrentWave > profile.Data.HighestWave then
+		profile.Data.HighestWave = state.CurrentWave
+		local ls = player:FindFirstChild("leaderstats")
+		local hw = ls and ls:FindFirstChild("Highest Wave")
+		if hw then hw.Value = state.CurrentWave end
+
+		local nextIdx = profile.Data.UnlockedModelIndex + 1
+		local nextModel = ModelProgression[nextIdx]
+		if nextModel and state.CurrentWave >= nextModel.WaveRequirement then
+			profile.Data.UnlockedModelIndex = nextIdx
+			PlotController:UpdateProtectionModel(player, plot)
+			ReplicatedStorage.Events.ShowModelAward:FireClient(player, nextModel.ModelName, nextModel.ImageId)
+		end
+	end
+
+	local total = 0
+	for _, g in ipairs(waveConfig.Enemies) do total += g.Count end
+	state.EnemiesKilledInWave = 0
+	state.TotalEnemiesInWave = total
+	ReplicatedStorage.Events.WaveUIStateChanged:FireClient(player, true, state.CurrentWave, total, waveConfig.IsBossWave)
+
+	local spawnPart = plot:FindFirstChild("EnemySpawn")
+	if not spawnPart then return end
+
+	local BASE_TARGET_CONCURRENT = waveConfig.TargetConcurrent or (waveConfig.IsBossWave and 1 or 6)
+	local MIN_TICK = 0.08
+
+	local groups = {}
+	for _, g in ipairs(waveConfig.Enemies) do
+		table.insert(groups, {
+			Enemy = g.Enemy,
+			Remaining = g.Count or 0,
+			MinGap = (g.DelayBetweenSpawns or 0),
+			_LastSpawnT = 0,
+		})
+	end
+
+	local function totalRemaining(): number
+		local t = 0
+		for _, gg in ipairs(groups) do t += gg.Remaining end
+		return t
+	end
+
+	local rrIndex = 1
+	local function nextGroupToSpawn(now: number, speed: number)
+		local n = #groups
+		for i = 1, n do
+			local idx = ((rrIndex + i - 2) % n) + 1
+			local g = groups[idx]
+			if g.Remaining > 0 then
+				local gap = (g.MinGap or 0)
+				local okByGap = (gap == 0) or (now - g._LastSpawnT) >= (gap / speed)
+				if okByGap then
+					rrIndex = idx + 1
+					return g
+				end
+			end
+		end
+		return nil
+	end
+
+	-- activity tracking
+	local lastActivityT = os.clock()
+	local function markActivity()
+		lastActivityT = os.clock()
+	end
+
+	local function spawnOne(fromGroup)
+		local template = ReplicatedStorage.Enemies:FindFirstChild(fromGroup.Enemy)
+		if not template then return end
+
+		local enemy = template:Clone()
+		local hum = enemy:WaitForChild("Humanoid")
+
+		local conf = EnemyConfigurations[enemy.Name]
+		local base = (conf and conf.MaxHealth) or hum.MaxHealth
+		local mult = waveConfig.HealthMultiplier or 1
+		local maxHp = math.max(1, math.floor(base * mult))
+		hum.MaxHealth, hum.Health = maxHp, maxHp
+
+		if waveConfig.IsBossWave then
+			hum.MaxSlopeAngle, hum.AutoJumpEnabled, hum.JumpPower = 0, false, 0
+		end
+		if waveConfig.DamageMultiplier then
+			enemy:SetAttribute("DamageMultiplier", waveConfig.DamageMultiplier)
+		end
+
+		local goal = Instance.new("ObjectValue")
+		goal.Name = "Goal"
+		goal.Value = plot:FindFirstChild("PlotHealth")
+		goal.Parent = enemy
+
+		local owner = Instance.new("ObjectValue")
+		owner.Name = "OwnerPlot"
+		owner.Value = plot
+		owner.Parent = enemy
+
+		for _, d in ipairs(enemy:GetDescendants()) do
+			if d:IsA("BasePart") then d.CollisionGroup = "Zombies" end
+		end
+
+		enemy:SetPrimaryPartCFrame(getRandomSpawnCFrame(spawnPart))
+		enemy.Parent = activeEnemiesFolder
+		local root = enemy:FindFirstChild("HumanoidRootPart")
+		if root then root:SetNetworkOwner(nil) end
+
+		if waveConfig.IsBossWave then
+			ReplicatedStorage.Events.BossWaveStarted:FireClient(player, hum, waveConfig.BossImageId)
+		end
+
+		state.AliveEnemies += 1
+		fromGroup.Remaining -= 1
+		fromGroup._LastSpawnT = os.clock()
+		markActivity()
+
+		hum.Died:Once(function()
+			state.AliveEnemies -= 1
+			state.EnemiesKilledInWave += 1
+			markActivity()
+
+			if conf and conf.CashReward then
+				local ls = player:FindFirstChild("leaderstats")
+				local cash = ls and ls:FindFirstChild("Cash")
+				if cash then
+					local per = conf.CashReward
+					if waveConfig.KillCashMultiplier then per = math.floor(per * waveConfig.KillCashMultiplier) end
+					cash.Value += per
+				end
+			end
+
+			if waveConfig.IsBossWave then
+				local ownerPlot = enemy:FindFirstChild("OwnerPlot")
+				local plotModel: Model? = ownerPlot and ownerPlot.Value
+				local ownerId = plotModel and plotModel:GetAttribute("OwnerId")
+				local killer = ownerId and Players:GetPlayerByUserId(ownerId)
+				if killer then
+					local effective = TotalLuckController:GetEffectiveFactor(killer)
+					local finalChance = math.min(BossGemDrop.MaxFinalChance, BossGemDrop.BaseChance * effective)
+					if RNG:NextNumber() < finalChance then
+						local minA, maxA = BossGemDrop.Amount.Min, BossGemDrop.Amount.Max
+						local count = RNG:NextInteger(minA, maxA)
+						if count > BossGemDrop.MaxPerKill then count = BossGemDrop.MaxPerKill end
+						PlayerController.AddGems(killer, count)
+						local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
+						if notify then
+							local text = (count == 1) and "+1 Gemstone" or ("+"..tostring(count).." Gemstones")
+							notify:FireClient(killer, text, "Gemstone")
+						end
+					end
+				end
+			end
+
+			ReplicatedStorage.Events.ZombieKilled:FireClient(player, state.EnemiesKilledInWave, state.CurrentWave)
+			enemy:Destroy()
+
+			if state.EnemiesKilledInWave >= state.TotalEnemiesInWave and state.IsActive and not state.IsStartingNextWave then
+				state.IsStartingNextWave = true
+				task.spawn(function()
+					if waveConfig.IsBossWave then
+						ReplicatedStorage.Events.BossWaveEnded:FireClient(player)
+					end
+
+					if waveConfig.CashReward then
+						local ls = player:FindFirstChild("leaderstats")
+						local cash = ls and ls:FindFirstChild("Cash")
+						if cash then
+							cash.Value += waveConfig.CashReward
+							ReplicatedStorage.Events.ShowNotification:FireClient(player, ("+%d Cash"):format(waveConfig.CashReward), "Success")
+						end
+					end
+
+					if waveConfig.IsBossWave and isMilestoneWave(state.CurrentWave) then
+						local currentSaved = tonumber(profile.Data.StartingWave) or 1
+						local nextStart = state.CurrentWave + 1
+						if nextStart > currentSaved then
+							profile.Data.StartingWave = nextStart
+
+							local upd = ReplicatedStorage.Events:FindFirstChild("StartingWaveUpdated") :: RemoteEvent?
+							if upd then upd:FireClient(player, nextStart) end
+
+							local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
+							if notify then
+								notify:FireClient(player, ("Checkpoint unlocked! Start at Wave %d."):format(nextStart), "Success")
+							end
+						end
+					end
+
+					local speedNow = getWaveSpeed(state)
+					local pause = (speedNow >= 2) and 0 or (INTERMISSION_TIME / speedNow)
+					if pause > 0 then task.wait(pause) end
+					if state.IsActive then startNextWave(player, plot) end
+				end)
+			end
+		end)
+	end
+
+	task.spawn(function()
+		while state.IsActive and totalRemaining() > 0 do
+			local speed = getWaveSpeed(state)
+			local desired = math.max(1, math.floor(BASE_TARGET_CONCURRENT * speed))
+			if waveConfig.IsBossWave then desired = 1 end
+
+			if state.AliveEnemies < desired then
+				local deficit = math.min(desired - state.AliveEnemies, totalRemaining())
+				local nNow = os.clock()
+				for _ = 1, deficit do
+					local g = nextGroupToSpawn(nNow, speed)
+					if g then
+						spawnOne(g)
+					else
+						break
+					end
+				end
+			end
+
+			task.wait(MIN_TICK / speed)
+		end
+	end)
+
+	-- watchdog: auto-finish stalled non-boss waves
+	task.spawn(function()
+		while state.IsActive and totalRemaining() > 0 do
+			if not waveConfig.IsBossWave then
+				local now = os.clock()
+				if (now - lastActivityT) >= NO_ACTIVITY_TIMEOUT then
+					for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
+						local owner = enemy:FindFirstChild("OwnerPlot")
+						if owner and owner.Value == plot then
+							enemy:Destroy()
+						end
+					end
+					for _, gg in ipairs(groups) do
+						gg.Remaining = 0
+					end
+					state.AliveEnemies = 0
+					state.EnemiesKilledInWave = state.TotalEnemiesInWave
+
+					state.IsStartingNextWave = true
+					task.spawn(function()
+						if waveConfig.IsBossWave then
+							ReplicatedStorage.Events.BossWaveEnded:FireClient(player)
+						end
+
+						if waveConfig.CashReward then
+							local ls = player:FindFirstChild("leaderstats")
+							local cash = ls and ls:FindFirstChild("Cash")
+							if cash then
+								cash.Value += waveConfig.CashReward
+								ReplicatedStorage.Events.ShowNotification:FireClient(player, ("+%d Cash"):format(waveConfig.CashReward), "Success")
+							end
+						end
+
+						local speedNow = getWaveSpeed(state)
+						local pause = (speedNow >= 2) and 0 or (INTERMISSION_TIME / speedNow)
+						if pause > 0 then task.wait(pause) end
+						if state.IsActive then startNextWave(player, plot) end
+					end)
+
+					return
+				end
+			end
+
+			task.wait(0.5)
+		end
+	end)
+end
+
+stopFight = function(plot: Model, reason: string)
+	local state = _plotStates[plot]
+	if not state then return end
+	local player = Players:GetPlayerByUserId(plot:GetAttribute("OwnerId"))
+	state.IsActive = false
+
+	if state.HealthConnection then state.HealthConnection:Disconnect() state.HealthConnection = nil end
+
+	for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
+		local owner = enemy:FindFirstChild("OwnerPlot")
+		if owner and owner.Value == plot then enemy:Destroy() end
+	end
+
+	_plotStates[plot] = nil
+
+	if player then
+		if reason == "manual" then
+			ReplicatedStorage.Events.EquipLastWeaponRequest:FireClient(player)
+		end
+
+		for _, itemModel in ipairs(plot:GetChildren()) do
+			if itemModel:GetAttribute("IsPlacedItem") then
+				local config = ItemConfigurations[itemModel.Name]
+				if config and config.Type == "Turrets" then TurretController:RemoveTurret(itemModel) end
+				itemModel:Destroy()
+			end
+		end
+
+		task.wait(0.1)
+		PlacementController:LoadPlacedItems(player, plot)
+
+		local profile = PlayerController:GetProfile(player)
+		if profile then
+			local md = ModelProgression[profile.Data.UnlockedModelIndex]
+			local maxHealth = (md and md.PlotHealth) or 10
+			local plotHealthPart = plot:FindFirstChild("PlotHealth")
+			if plotHealthPart then plotHealthPart:SetAttribute("Health", maxHealth) end
+		end
+
+		ReplicatedStorage.Events.WaveStateChanged:FireClient(player, false)
+		ReplicatedStorage.Events.WaveUIStateChanged:FireClient(player, false)
+		ReplicatedStorage.Events.BossWaveEnded:FireClient(player)
+
+		if reason == "loss" and _autoWaveStates[player] == true then
+			task.wait(1)
+			if player.Parent then startFight(player) end
+		end
+	end
+end
+
+startFight = function(player: Player)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+	local profile = PlayerController:GetProfile(player)
+	if not profile or _plotStates[plot] then return end
+
+	local md = ModelProgression[profile.Data.UnlockedModelIndex]
+	local maxHealth = (md and md.PlotHealth) or 10
+
+	local plotHealth = plot:FindFirstChild("PlotHealth")
+	if not plotHealth then return end
+	plotHealth:SetAttribute("Health", maxHealth)
+
+	local startMultiplier = 1
+	if hasFastForwardUnlocked(player) then
+		startMultiplier = math.clamp(_preferredMultiplier[player] or 1, 1, 4)
+	end
+
+	_plotStates[plot] = {
+		IsActive = true,
+		CurrentWave = (profile.Data.StartingWave or 1) - 1,
+		EnemiesKilledInWave = 0,
+		TotalEnemiesInWave = 0,
+		IsStartingNextWave = false,
+		WaveSpeedMultiplier = startMultiplier,
+		AliveEnemies = 0,
+		HealthConnection = plotHealth:GetAttributeChangedSignal("Health"):Connect(function()
+			if (plotHealth:GetAttribute("Health") or maxHealth) <= 0 then
+				ReplicatedStorage.Events.ShowNotification:FireClient(player, "Your plot was destroyed!", "Error")
+				stopFight(plot, "loss")
+			end
+		end)
+	}
+
+	local waveSpeedChanged = ReplicatedStorage.Events:FindFirstChild("WaveSpeedChanged")
+	if waveSpeedChanged then (waveSpeedChanged :: RemoteEvent):FireClient(player, startMultiplier) end
+
+	ReplicatedStorage.Events.WaveStateChanged:FireClient(player, true, maxHealth, maxHealth)
+	startNextWave(player, plot)
+end
+
+function WaveController:Init(controllers: {[string]: any})
+	PlayerController = controllers.PlayerController
+	TurretController = controllers.TurretController
+	PlacementController = controllers.PlacementController
+	WeaponController = controllers.WeaponController
+	PlotController = controllers.PlotController
+end
+
+function WaveController:Start()
+	local function ensureRemote(name: string): RemoteEvent
+		local events = ReplicatedStorage:FindFirstChild("Events") or Instance.new("Folder")
+		events.Name = "Events"; events.Parent = ReplicatedStorage
+		local r = events:FindFirstChild(name) :: RemoteEvent?
+		if not r then r = Instance.new("RemoteEvent"); r.Name = name; r.Parent = events end
+		return r
+	end
+	ensureRemote("ToggleFastForward")
+	ensureRemote("SetWaveSpeedMultiplier")
+	ensureRemote("WaveSpeedChanged")
+	ensureRemote("StartingWaveUpdated")
+
+	ReplicatedStorage.Events.SetAutoWave.OnServerEvent:Connect(function(player, isEnabled)
+		_autoWaveStates[player] = isEnabled
+	end)
+
+	ReplicatedStorage.Events.ToggleWaveState.OnServerEvent:Connect(function(player)
+		if _fightToggleDebounce[player] then return end
+		_fightToggleDebounce[player] = true
+
+		local profile = PlayerController:GetProfile(player)
+		if profile and not profile.Data.HasCompletedOnboarding then
+			profile.Data.HasCompletedOnboarding = true
+			ReplicatedStorage.Events.EndOnboarding:FireClient(player)
+		end
+
+		local plot = getPlotForPlayer(player)
+		if not plot then _fightToggleDebounce[player] = nil return end
+
+		if _plotStates[plot] and _plotStates[plot].IsActive then
+			if _autoWaveStates[player] then
+				_autoWaveStates[player] = false
+				ReplicatedStorage.Events.AutoWaveStateChanged:FireClient(player, false)
+			end
+			stopFight(plot, "manual")
+		else
+			startFight(player)
+		end
+
+		task.delay(1, function() _fightToggleDebounce[player] = nil end)
+	end)
+
+	ReplicatedStorage.Events.ToggleFastForward.OnServerEvent:Connect(function(player)
+		if not hasFastForwardUnlocked(player) then
+			local sn = ReplicatedStorage.Events:FindFirstChild("ShowNotification")
+			if sn then sn:FireClient(player, "Unlock Fast-Forward to use this!", "Warning") end
+			return
+		end
+		local plot = getPlotForPlayer(player)
+		local state = plot and _plotStates[plot] or nil
+		if state and state.IsActive then
+			state.WaveSpeedMultiplier = (getWaveSpeed(state) == 1) and 2 or 1
+			ReplicatedStorage.Events.WaveSpeedChanged:FireClient(player, state.WaveSpeedMultiplier)
+		else
+			local cur = math.clamp(_preferredMultiplier[player] or 1, 1, 4)
+			local newV = (cur == 1) and 2 or 1
+			_preferredMultiplier[player] = newV
+			ReplicatedStorage.Events.WaveSpeedChanged:FireClient(player, newV)
+			local sn = ReplicatedStorage.Events:FindFirstChild("ShowNotification")
+			if sn then sn:FireClient(player, "Fast-Forward set. It will apply on your next wave.", "Normal") end
+		end
+	end)
+
+	ReplicatedStorage.Events.SetWaveSpeedMultiplier.OnServerEvent:Connect(function(player, m)
+		if not hasFastForwardUnlocked(player) then
+			local sn = ReplicatedStorage.Events:FindFirstChild("ShowNotification")
+			if sn then sn:FireClient(player, "Unlock Fast-Forward to use this!", "Warning") end
+			return
+		end
+		m = tonumber(m) or 1
+		m = math.clamp(m, 0.25, 4)
+		local plot = getPlotForPlayer(player)
+		local state = plot and _plotStates[plot] or nil
+		if state and state.IsActive then
+			state.WaveSpeedMultiplier = m
+			ReplicatedStorage.Events.WaveSpeedChanged:FireClient(player, m)
+		else
+			_preferredMultiplier[player] = math.max(1, math.floor(m + 0.5))
+			ReplicatedStorage.Events.WaveSpeedChanged:FireClient(player, _preferredMultiplier[player])
+			local sn = ReplicatedStorage.Events:FindFirstChild("ShowNotification")
+			if sn then sn:FireClient(player, "Fast-Forward set. It will apply on your next wave.", "Normal") end
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		_autoWaveStates[player] = nil
+		_preferredMultiplier[player] = nil
+
+		local plot = getPlotForPlayer(player)
+		if not plot then return end
+		local state = _plotStates[plot]
+		if not state then return end
+
+		state.IsActive = false
+		if state.HealthConnection then state.HealthConnection:Disconnect() end
+
+		for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
+			local owner = enemy:FindFirstChild("OwnerPlot")
+			if owner and owner.Value == plot then enemy:Destroy() end
+		end
+		_plotStates[plot] = nil
+	end)
+end
+
+return WaveController
+
+---
+
+--- ServerScriptService.Controllers.PhysicsController (ModuleScript) ---
+--!strict
+local PhysicsService = game:GetService("PhysicsService")
+local PhysicsController = {}
+function PhysicsController:Start()
+	pcall(PhysicsService.RegisterCollisionGroup, PhysicsService, "Players")
+	pcall(PhysicsService.RegisterCollisionGroup, PhysicsService, "Zombies")
+	PhysicsService:CollisionGroupSetCollidable("Zombies", "Zombies", false)
+	PhysicsService:CollisionGroupSetCollidable("Zombies", "Players", false)
+	PhysicsService:CollisionGroupSetCollidable("Players", "Players", false)
+	--print("Custom collision groups for Players and Zombies have been configured.")
+end
+return PhysicsController
+---
+
+--- ServerScriptService.Controllers.TurretController (ModuleScript) ---
+--!strict
+
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local DamageHandler = require(ReplicatedStorage.Modules.DamageHandler)
+
+local TurretFiredFX = ReplicatedStorage.Events:WaitForChild("TurretFiredFX")
+
+local TurretController = {}
+type TurretData = {
+	config: any,
+	plot: Model,
+	lastFireTime: number,
+	attachments: {Attachment},
+	currentTarget: Model?,
+	lockOnTime: number,
+}
+local _activeTurrets: {[Model]: TurretData} = {}
+
+-- ========= helpers =========
+
+local function enemyIsAlive(m: Model): boolean
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0
+end
+
+local function isMortarTurret(turretModel: Model): boolean
+	return string.find(turretModel.Name:lower(), "mortar") ~= nil
+end
+
+local function safeNum(v: any, fallback: number): number
+	local n = tonumber(v)
+	if not n or n ~= n or n == math.huge or n == -math.huge then
+		return fallback
+	end
+	return n
+end
+
+-- lead point once (simple 2-pass)
+local function leadPoint(p0: Vector3, pT: Vector3, vT: Vector3, projSpeed: number): Vector3
+	local r = pT - p0
+	local t = r.Magnitude / math.max(1, projSpeed)
+	local p = pT + vT * t
+	local r2 = p - p0
+	local t2 = r2.Magnitude / math.max(1, projSpeed)
+	return pT + vT * t2
+end
+
+-- ballistic solve (returns initial velocity; highArc optional)
+local function solveBallistic(p0: Vector3, pT: Vector3, speed: number, highArc: boolean?): Vector3?
+	local g = Workspace.Gravity
+	local r = pT - p0
+	local dxz = Vector3.new(r.X, 0, r.Z)
+	local d = dxz.Magnitude
+	if d < 1e-3 then return Vector3.new(0, speed, 0) end
+	local dir = dxz.Unit
+	local vy = r.Y
+	local v2 = speed * speed
+	local disc = (v2 * v2) - g * (g * d * d + 2 * vy * v2)
+	if disc < 0 then return nil end
+	local root = math.sqrt(disc)
+	local tanHigh = (v2 + root) / (g * d)
+	local tanLow  = (v2 - root) / (g * d)
+	local theta = math.atan((highArc and tanHigh or tanLow))
+	local vxz = math.cos(theta) * speed
+	local vy0 = math.sin(theta) * speed
+	return dir * vxz + Vector3.yAxis * vy0
+end
+
+-- get time of flight from chosen v0 using horizontal motion
+local function flightTime(p0: Vector3, pT: Vector3, v0: Vector3, fallbackSpeed: number): number
+	local d = (Vector3.new(pT.X, 0, pT.Z) - Vector3.new(p0.X, 0, p0.Z)).Magnitude
+	local vxz = Vector3.new(v0.X, 0, v0.Z).Magnitude
+	if vxz < 1 then
+		return d / math.max(1, fallbackSpeed)
+	end
+	return d / vxz
+end
+
+-- ========= visuals =========
+
+local function explosionVFX(pos: Vector3, splashRadius: number)
+	local VIS_MIN, VIS_MAX = 3.5, 6.5
+	local vis = math.clamp(splashRadius * 0.35, VIS_MIN, VIS_MAX)
+
+	local effect = Instance.new("Part")
+	effect.Anchored = true
+	effect.CanCollide = false
+	effect.CanQuery = false
+	effect.Transparency = 1
+	effect.Size = Vector3.new(1,1,1)
+	effect.CFrame = CFrame.new(pos)
+	effect.Parent = Workspace
+	Debris:AddItem(effect, 1.5)
+
+	local smoke = Instance.new("ParticleEmitter")
+	smoke.Texture = "rbxassetid://241837157"
+	smoke.Color = ColorSequence.new(Color3.fromRGB(255,190,110), Color3.fromRGB(90,70,50))
+	smoke.Lifetime = NumberRange.new(0.9, 1.4)
+	smoke.Speed = NumberRange.new(12, 18)
+	smoke.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, vis * 0.5),
+		NumberSequenceKeypoint.new(0.35, vis * 0.9),
+		NumberSequenceKeypoint.new(1, vis * 0.35),
+	})
+	smoke.Rate = 0
+	smoke.SpreadAngle = Vector2.new(360, 360)
+	smoke.EmissionDirection = Enum.NormalId.Top
+	smoke.Drag = 4
+	smoke.Parent = effect
+	smoke:Emit(math.clamp(math.floor(vis * 10), 25, 70))
+
+	local shock = Instance.new("Part")
+	shock.Anchored = true
+	shock.CanCollide = false
+	shock.CanQuery = false
+	shock.Material = Enum.Material.Neon
+	shock.Color = Color3.fromRGB(255, 220, 120)
+	shock.Shape = Enum.PartType.Ball
+	shock.Size = Vector3.new(1,1,1)
+	shock.CFrame = CFrame.new(pos)
+	shock.Parent = Workspace
+	Debris:AddItem(shock, 0.25)
+
+	local light = Instance.new("PointLight")
+	light.Brightness = 8
+	light.Range = vis * 1.6
+	light.Color = Color3.fromRGB(255,200,120)
+	light.Parent = shock
+
+	task.spawn(function()
+		local t0 = os.clock()
+		while shock.Parent do
+			local t = os.clock() - t0
+			if t > 0.22 then shock:Destroy() break end
+			local s = vis * (1.0 + t * 8.0)
+			shock.Size = Vector3.new(s, s, s)
+			shock.Transparency = math.clamp(t * 4, 0, 1)
+			light.Brightness = math.max(0, 8 - t * 40)
+			RunService.Heartbeat:Wait()
+		end
+	end)
+
+	local debrisCount = math.clamp(math.floor(vis * 4), 4, 10)
+	for _ = 1, debrisCount do
+		local c = Instance.new("Part")
+		c.Size = Vector3.new(0.6, 0.6, 0.6)
+		c.Material = Enum.Material.Concrete
+		c.Color = Color3.fromRGB(112, 100, 90)
+		c.Anchored = false
+		c.CanCollide = false
+		c.CanQuery = false
+		c.Massless = true
+		c.CFrame = CFrame.new(pos + Vector3.new(0, 0.4, 0))
+		c.Parent = Workspace
+		local dir = Vector3.new(math.random() - 0.5, math.random() * 0.8 + 0.2, math.random() - 0.5).Unit
+		local power = vis * 5
+		c.AssemblyLinearVelocity = dir * power
+		c.AssemblyAngularVelocity = Vector3.new(math.random(), math.random(), math.random()) * 4
+		Debris:AddItem(c, 0.9)
+	end
+end
+
+-- ========= damage =========
+
+local function splashEnemies(center: Vector3, radius: number, damage: number, attacker: Model, plot: Model)
+	local parts = Workspace:GetPartBoundsInRadius(center, radius)
+	local hitModels: {[Model]: boolean} = {}
+	for _, part in ipairs(parts) do
+		local m = part:FindFirstAncestorOfClass("Model")
+		if not m or hitModels[m] then continue end
+		local op = m:FindFirstChild("OwnerPlot")
+		if not op or op.Value ~= plot then continue end
+		if not enemyIsAlive(m) then continue end
+		if not m:FindFirstChild("Goal") then continue end
+		hitModels[m] = true
+	end
+	for m, _ in pairs(hitModels) do
+		pcall(function()
+			DamageHandler.dealDamage(attacker, m, damage)
+		end)
+	end
+end
+
+-- ========= mortar projectile =========
+
+local function launchMortarShell(turretModel: Model, fromPos: Vector3, targetModel: Model, cfg: any, plot: Model)
+	local speed        = safeNum(cfg.ProjectileSpeed, 120)
+	local splashRadius = safeNum(cfg.SplashRadius, 15)
+	local damage       = safeNum(cfg.Damage, 100)
+
+	-- fixed prediction at fire time
+	local targetRoot = targetModel:FindFirstChild("HumanoidRootPart")
+	local tgtPos = targetRoot and targetRoot.Position or targetModel.PrimaryPart.Position
+	local tgtVel = targetRoot and targetRoot.AssemblyLinearVelocity or Vector3.zero
+	local aimPoint = leadPoint(fromPos, tgtPos, tgtVel, speed)
+
+	-- pick a high arc if possible
+	local v0 = solveBallistic(fromPos, aimPoint, speed, true)
+		or solveBallistic(fromPos, aimPoint, speed, false)
+		or ((aimPoint - fromPos).Unit * (speed * 0.7) + Vector3.yAxis * (speed * 0.5))
+
+	-- compute predicted impact (fixed) from v0
+	local tFlight = flightTime(fromPos, aimPoint, v0, speed)
+	local g = Vector3.new(0, -Workspace.Gravity, 0)
+	local predictedImpact = fromPos + v0 * tFlight + 0.5 * g * (tFlight * tFlight)
+
+	-- shell
+	local shell = Instance.new("Part")
+	shell.Name = "MortarShell"
+	shell.Shape = Enum.PartType.Ball
+	shell.Material = Enum.Material.Metal
+	shell.Color = Color3.new(0.9, 0.9, 0.9)
+	shell.Size = Vector3.new(1.2, 1.2, 1.2)
+	shell.CanCollide = false
+	shell.CanQuery = false
+	shell.CFrame = CFrame.new(fromPos)
+	shell.Parent = Workspace
+
+	local a0 = Instance.new("Attachment", shell); a0.Position = Vector3.new(0, -0.5, 0)
+	local a1 = Instance.new("Attachment", shell); a1.Position = Vector3.new(0, 0.5, 0)
+	local trail = Instance.new("Trail")
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.Lifetime = 0.45
+	trail.MinLength = 0.1
+	trail.Color = ColorSequence.new(Color3.fromRGB(200,200,200), Color3.fromRGB(255,255,255))
+	trail.Transparency = NumberSequence.new(0.05, 1)
+	trail.LightEmission = 1
+	trail.Parent = shell
+
+	shell.AssemblyLinearVelocity = v0
+
+	-- ignore list for ground checks
+	local ignore = {turretModel, plot}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then table.insert(ignore, plr.Character) end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local impacted = false
+	local minFlight = 0.22
+	local startPos = fromPos
+
+	task.spawn(function()
+		local t0 = os.clock()
+		while shell.Parent and not impacted do
+			local age = os.clock() - t0
+			if age > 8 then break end
+
+			local pos = shell.Position
+			local vel = shell.AssemblyLinearVelocity
+
+			-- detonate near the fixed predicted impact
+			local horizToImpact = (Vector3.new(pos.X,0,pos.Z) - Vector3.new(predictedImpact.X,0,predictedImpact.Z)).Magnitude
+			local nearImpact = horizToImpact <= math.max(2.5, splashRadius * 0.4)
+			local belowImpact = pos.Y <= (predictedImpact.Y + math.max(1.0, splashRadius * 0.15))
+
+			local traveled = (Vector3.new(pos.X,0,pos.Z) - Vector3.new(startPos.X,0,startPos.Z)).Magnitude
+
+			if age > minFlight and nearImpact and belowImpact and traveled >= 10 then
+				impacted = true
+				explosionVFX(pos, splashRadius)
+				splashEnemies(pos, splashRadius, damage, turretModel, plot)
+				shell:Destroy()
+				break
+			end
+
+			-- descending + ground proximity
+			if age > minFlight and vel.Y < -2 then
+				local down = Workspace:Raycast(pos, Vector3.new(0, -8, 0), params)
+				if down and (pos.Y - down.Position.Y) <= 2.1 and traveled >= 10 then
+					impacted = true
+					explosionVFX(down.Position, splashRadius)
+					splashEnemies(down.Position, splashRadius, damage, turretModel, plot)
+					shell:Destroy()
+					break
+				end
+			end
+
+			RunService.Heartbeat:Wait()
+		end
+
+		if not impacted and shell.Parent then
+			impacted = true
+			explosionVFX(shell.Position, splashRadius)
+			splashEnemies(shell.Position, splashRadius, damage, turretModel, plot)
+			shell:Destroy()
+		end
+	end)
+end
+
+-- ========= main loop =========
+
+function TurretController:AddTurret(turretModel: Model, plot: Model)
+	local cfg = ItemConfigurations[turretModel.Name]
+	if not cfg then
+		warn("Missing ItemConfiguration for turret:", turretModel.Name)
+		return
+	end
+
+	local attachments = {} :: {Attachment}
+	for _, d in ipairs(turretModel:GetDescendants()) do
+		if d:IsA("Attachment") and d.Name == "Muzzle" then
+			table.insert(attachments, d)
+		end
+	end
+
+	_activeTurrets[turretModel] = {
+		config = cfg,
+		plot = plot,
+		lastFireTime = 0,
+		attachments = attachments,
+		currentTarget = nil,
+		lockOnTime = 0,
+	}
+end
+
+function TurretController:RemoveTurret(turretModel: Model)
+	_activeTurrets[turretModel] = nil
+end
+
+function TurretController:Start()
+	RunService.Heartbeat:Connect(function()
+		local enemiesFolder = Workspace:FindFirstChild("ActiveEnemies")
+		if not enemiesFolder then return end
+		local now = os.clock()
+
+		for turretModel, data in pairs(_activeTurrets) do
+			if not turretModel.Parent or not turretModel.PrimaryPart then
+				_activeTurrets[turretModel] = nil
+				continue
+			end
+
+			local fireRate  = safeNum(data.config.FireRate, 1)
+			local range     = safeNum(data.config.Range, 60)
+			local damage    = safeNum(data.config.Damage, 10)
+			local lockDelay = safeNum(data.config.LockOnDelay, 0.1)
+			local minRange  = safeNum(data.config.MinRange, 16) -- mortar dead-zone
+
+			-- nearest target on same plot
+			local turretPos = turretModel.PrimaryPart.Position
+			local bestTarget: Model? = nil
+			local bestDist = range
+			for _, enemy in ipairs(enemiesFolder:GetChildren()) do
+				local op = enemy:FindFirstChild("OwnerPlot")
+				local root = enemy:FindFirstChild("HumanoidRootPart")
+				if op and op.Value == data.plot and root and enemyIsAlive(enemy) then
+					local dist = (root.Position - turretPos).Magnitude
+					if dist < bestDist then
+						bestDist = dist
+						bestTarget = enemy
+					end
+				end
+			end
+
+			if bestTarget ~= data.currentTarget then
+				data.lockOnTime = now
+				data.currentTarget = bestTarget
+			end
+
+			if now - data.lastFireTime < (1 / fireRate) then continue end
+			if not data.currentTarget or now - data.lockOnTime < lockDelay then continue end
+
+			local targetRoot = data.currentTarget:FindFirstChild("HumanoidRootPart")
+			if not targetRoot then continue end
+
+			data.lastFireTime = now
+
+			-- pick origins (muzzles or primary)
+			local origins: {Vector3} = {}
+			if #data.attachments > 0 then
+				for _, a in ipairs(data.attachments) do table.insert(origins, a.WorldPosition) end
+			else
+				table.insert(origins, turretModel.PrimaryPart.Position)
+			end
+
+			for _, origin in ipairs(origins) do
+				if isMortarTurret(turretModel) then
+					local toTarget = (targetRoot.Position - origin)
+					-- enforce dead-zone but otherwise allow full Range
+					if toTarget.Magnitude < minRange then
+						continue
+					end
+					launchMortarShell(turretModel, origin, data.currentTarget :: Model, data.config, data.plot)
+				else
+					-- normal hitscan
+					local direction = (targetRoot.Position - origin).Unit
+					local raycastParams = RaycastParams.new()
+					raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+					raycastParams.FilterDescendantsInstances = { turretModel, data.plot }
+					local result = Workspace:Raycast(origin, direction * range, raycastParams)
+
+					local ownerId = data.plot:GetAttribute("OwnerId")
+					local owner = ownerId and Players:GetPlayerByUserId(ownerId)
+
+					if result and result.Instance then
+						local hitModel = result.Instance.Parent
+						local hum = hitModel and hitModel:FindFirstChildOfClass("Humanoid")
+						if hum and hitModel:FindFirstChild("Goal") then
+							DamageHandler.dealDamage(turretModel, hitModel, damage)
+						end
+						if owner then TurretFiredFX:FireClient(owner, turretModel, origin, result.Position) end
+					else
+						if owner then TurretFiredFX:FireClient(owner, turretModel, origin, origin + direction * range) end
+					end
+				end
+			end
+		end
+	end)
+end
+
+return TurretController
+
+---
+
+--- ServerScriptService.Controllers.WeaponsShopController (ModuleScript) ---
+--!strict
+-- GLOBAL WEAPON SHOP CONTROLLER (global baseline + personal stock; purchases are per-player)
+
+local ReplicatedStorage     = game:GetService("ReplicatedStorage")
+local Players               = game:GetService("Players")
+local MarketplaceService    = game:GetService("MarketplaceService")
+local ServerScriptService   = game:GetService("ServerScriptService")
+
+local Modules               = ReplicatedStorage:WaitForChild("Modules")
+local WeaponConfigurations  = require(Modules:WaitForChild("WeaponConfigurations"))
+local ItemConfigurations    = require(Modules:WaitForChild("ItemConfigurations"))
+local NumberFormatter       = require(Modules:WaitForChild("NumberFormatter"))
+local BadgeController       = require(ServerScriptService.Controllers:WaitForChild("BadgeController"))
+
+local PlayerController      : any
+local CrateController       : any
+local BlocksShopController  : any
+local GlobalShopController  : any
+
+local MAX_CRATES = 3
+
+local ShopController = {}
+local pendingSkips: {[Player]: Model} = {}
+
+-- ===== Product ids =====
+local PRODUCT_SERVERLUCK_X2       = 3446300267 -- 2x (299R$)
+local PRODUCT_SERVERLUCK_X4       = 3446300425 -- 4x (799R$)
+local PRODUCT_SERVERLUCK_ADD15M   = 3446300596 -- +15m (699R$)
+
+local PRODUCT_MUTATION_SKIP       = 3445097534 -- mutationSkipTimer
+local PRODUCT_REPAIR_ALL          = 3444162940 -- revive/repair all
+
+
+-- Remotes
+local Events = ReplicatedStorage:WaitForChild("Events")
+local purchaseItemEvent       = Events:WaitForChild("PurchaseWeaponCrate") :: RemoteEvent
+local updateStocksEvent       = Events:WaitForChild("UpdateWeaponStocks") :: RemoteEvent
+local showNotificationEvent   = Events:WaitForChild("ShowNotification") :: RemoteEvent
+local promptSkipTimerRequest  = Events:WaitForChild("PromptSkipTimerRequest") :: RemoteEvent
+
+local Functions               = ReplicatedStorage:WaitForChild("Functions")
+local getResetTime            = Functions:WaitForChild("GetWeaponShopResetTime") :: RemoteFunction
+local getStocks               = Functions:WaitForChild("GetWeaponShopStocks") :: RemoteFunction
+
+-- Robux spent signal
+local SignalsFolder = ReplicatedStorage:FindFirstChild("Signals") or Instance.new("Folder", ReplicatedStorage)
+SignalsFolder.Name = "Signals"; SignalsFolder.Parent = ReplicatedStorage
+local RobuxSpentEvent = SignalsFolder:FindFirstChild("RobuxSpent") or Instance.new("BindableEvent")
+RobuxSpentEvent.Name = "RobuxSpent"; RobuxSpentEvent.Parent = SignalsFolder
+local RobuxSpent = RobuxSpentEvent :: BindableEvent
+
+-- === Price cache helpers ===
+local priceCache: {[string]: number} = {}
+local processedPurchaseIds: {[string]: boolean} = {}
+
+local function cacheKey(kind: string, id: number): string
+	return string.format("%s:%d", kind, id)
+end
+
+local function getDevProductPriceR(productId: number): number
+	local key = cacheKey("product", productId)
+	if priceCache[key] then return priceCache[key] end
+	local price = 0
+	local ok, info = pcall(function()
+		return MarketplaceService:GetProductInfo(productId, Enum.InfoType.Product)
+	end)
+	if ok and info and typeof(info.PriceInRobux) == "number" then
+		price = math.max(0, info.PriceInRobux)
+	end
+	priceCache[key] = price
+	return price
+end
+
+local function getGamePassPriceR(gamePassId: number): number
+	local key = cacheKey("gamepass", gamePassId)
+	if priceCache[key] then return priceCache[key] end
+	local price = 0
+	local ok, info = pcall(function()
+		return MarketplaceService:GetProductInfo(gamePassId, Enum.InfoType.GamePass)
+	end)
+	if ok and info and typeof(info.PriceInRobux) == "number" then
+		price = math.max(0, info.PriceInRobux)
+	end
+	priceCache[key] = price
+	return price
+end
+
+-- === Product mapping ===
+local function getProductConfig(productId: number)
+	for id, config in pairs(WeaponConfigurations.ShopProducts) do
+		if config.ProductID == productId then return id, config, "ShopAction" end
+	end
+	for id, config in pairs(WeaponConfigurations.CashProducts) do
+		if config.ProductID == productId then return id, config, "Cash" end
+	end
+	for id, config in pairs(WeaponConfigurations.Crates) do
+		if config.ProductID == productId or config.SkipTimerProductID == productId then
+			return id, config, "Crate"
+		end
+	end
+	for id, config in pairs(ItemConfigurations) do
+		if config.ProductID == productId then return id, config, "BlockOrTurret" end
+	end
+	return nil, nil, nil
+end
+
+-- === Receipt processing (ONLY here) ===
+local function processReceipt(receiptInfo: {[string]: any})
+	local playerId   = receiptInfo.PlayerId
+	local productId  = receiptInfo.ProductId
+	local purchaseId = tostring(receiptInfo.PurchaseId or "")
+	local player     = Players:GetPlayerByUserId(playerId)
+	if not player then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+	local function grantAndCount(decision: Enum.ProductPurchaseDecision)
+		if decision == Enum.ProductPurchaseDecision.PurchaseGranted and not processedPurchaseIds[purchaseId] then
+			processedPurchaseIds[purchaseId] = true
+			local robux = getDevProductPriceR(productId)
+			if robux > 0 then RobuxSpent:Fire(playerId, robux) end
+		end
+		return decision
+	end
+
+	-- ===== Server luck products (centralized here) =====
+	if productId == PRODUCT_SERVERLUCK_X2 then
+		pcall(function() TotalLuckController:StartServerLuck(nil, 2) end)
+		showNotificationEvent:FireClient(player, "Server Luck set to 2x!", "Success")
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+
+	elseif productId == PRODUCT_SERVERLUCK_X4 then
+		pcall(function() TotalLuckController:StartServerLuck(nil, 4) end)
+		showNotificationEvent:FireClient(player, "Server Luck set to 4x!", "Success")
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+
+	elseif productId == PRODUCT_SERVERLUCK_ADD15M then
+		pcall(function() TotalLuckController:StartServerLuck(15 * 60, nil) end)
+		showNotificationEvent:FireClient(player, "+15 minutes added to Server Luck!", "Success")
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+	end
+	-- ================================================
+
+	-- ===== Mutation skip (no marketplace elsewhere) =====
+	if productId == PRODUCT_MUTATION_SKIP then
+		if MutationController and MutationController.SkipActiveJob then
+			pcall(function() MutationController:SkipActiveJob(player) end)
+			showNotificationEvent:FireClient(player, "Mutation skipped!", "Success")
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+		else
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+	end
+
+	-- ===== Repair all (receipt only here) =====
+	if productId == PRODUCT_REPAIR_ALL then
+		if RepairSignController and RepairSignController.ConfirmPurchase then
+			pcall(function() RepairSignController:ConfirmPurchase(playerId) end)
+			showNotificationEvent:FireClient(player, "Repair complete!", "Success")
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+		else
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+	end
+
+	-- ===== Starter Pack =====
+	if productId == AdsRewards.STARTERPACK_PRODUCT_ID then
+		AdsRewards.GrantStarterPack(player)
+		if PlayerController.MarkStarterPackOwned then PlayerController:MarkStarterPackOwned(player) end
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+	end
+
+	-- ===== Config-mapped products =====
+	local itemId, config, productType = getProductConfig(productId)
+	if not itemId or not config or not productType then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	if productType == "ShopAction" then
+		if itemId == "RestockBlocksShop" then
+			BlocksShopController:PersonalRestock(player)
+			showNotificationEvent:FireClient(player, "Blocks Shop Restocked (Personal)!", "Success")
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+		elseif itemId == "RestockWeaponsShop" then
+			GlobalShopController:AddPersonalWeapons(player)
+			showNotificationEvent:FireClient(player, "Weapons Shop Restocked (Personal)!", "Success")
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+		end
+
+	elseif productType == "Cash" then
+		local leaderstats = player:FindFirstChild("leaderstats")
+		local cash = leaderstats and leaderstats:FindFirstChild("Cash")
+		if cash then
+			cash.Value += config.CashAmount
+			showNotificationEvent:FireClient(player, `You received ${NumberFormatter.formatNumber(config.CashAmount)} cash!`, "Success")
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+		end
+
+	elseif productType == "BlockOrTurret" then
+		local profile = PlayerController:GetProfile(player)
+		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+		local inv = profile.Data.BlockInventory
+		inv[itemId] = (inv[itemId] or 0) + 1
+		ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, inv)
+		showNotificationEvent:FireClient(player, `Purchased {config.DisplayName}!`, "Success")
+		-- 🔔 Auto-badge for turrets/cowboys purchased via product
+		if config.Type == "Turrets" then
+			BadgeController.SyncForNewItem(player, itemId)
+		end
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+
+	elseif productType == "Crate" then
+		-- Gold crate = instant open
+		if productId == WeaponConfigurations.Crates.GoldCrate.ProductID then
+			local loot = config.Loot
+			local total = 0; for _, l in ipairs(loot) do total += l.Weight end
+			local roll = math.random() * total
+			local chosen = loot[#loot].Item
+			for _, l in ipairs(loot) do
+				if roll <= l.Weight then chosen = l.Item; break else roll -= l.Weight end
+			end
+			local profile = PlayerController:GetProfile(player)
+			if chosen and profile and not table.find(profile.Data.WeaponInventory, chosen) then
+				table.insert(profile.Data.WeaponInventory, chosen)
+			end
+			local wcfg = WeaponConfigurations.Weapons[chosen]
+			ReplicatedStorage.Events.ShowModelAward:FireClient(player, wcfg.DisplayName, wcfg.ImageId)
+			ReplicatedStorage.Events.WeaponInventoryUpdated:FireClient(player, profile.Data.WeaponInventory)
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+
+			-- Crate “skip timer” product
+		elseif config.SkipTimerProductID and productId == config.SkipTimerProductID then
+			local crate = pendingSkips[player]
+			if crate and crate.Parent then
+				crate:SetAttribute("UnlockTimestamp", 0)
+				pendingSkips[player] = nil
+				showNotificationEvent:FireClient(player, "Timer Skipped!", "Success")
+				return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+			end
+
+		else
+			local profile = PlayerController:GetProfile(player)
+			if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+			if #profile.Data.Crates >= MAX_CRATES then return Enum.ProductPurchaseDecision.NotProcessedYet end
+			while not CrateController do task.wait() end
+			if CrateController:PurchaseCrate(player, itemId, true) then
+				showNotificationEvent:FireClient(player, "Purchase Successful!", "Success")
+				return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+			end
+		end
+	end
+
+	return Enum.ProductPurchaseDecision.NotProcessedYet
+end
+
+-- CASH purchase path (per-player stock)
+local function onPurchaseRequest(player: Player, itemId: string)
+	local profile = PlayerController:GetProfile(player)
+	local config = WeaponConfigurations.Crates[itemId]
+	if not profile or not config then return end
+
+	local myStock = GlobalShopController:GetPlayerWeapons(player)
+	if not config.Unlimited and (myStock[itemId] or 0) <= 0 then
+		showNotificationEvent:FireClient(player, "This item is out of stock!", "Error")
+		return
+	end
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local cash = leaderstats and leaderstats:FindFirstChild("Cash")
+	if not (cash and cash.Value >= config.Price) then
+		showNotificationEvent:FireClient(player, "Not enough cash!", "Error")
+		return
+	end
+
+	while not CrateController do task.wait() end
+	if CrateController:PurchaseCrate(player, itemId) then
+		cash.Value -= config.Price
+		if not config.Unlimited then
+			local ok = GlobalShopController:ConsumeWeapons(player, itemId)
+			if not ok then
+				showNotificationEvent:FireClient(player, "This crate just went out of stock!", "Error")
+			end
+		end
+	end
+end
+
+function ShopController:RequestSkipTimer(player: Player, crateModel: Model)
+	local ctype = crateModel:GetAttribute("CrateType")
+	if not ctype then return end
+	local cfg = WeaponConfigurations.Crates[ctype]
+	if not cfg or not cfg.SkipTimerProductID then return end
+	pendingSkips[player] = crateModel
+	promptSkipTimerRequest:FireClient(player, cfg.SkipTimerProductID)
+end
+
+function ShopController:Init(controllers: {[string]: any})
+	PlayerController      = controllers.PlayerController
+	CrateController       = controllers.CrateController
+	BlocksShopController  = controllers.BlocksShopController
+	GlobalShopController  = controllers.GlobalShopController
+	RepairSignController  = controllers.RepairSignController -- no receipt logic inside it
+end
+
+function ShopController:Start()
+	MarketplaceService.ProcessReceipt = processReceipt
+
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, id: number, purchased: boolean)
+		if not purchased then return end
+		local robux = getGamePassPriceR(id)
+		if robux > 0 then RobuxSpent:Fire(player.UserId, robux) end
+	end)
+
+	getResetTime.OnServerInvoke = function()
+		while not GlobalShopController do task.wait() end
+		return GlobalShopController:GetNextRestock()
+	end
+
+	getStocks.OnServerInvoke = function(player)
+		while not GlobalShopController do task.wait() end
+		return GlobalShopController:GetPlayerWeapons(player)
+	end
+
+	purchaseItemEvent.OnServerEvent:Connect(onPurchaseRequest)
+end
+
+return ShopController
+
+---
+
+--- ServerScriptService.Controllers.WeaponController (ModuleScript) ---
+--!strict
+-- This controller securely handles requests to equip, unequip, and select weapons.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local WEAPONS_FOLDER = ReplicatedStorage:WaitForChild("Weapons")
+
+local WaveController
+local PlayerController
+local WeaponController = {}
+
+function WeaponController:UnequipWeapon(player: Player)
+	local character = player.Character
+	if not character then return end
+	local existingTool = character:FindFirstChildOfClass("Tool")
+	if existingTool then
+		existingTool:Destroy()
+	end
+end
+
+function WeaponController:EquipWeapon(player: Player, weaponName: string)
+	local character = player.Character
+	local profile = PlayerController:GetProfile(player)
+	if not character or not profile then return end
+
+	if not table.find(profile.Data.WeaponInventory, weaponName) then
+		-- This can happen if the last equipped weapon was removed from their inventory later.
+		-- Silently fail instead of printing a warning.
+		return
+	end
+
+	self:UnequipWeapon(player)
+
+	local weaponTemplate = WEAPONS_FOLDER:FindFirstChild(weaponName)
+	if weaponTemplate then
+		local newWeapon = weaponTemplate:Clone()
+		newWeapon.Parent = character
+		-- ## REMOVED ## No longer setting the attribute here.
+	end
+end
+
+local function onEquipRequest(player: Player, weaponName: string)
+	if WaveController:IsPlayerFighting(player) then return end
+	WeaponController:EquipWeapon(player, weaponName)
+end
+
+local function onUnequipRequest(player: Player)
+	WeaponController:UnequipWeapon(player)
+end
+
+local function onEquipLastRequest(player: Player)
+	local lastWeapon = player:GetAttribute("LastEquippedWeapon")
+	if typeof(lastWeapon) == "string" then
+		WeaponController:EquipWeapon(player, lastWeapon)
+	end
+end
+
+local function onSetSelectedWeapon(player: Player, weaponName: string)
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	if table.find(profile.Data.WeaponInventory, weaponName) then
+		player:SetAttribute("LastEquippedWeapon", weaponName)
+		profile.Data.LastEquippedWeapon = weaponName
+	end
+end
+
+function WeaponController:Init(controllers: {[string]: any})
+	WaveController = controllers.WaveController
+	PlayerController = controllers.PlayerController
+end
+
+function WeaponController:Start()
+	ReplicatedStorage.Events.EquipWeaponRequest.OnServerEvent:Connect(onEquipRequest)
+	ReplicatedStorage.Events.UnequipWeaponRequest.OnServerEvent:Connect(onUnequipRequest)
+	ReplicatedStorage.Events.EquipLastWeaponRequest.OnServerEvent:Connect(onEquipLastRequest)
+	ReplicatedStorage.Events.SetSelectedWeaponRequest.OnServerEvent:Connect(onSetSelectedWeapon) -- ## ADDED ##
+end
+
+return WeaponController
+---
+
+--- ServerScriptService.Controllers.CrateController (ModuleScript) ---
+--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local WeaponConfigurations = require(ReplicatedStorage.Modules.WeaponConfigurations)
+local PlayerController
+local WeaponsShopController
+
+local CRATE_MODELS = ReplicatedStorage:WaitForChild("Crates")
+
+local BASE_MAX_CRATES = 3
+local GAMEPASS_EXTRA_CRATE_SLOTS = 1572988194
+local EXTRA_SLOTS = 3
+
+local CrateController = {}
+local crateInteractionDebounce: {[Model]: boolean} = {}
+
+local Events = ReplicatedStorage:FindFirstChild("Events") or Instance.new("Folder")
+Events.Name = "Events"
+Events.Parent = ReplicatedStorage
+
+local function ensureRemoteEvent(name: string): RemoteEvent
+	local ev = Events:FindFirstChild(name) :: RemoteEvent?
+	if not ev then ev = Instance.new("RemoteEvent") ev.Name = name ev.Parent = Events end
+	return ev
+end
+
+local UpdateCrateCapacity = ensureRemoteEvent("UpdateCrateCapacity")
+local CrateDataUpdated = ensureRemoteEvent("CrateDataUpdated")
+local ShowModelAward = ensureRemoteEvent("ShowModelAward")
+local WeaponInventoryUpdated = ensureRemoteEvent("WeaponInventoryUpdated")
+local ShowNotification = ensureRemoteEvent("ShowNotification")
+
+function CrateController:GetMaxCrates(player: Player): number
+	local profile = PlayerController and PlayerController:GetProfile(player)
+	local owns = false
+	if profile and profile.Data then
+		owns = profile.Data.OwnsExtraCrateGP == true
+	else
+		local attr = player:GetAttribute("HasCrateSlotsPass")
+		owns = (typeof(attr) == "boolean" and attr) or false
+	end
+	return BASE_MAX_CRATES + (owns and EXTRA_SLOTS or 0)
+end
+
+local function pushCapacityToClient(player: Player)
+	UpdateCrateCapacity:FireClient(player, CrateController:GetMaxCrates(player))
+end
+
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, gamePassId: number, wasPurchased: boolean)
+	if gamePassId ~= GAMEPASS_EXTRA_CRATE_SLOTS then return end
+	local profile = PlayerController and PlayerController:GetProfile(player)
+	if profile and profile.Data then
+		profile.Data.OwnsExtraCrateGP = wasPurchased or profile.Data.OwnsExtraCrateGP
+	end
+	player:SetAttribute("HasCrateSlotsPass", wasPurchased or player:GetAttribute("HasCrateSlotsPass") == true)
+	pushCapacityToClient(player)
+end)
+
+local function getPlotForPlayer(player: Player): Model?
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = Workspace.Plots:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+	for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then return plot end
+	end
+	return nil
+end
+
+local function getAvailableSpawnCount(plot: Model): number
+	local folder = plot:FindFirstChild("Crate")
+	if not folder then return 0 end
+	local n = 0
+	for _, ch in ipairs(folder:GetChildren()) do
+		if ch:IsA("BasePart") and ch.Name:match("^CrateSpawn%d+$") then n += 1 end
+	end
+	if n == 0 then
+		for i = 1, 12 do
+			if folder:FindFirstChild("CrateSpawn" .. i) then n += 1 else break end
+		end
+	end
+	return n
+end
+
+local function onOpenCrate(player: Player, crateModel: Model)
+	local profile = PlayerController:GetProfile(player)
+	if not profile or not crateModel.Parent then return end
+	local spawnIndex = crateModel:GetAttribute("SpawnIndex")
+	local crateDataIndex = -1
+	for i, data in ipairs(profile.Data.Crates) do
+		if data.SpawnIndex == spawnIndex then crateDataIndex = i break end
+	end
+	if crateDataIndex == -1 then return end
+	local crateType = profile.Data.Crates[crateDataIndex].Type
+	local lootTable = WeaponConfigurations.Crates[crateType].Loot
+	local totalWeight = 0
+	for _, loot in ipairs(lootTable) do totalWeight += loot.Weight end
+	local roll = math.random() * totalWeight
+	local chosenWeaponId: string = lootTable[#lootTable].Item
+	for _, loot in ipairs(lootTable) do
+		if roll <= loot.Weight then chosenWeaponId = loot.Item break else roll -= loot.Weight end
+	end
+	if chosenWeaponId and not table.find(profile.Data.WeaponInventory, chosenWeaponId) then
+		table.insert(profile.Data.WeaponInventory, chosenWeaponId)
+	end
+	table.remove(profile.Data.Crates, crateDataIndex)
+	crateModel:Destroy()
+	local weaponConfig = WeaponConfigurations.Weapons[chosenWeaponId]
+	ShowModelAward:FireClient(player, weaponConfig.DisplayName, weaponConfig.ImageId)
+	WeaponInventoryUpdated:FireClient(player, profile.Data.WeaponInventory)
+	CrateDataUpdated:FireClient(player, profile.Data.Crates)
+end
+
+function CrateController:SpawnCrateModel(plot: Model, crateData: table)
+	local crateTemplate = CRATE_MODELS:FindFirstChild(crateData.Type)
+	local crateSpawns = plot:FindFirstChild("Crate")
+	if not crateTemplate or not crateSpawns or not crateTemplate.PrimaryPart then return end
+	local spawnPart = crateSpawns:FindFirstChild("CrateSpawn" .. crateData.SpawnIndex)
+	if not spawnPart then return end
+	local newCrate = crateTemplate:Clone()
+	newCrate:SetAttribute("OwnerId", plot:GetAttribute("OwnerId"))
+	newCrate:SetAttribute("UnlockTimestamp", crateData.UnlockTimestamp)
+	newCrate:SetAttribute("SpawnIndex", crateData.SpawnIndex)
+	newCrate:SetAttribute("CrateType", crateData.Type)
+	newCrate:SetPrimaryPartCFrame(spawnPart.CFrame * CFrame.new(0, 3, 0))
+	newCrate.Parent = crateSpawns
+	newCrate.PrimaryPart.Touched:Connect(function(hit)
+		if crateInteractionDebounce[newCrate] then return end
+		local toucher = hit.Parent
+		if not toucher then return end
+		local player = Players:GetPlayerFromCharacter(toucher)
+		if not player or player.UserId ~= newCrate:GetAttribute("OwnerId") then return end
+		crateInteractionDebounce[newCrate] = true
+		local unlockTime = newCrate:GetAttribute("UnlockTimestamp")
+		if os.time() >= unlockTime then
+			onOpenCrate(player, newCrate)
+			crateInteractionDebounce[newCrate] = nil
+		else
+			while not WeaponsShopController do task.wait() end
+			WeaponsShopController:RequestSkipTimer(player, newCrate)
+			task.delay(2, function() crateInteractionDebounce[newCrate] = nil end)
+		end
+	end)
+end
+
+function CrateController:PurchaseCrate(player: Player, crateId: string, isRobuxPurchase: boolean?): boolean
+	local profile = PlayerController:GetProfile(player)
+	local plot = getPlotForPlayer(player)
+	if not profile or not plot then return false end
+	local maxByPass = self:GetMaxCrates(player)
+	local availableSpawns = getAvailableSpawnCount(plot)
+	local capacity = math.max(1, math.min(maxByPass, availableSpawns))
+	if #profile.Data.Crates >= capacity then
+		if not isRobuxPurchase then ShowNotification:FireClient(player, "All crate slots are full!", "Error") end
+		return false
+	end
+	local usedIndexes: {[number]: true} = {}
+	for _, existingCrate in ipairs(profile.Data.Crates) do
+		usedIndexes[existingCrate.SpawnIndex] = true
+	end
+	local spawnIndex = -1
+	for i = 1, capacity do
+		if not usedIndexes[i] then spawnIndex = i break end
+	end
+	if spawnIndex == -1 then
+		if not isRobuxPurchase then ShowNotification:FireClient(player, "All crate slots are full!", "Error") end
+		return false
+	end
+	local crateConfig = WeaponConfigurations.Crates[crateId]
+	if not crateConfig then return false end
+	local unlockTimestamp = os.time() + crateConfig.UnlockTime
+	local crateData = { Type = crateId, SpawnIndex = spawnIndex, UnlockTimestamp = unlockTimestamp }
+	table.insert(profile.Data.Crates, crateData)
+	self:SpawnCrateModel(plot, crateData)
+	if not isRobuxPurchase then ShowNotification:FireClient(player, "Crate purchased and placed on your plot!", "Success") end
+	CrateDataUpdated:FireClient(player, profile.Data.Crates)
+	return true
+end
+
+function CrateController:LoadPlayerCrates(player: Player, plot: Model)
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+	for _, crateData in ipairs(profile.Data.Crates) do
+		self:SpawnCrateModel(plot, crateData)
+	end
+	pushCapacityToClient(player)
+end
+
+function CrateController:Init(controllers: {[string]: any})
+	PlayerController = controllers.PlayerController
+	WeaponsShopController = controllers.WeaponsShopController
+	Players.PlayerAdded:Connect(function(plr)
+		task.defer(pushCapacityToClient, plr)
+	end)
+	Players.PlayerRemoving:Connect(function(plr)
+		crateInteractionDebounce = {}
+	end)
+end
+
+function CrateController:Start() end
+
+return CrateController
+
+---
+
+--- ServerScriptService.Controllers.ShopTimerController (ModuleScript) ---
+--!strict
+-- GLOBAL SHOP TIMER CONTROLLER
+
+local RunService = game:GetService("RunService")
+
+local GlobalShopController
+local Controller = {}
+local INTERVAL = 5
+local acc = 0
+
+function Controller:Init(controllers: {[string]: any})
+	GlobalShopController = controllers.GlobalShopController
+end
+
+function Controller:Start()
+	RunService.Heartbeat:Connect(function(dt)
+		acc += dt
+		if acc < INTERVAL then return end
+		acc = 0
+		if GlobalShopController and GlobalShopController.CheckAndRestockDue then
+			GlobalShopController:CheckAndRestockDue()
+		end
+	end)
+end
+
+return Controller
+
+---
+
+--- ServerScriptService.Controllers.GroupRewardController (ModuleScript) ---
+--!strict
+-- Uses PlayerController profile flag: HasClaimedGroupReward
+-- Notifies via ReplicatedStorage.Events.ShowNotification (consumed by your NotificationManager)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Controller = {} :: any
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local GROUP_ID = 35962500                 
+local TOUCH_MODEL_NAME = "GroupTouch"     
+local TOUCH_PART_NAME  = "Touch"          
+
+-- Reward item id as defined in your ItemConfigurations (Type = "Turrets")
+local REWARD_ITEM_ID = "RifleGuard"
+
+-- logging level: "debug" | "info" | "warn" | "error"
+local LOG_LEVEL = "info"
+
+
+
+local LV = {debug=1, info=2, warn=3, error=4}
+local CUR = LV[LOG_LEVEL] or LV.info
+local function log(level: string, ...)
+	if (LV[level] or 9) < CUR then return end
+	--print(("[GroupReward][%s] "):format(level:upper()), ...)
+end
+local function dbg(...)  log("debug", ...) end
+local function info(...) log("info",  ...) end
+local function warnl(...)log("warn",  ...) end
+local function errl(...) log("error", ...) end
+
+
+local _controllers: {[string]: any}? = nil
+local touchCounts: {[Player]: number} = {}  
+
+
+local EventsFolder: Folder = ReplicatedStorage:WaitForChild("Events")
+local ShowNotification: RemoteEvent = EventsFolder:WaitForChild("ShowNotification")
+local BlockInventoryUpdated: RemoteEvent = EventsFolder:WaitForChild("BlockInventoryUpdated")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local ItemConfigurations = require(Modules:WaitForChild("ItemConfigurations"))
+
+
+local function setPadText(model: Model, top: string?, bottom: string?)
+	local gui = model:FindFirstChild("DecorGUI")
+	if not gui then return end
+	local topLbl = gui:FindFirstChild("Text")
+	local subLbl = gui:FindFirstChild("Text+") or (function()
+		local list = {}
+		for _,c in ipairs(gui:GetChildren()) do
+			if c:IsA("TextLabel") and c.Name=="Text" then table.insert(list, c) end
+		end
+		return list[2]
+	end)()
+	if topLbl and topLbl:IsA("TextLabel") and top then topLbl.Text = top end
+	if subLbl and subLbl:IsA("TextLabel") and bottom then subLbl.Text = bottom end
+end
+
+local function isInGroup(plr: Player): boolean
+	local ok, rank = pcall(function() return plr:GetRankInGroup(GROUP_ID) end)
+	if not ok then
+		errl("GetRankInGroup failed for", plr.Name)
+		return false
+	end
+	return (rank or 0) > 0
+end
+
+
+local function getProfile(plr: Player)
+	if not _controllers then return nil end
+	local pc = _controllers.PlayerController
+	if not pc then return nil end
+	local ok, profile = pcall(function() return pc:GetProfile(plr) end)
+	if ok then return profile end
+	return nil
+end
+
+local function alreadyClaimed(plr: Player): boolean
+	local profile = getProfile(plr)
+	if profile and profile.Data then
+		return profile.Data.HasClaimedGroupReward == true
+	end
+	return plr:GetAttribute("GroupRewardClaimed") == true
+end
+
+local function markClaimed(plr: Player)
+	local profile = getProfile(plr)
+	if profile and profile.Data then
+		profile.Data.HasClaimedGroupReward = true
+	end
+	plr:SetAttribute("GroupRewardClaimed", true)
+end
+
+
+local function grantInventoryTurret(plr: Player): (boolean, string?)
+	local profile = getProfile(plr)
+	if not (profile and profile.Data) then
+		return false, "Profile not ready"
+	end
+	local cfg = ItemConfigurations[REWARD_ITEM_ID]
+	if not cfg then
+		return false, "ItemConfigurations missing entry for "..REWARD_ITEM_ID
+	end
+	if cfg.Type ~= "Turrets" then
+		warnl("Reward item is not Type='Turrets':", REWARD_ITEM_ID, "Type:", tostring(cfg.Type))
+	end
+
+	local inv = profile.Data.BlockInventory
+	inv[REWARD_ITEM_ID] = (inv[REWARD_ITEM_ID] or 0) + 1
+
+
+	BlockInventoryUpdated:FireClient(plr, inv)
+
+
+	if not profile.Data.HasCompletedOnboarding and cfg.Type == "Turrets" then
+		local UpdateOnboarding = EventsFolder:FindFirstChild("UpdateOnboardingStep")
+		if UpdateOnboarding and UpdateOnboarding:IsA("RemoteEvent") then
+			UpdateOnboarding:FireClient(plr, "Step2_PlaceTurret")
+		end
+	end
+
+	return true
+end
+
+
+local function onEnterPad(model: Model, plr: Player)
+	for _ = 1, 50 do
+		if getProfile(plr) then break end
+		task.wait(0.1)
+	end
+
+	if alreadyClaimed(plr) then
+		-- One notification per entry only
+		ShowNotification:FireClient(plr, "Already claimed", "Normal")
+		setPadText(model, "Already claimed", "Enjoy!")
+		return
+	end
+
+	if not isInGroup(plr) then
+		ShowNotification:FireClient(plr, "Join our group first!", "Error")
+		setPadText(model, "Join our group!", "Then step on the pad")
+		return
+	end
+
+	local ok, err = grantInventoryTurret(plr)
+	if not ok then
+		errl("Grant failed for", plr.Name, err or "?")
+		ShowNotification:FireClient(plr, "Reward error, try again", "Error")
+		return
+	end
+
+	markClaimed(plr)
+	ShowNotification:FireClient(plr, "🎉 Rifle Guard added to your inventory!", "Success")
+	setPadText(model, "Reward claimed!", "Open Inventory")
+	info("Granted RifleGuard (inventory) to", plr.Name, plr.UserId)
+end
+
+
+function Controller:Init(controllers: {[string]: any})
+	_controllers = controllers
+
+
+	Players.PlayerAdded:Connect(function(plr)
+		task.spawn(function()
+			for _ = 1, 50 do
+				local profile = getProfile(plr)
+				if profile then
+					if profile.Data.HasClaimedGroupReward then
+						plr:SetAttribute("GroupRewardClaimed", true)
+						dbg("Pre-marked claimed for", plr.Name)
+					end
+					break
+				end
+				task.wait(0.1)
+			end
+		end)
+	end)
+end
+
+function Controller:Start()
+	info("Starting GroupRewardController • GROUP_ID =", GROUP_ID)
+
+	local model = Workspace:FindFirstChild(TOUCH_MODEL_NAME)
+	if not model or not model:IsA("Model") then
+		warnl("Workspace."..TOUCH_MODEL_NAME.." not found; waiting…")
+		model = Workspace:WaitForChild(TOUCH_MODEL_NAME, 10) :: any
+	end
+	if not model or not model:IsA("Model") then
+		errl("GroupTouch model missing; aborting")
+		return
+	end
+
+	local touch = model:FindFirstChild(TOUCH_PART_NAME)
+	if not touch or not touch:IsA("BasePart") then
+		errl(("GroupTouch.%s missing or not a BasePart"):format(TOUCH_PART_NAME))
+		return
+	end
+
+
+	setPadText(model, "Free Turret", "Like game & join group!")
+
+
+	touch.Touched:Connect(function(hit)
+		local char = hit and hit.Parent
+		local plr = char and Players:GetPlayerFromCharacter(char)
+		if not plr then return end
+
+
+		local n = (touchCounts[plr] or 0) + 1
+		touchCounts[plr] = n
+		if n == 1 then
+			onEnterPad(model, plr)
+		end
+	end)
+
+
+	touch.TouchEnded:Connect(function(hit)
+		local char = hit and hit.Parent
+		local plr = char and Players:GetPlayerFromCharacter(char)
+		if not plr then return end
+		local n = (touchCounts[plr] or 0) - 1
+		if n < 0 then n = 0 end
+		touchCounts[plr] = n
+	end)
+
+	info("Pad armed:", model:GetFullName(), "->", touch:GetFullName())
+end
+
+return Controller
+
+---
+
+--- ServerScriptService.Controllers.LeaderboardController (Script) ---
+--!strict
+
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService  = game:GetService("DataStoreService")
+local Players           = game:GetService("Players")
+local Workspace         = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("LeaderboardConfig"))
+
+local dsCash   = DataStoreService:GetOrderedDataStore(Config.DataStores.MostCash)
+local dsWaves  = DataStoreService:GetOrderedDataStore(Config.DataStores.MostWaves)
+local dsTime   = DataStoreService:GetOrderedDataStore(Config.DataStores.MostPlaytime)
+local dsSpent  = DataStoreService:GetOrderedDataStore(Config.DataStores.MostRobuxSpent) -- NEW
+
+
+local function findDescendantByNameCI(root: Instance, name: string): Instance?
+	local target = string.lower(name)
+	for _, inst in ipairs(root:GetDescendants()) do
+		if string.lower(inst.Name) == target then
+			return inst
+		end
+	end
+	return nil
+end
+
+local function getLeaderboardsFolder(): Instance?
+	return findDescendantByNameCI(Workspace, "Leaderboards")
+end
+
+local function getBoardPart(modelName: string): BasePart?
+	local lbFolder = getLeaderboardsFolder()
+	if not lbFolder then return nil end
+
+	local model = findDescendantByNameCI(lbFolder, modelName)
+	if not (model and model:IsA("Model")) then return nil end
+
+	local board = model:FindFirstChild(Config.BoardPartName)
+	if board and board:IsA("BasePart") then
+		return board
+	end
+	return nil
+end
+
+local function ensureGui(part: BasePart, title: string): Frame
+	local sg = part:FindFirstChild("BoardGui") :: SurfaceGui
+	if not sg then
+		sg = Instance.new("SurfaceGui")
+		sg.Name = "BoardGui"
+		sg.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		sg.PixelsPerStud = Config.UI.PixelsPerStud
+		sg.CanvasSize = Config.UI.CanvasSize
+		sg.Face = Enum.NormalId.Right 
+		sg.Parent = part
+	else
+		sg.Face = Enum.NormalId.Right
+	end
+
+	local root = sg:FindFirstChild("Root") :: Frame
+	if not root then
+		root = Instance.new("Frame")
+		root.Name = "Root"
+		root.Size = UDim2.fromScale(1,1)
+		root.BackgroundColor3 = Config.UI.Bg
+		root.BorderSizePixel = 0
+		root.Parent = sg
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Config.UI.Stroke
+		stroke.Thickness = 8
+		stroke.Parent = root
+
+		local pad = Instance.new("UIPadding")
+		pad.PaddingTop    = UDim.new(0, 22)
+		pad.PaddingBottom = UDim.new(0, 22)
+		pad.PaddingLeft   = UDim.new(0, 22)
+		pad.PaddingRight  = UDim.new(0, 22)
+		pad.Parent = root
+
+		local list = Instance.new("UIListLayout")
+		list.Padding = UDim.new(0, Config.UI.RowPad)
+		list.FillDirection = Enum.FillDirection.Vertical
+		list.SortOrder = Enum.SortOrder.LayoutOrder
+		list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		list.Parent = root
+
+		local titleLbl = Instance.new("TextLabel")
+		titleLbl.Name = "Title"
+		titleLbl.LayoutOrder = 0
+		titleLbl.Size = UDim2.new(1, -20, 0, 60)
+		titleLbl.BackgroundTransparency = 1
+		titleLbl.Font = Enum.Font.GothamBlack
+		titleLbl.TextScaled = true
+		titleLbl.TextWrapped = true
+		titleLbl.TextColor3 = Config.UI.TitleColor
+		titleLbl.Text = title
+		titleLbl.Parent = root
+	end
+	(root:FindFirstChild("Title") :: TextLabel).Text = title
+	return root
+end
+
+local function clearRows(root: Frame)
+	for _, c in ipairs(root:GetChildren()) do
+		if c:IsA("Frame") and c.Name == "Row" then c:Destroy() end
+	end
+end
+
+local function makeRow(parent: Instance, rank: number, userId: number, valueText: string)
+	local f = Instance.new("Frame")
+	f.Name = "Row"
+	f.Size = UDim2.new(1, -10, 0, 46)
+	f.BackgroundTransparency = 0.2
+	f.BackgroundColor3 = (rank % 2 == 0) and Color3.fromRGB(12,60,105) or Color3.fromRGB(10,50,90)
+	f.BorderSizePixel = 0
+	f.LayoutOrder = rank
+	f.Parent = parent
+
+	local ui = Instance.new("UIListLayout")
+	ui.FillDirection = Enum.FillDirection.Horizontal
+	ui.Padding = UDim.new(0, 10)
+	ui.Parent = f
+
+	local rankLbl = Instance.new("TextLabel")
+	rankLbl.Size = UDim2.new(0, 60, 1, 0)
+	rankLbl.BackgroundTransparency = 1
+	rankLbl.Font = Enum.Font.GothamBold
+	rankLbl.TextScaled = true
+	rankLbl.TextColor3 = Config.UI.TextColor
+	rankLbl.Text = "#" .. tostring(rank)
+	rankLbl.Parent = f
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, -260, 1, 0)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Font = Enum.Font.Gotham
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.TextScaled = true
+	nameLbl.TextColor3 = Config.UI.TextColor
+	nameLbl.Text = ("Player %d"):format(userId)
+	nameLbl.Parent = f
+
+	local valueLbl = Instance.new("TextLabel")
+	valueLbl.Size = UDim2.new(0, 180, 1, 0)
+	valueLbl.BackgroundTransparency = 1
+	valueLbl.Font = Enum.Font.GothamBold
+	valueLbl.TextScaled = true
+	valueLbl.TextXAlignment = Enum.TextXAlignment.Right
+	valueLbl.TextColor3 = Config.UI.TextColor
+	valueLbl.Text = valueText
+	valueLbl.Parent = f
+
+	task.spawn(function()
+		local ok, result = pcall(function()
+			return Players:GetNameFromUserIdAsync(userId)
+		end)
+		if ok and result then
+			nameLbl.Text = result end
+	end)
+end
+
+local function secondsToHMS(total: number): string
+	total = math.max(0, math.floor(total + 0.5))
+	local h = math.floor(total/3600)
+	local m = math.floor((total%3600)/60)
+	local s = total%60
+	if h > 0 then
+		return string.format("%dh %dm %ds", h, m, s)
+	else
+		return string.format("%dm %ds", m, s)
+	end
+end
+
+local function abbrev(n: number): string
+	if n >= 1e12 then return string.format("%.2fT", n/1e12)
+	elseif n >= 1e9 then return string.format("%.2fB", n/1e9)
+	elseif n >= 1e6 then return string.format("%.2fM", n/1e6)
+	elseif n >= 1e3 then return string.format("%.2fk", n/1e3)
+	else return tostring(n) end
+end
+
+local function pullTop(ds: OrderedDataStore, limit: number)
+	for i=1,3 do
+		local ok, result = pcall(function()
+			return ds:GetSortedAsync(false, limit) -- false = descending
+		end)
+		if ok then
+			return (result :: DataStorePages):GetCurrentPage()
+		end
+		task.wait(0.75 * i)
+	end
+	warn("[LeaderboardController] GetSortedAsync failed")
+	return {}
+end
+
+local function isStudioDummyName(name: string): boolean
+	name = tostring(name)
+	-- Matches Player -1, Player -2, Player 1, Player 2, Player1, etc.
+	return name:match("^Player%s*%-?%d+$") ~= nil
+end
+
+local function render(part: BasePart, title: string, ds: OrderedDataStore, valueFmt: (number)->string)
+	local root = ensureGui(part, title)
+	clearRows(root)
+
+	local data = pullTop(ds, Config.Limit)
+	local shown = 0
+
+	for _, entry in ipairs(data) do
+		local uid = tonumber(entry.key) or 0
+		local val = tonumber(entry.value) or 0
+
+		-- Try to resolve the username
+		local ok, name = pcall(function()
+			return Players:GetNameFromUserIdAsync(uid)
+		end)
+
+		-- ✅ Skip fake studio users (Player -1, Player -2, etc.)
+		if ok and name and not isStudioDummyName(name) then
+			shown += 1
+			makeRow(root, shown, uid, valueFmt(val))
+		end
+	end
+end
+
+
+task.spawn(function()
+	local cashPart  = getBoardPart(Config.ModelNames.Cash)
+	local wavesPart = getBoardPart(Config.ModelNames.Waves)
+	local timePart  = getBoardPart(Config.ModelNames.Playtime)
+	local spentPart = getBoardPart(Config.ModelNames.Robux) -- NEW
+
+	-- immediate render
+	if cashPart  then render(cashPart,  "Most Cash",        dsCash,  function(n) return "$"..abbrev(n) end) end
+	if wavesPart then render(wavesPart, "Most Waves",       dsWaves, function(n) return "Wave "..tostring(n) end) end
+	if timePart  then render(timePart,  "Most Playtime",    dsTime,  function(n) return secondsToHMS(n) end) end
+	if spentPart then render(spentPart, "Most Robux Spent", dsSpent, function(n) return "R$ "..abbrev(n) end) end
+
+	while true do
+		if cashPart  then render(cashPart,  "Most Cash",        dsCash,  function(n) return "$"..abbrev(n) end) end
+		if wavesPart then render(wavesPart, "Most Waves",       dsWaves, function(n) return "Wave "..tostring(n) end) end
+		if timePart  then render(timePart,  "Most Playtime",    dsTime,  function(n) return secondsToHMS(n) end) end
+		if spentPart then render(spentPart, "Most Robux Spent", dsSpent, function(n) return "R$ "..abbrev(n) end) end
+		task.wait(Config.PullInterval)
+	end
+end)
+
+---
+
+--- ServerScriptService.Controllers.LeaderboardWriter (Script) ---
+--!strict
+
+
+local Players            = game:GetService("Players")
+local DataStoreService   = game:GetService("DataStoreService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("LeaderboardConfig"))
+
+local dsCash   = DataStoreService:GetOrderedDataStore(Config.DataStores.MostCash)
+local dsWaves  = DataStoreService:GetOrderedDataStore(Config.DataStores.MostWaves)
+local dsTime   = DataStoreService:GetOrderedDataStore(Config.DataStores.MostPlaytime)
+local dsSpent  = DataStoreService:GetOrderedDataStore(Config.DataStores.MostRobuxSpent) -- NEW
+
+local sessionStart: {[number]: number} = {}
+local lastWrite: {[string]: number} = {}
+
+
+local SignalsFolder = ReplicatedStorage:FindFirstChild("Signals") or Instance.new("Folder")
+SignalsFolder.Name = "Signals"
+SignalsFolder.Parent = ReplicatedStorage
+
+local RobuxSpentEvent = SignalsFolder:FindFirstChild("RobuxSpent")
+if not RobuxSpentEvent then
+	RobuxSpentEvent = Instance.new("BindableEvent")
+	RobuxSpentEvent.Name = "RobuxSpent"
+	RobuxSpentEvent.Parent = SignalsFolder
+end
+local RobuxSpentBindable = RobuxSpentEvent :: BindableEvent
+
+local function now() return os.time() end
+
+local function throttle(key: string, seconds: number): boolean
+	local t = now()
+	local last = lastWrite[key]
+	if not last or t - last >= seconds then
+		lastWrite[key] = t
+		return true
+	end
+	return false
+end
+
+local function safeSet(ds: OrderedDataStore, key: string, value: number)
+	for i=1,3 do
+		local ok = pcall(function() ds:SetAsync(key, value) end)
+		if ok then return end
+		task.wait(0.75 * i)
+	end
+	warn("[LeaderboardWriter] SetAsync failed for", key, value)
+end
+
+local function addNumber(ds: OrderedDataStore, userKey: string, addAmount: number)
+	if addAmount == 0 then return end
+	for i=1,3 do
+		local ok = pcall(function()
+			ds:UpdateAsync(userKey, function(old)
+				old = typeof(old) == "number" and old or 0
+				return math.max(0, old + addAmount)
+			end)
+		end)
+		if ok then return end
+		task.wait(0.75 * i)
+	end
+	warn("[LeaderboardWriter] UpdateAsync failed for", userKey, addAmount)
+end
+
+local function addPlaytime(userKey: string, addSeconds: number)
+	if addSeconds <= 0 then return end
+	addNumber(dsTime, userKey, addSeconds)
+end
+
+local function addRobuxSpent(userKey: string, addRobux: number)
+	if addRobux <= 0 then return end
+	addNumber(dsSpent, userKey, addRobux)
+end
+
+local function pushCash(plr: Player, value: number)
+	local key = tostring(plr.UserId)
+	if throttle("cash"..key, 10) then
+		safeSet(dsCash, key, value)
+	end
+end
+
+local function pushWaves(plr: Player, value: number)
+	local key = tostring(plr.UserId)
+	if throttle("wave"..key, 10) then
+		safeSet(dsWaves, key, value)
+	end
+end
+
+
+RobuxSpentBindable.Event:Connect(function(userId: number, amountRobux: number)
+	if typeof(userId) ~= "number" or typeof(amountRobux) ~= "number" then return end
+	if amountRobux <= 0 then return end
+	addRobuxSpent(tostring(userId), amountRobux)
+end)
+
+
+
+Players.PlayerAdded:Connect(function(plr)
+	sessionStart[plr.UserId] = now()
+
+	task.defer(function()
+		local ls = plr:WaitForChild("leaderstats", 15)
+		if not ls then return end
+
+		local cash = ls:FindFirstChild("Cash")
+		if cash and cash:IsA("IntValue") then
+			pushCash(plr, cash.Value)
+			cash:GetPropertyChangedSignal("Value"):Connect(function()
+				pushCash(plr, cash.Value)
+			end)
+		end
+
+		local waves = ls:FindFirstChild("Highest Wave")
+		if waves and waves:IsA("IntValue") then
+			pushWaves(plr, waves.Value)
+			waves:GetPropertyChangedSignal("Value"):Connect(function()
+				pushWaves(plr, waves.Value)
+			end)
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	local start = sessionStart[plr.UserId]
+	if start then
+		addPlaytime(tostring(plr.UserId), now() - start)
+		sessionStart[plr.UserId] = nil
+	end
+
+	local ls = plr:FindFirstChild("leaderstats")
+	if ls then
+		local c = ls:FindFirstChild("Cash")
+		if c and c:IsA("IntValue") then pushCash(plr, c.Value) end
+		local w = ls:FindFirstChild("Highest Wave")
+		if w and w:IsA("IntValue") then pushWaves(plr, w.Value) end
+	end
+end)
+
+---
+
+--- ServerScriptService.Controllers.PlotSignagneController (ModuleScript) ---
+--!strict
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local PlotSignageController = {}
+
+
+local PLOT_FOLDER_NAME: string? = "Plots" 
+local SIGN_MODEL_NAME = "PlotSignage"
+local SIGN_PART_NAME  = "Screen"
+local GUI_NAME        = "SignGui"
+
+-- SurfaceGui sizing
+local CANVAS_SIZE = Vector2.new(900, 400)
+local PIXELS_PER_STUD = 75
+
+-- Visual style
+local BG_TRANSPARENCY = 1
+local TEXT_COLOR      = Color3.fromRGB(255,255,255)
+local TEXT_STROKE     = Color3.fromRGB(0,0,0)
+local TEXT_STROKE_T   = 0
+local TEXT_STROKE_Size = 3
+local FONT            = Enum.Font.FredokaOne
+local AVATAR_SIZE     = UDim2.fromScale(0.28, 0.8)
+local AVATAR_ASPECT   = 1.0
+
+
+
+
+local function possessive(name: string): string
+	local last = name:sub(-1):lower()
+	if last == "s" then
+		return name .. "’"
+	else
+		return name .. "'s"
+	end
+end
+
+local function getOwnerUserId(plot: Instance): number?
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local attr = plot:GetAttribute(key)
+		if typeof(attr) == "number" then
+			return attr
+		end
+	end
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local iv = plot:FindFirstChild(key)
+		if iv and iv:IsA("IntValue") then
+			return iv.Value
+		end
+	end
+	return nil
+end
+
+local function getNameAndThumb(userId: number): (string, string)
+	local okName, playerName = pcall(Players.GetNameFromUserIdAsync, Players, userId)
+	if not okName then
+		playerName = ("User %d"):format(userId)
+	end
+	local thumbUrl = ""
+	local okThumb, url = pcall(Players.GetUserThumbnailAsync, Players, userId,
+		Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+	if okThumb then
+		thumbUrl = url
+	end
+	return playerName, thumbUrl
+end
+
+local function clearOldGui(screen: BasePart)
+	for _, child in ipairs(screen:GetChildren()) do
+		if child:IsA("SurfaceGui") and child.Name == GUI_NAME then
+			child:Destroy()
+		end
+	end
+end
+
+local function makeGui(screen: BasePart, titleText: string, thumbUrl: string)
+	clearOldGui(screen)
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = GUI_NAME
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = PIXELS_PER_STUD
+	gui.CanvasSize = CANVAS_SIZE
+	gui.Adornee = screen
+	gui.Face = Enum.NormalId.Front
+	gui.AlwaysOnTop = false
+	gui.Parent = screen
+
+	local bg = Instance.new("Frame")
+	bg.Name = "BG"
+	bg.Size = UDim2.fromScale(1,1)
+	bg.BackgroundTransparency = BG_TRANSPARENCY
+	bg.Parent = gui
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Name = "Avatar"
+	avatar.Size = AVATAR_SIZE
+	avatar.Position = UDim2.fromScale(0.05, 0.1)
+	avatar.BackgroundTransparency = 1
+	avatar.Image = (thumbUrl ~= "" and thumbUrl) or "rbxassetid://0"
+	avatar.Parent = bg
+	local uic = Instance.new("UICorner")
+	uic.CornerRadius = UDim.new(0, 30)
+	uic.Parent = avatar
+	local uiAspect = Instance.new("UIAspectRatioConstraint")
+	uiAspect.AspectRatio = AVATAR_ASPECT
+	uiAspect.Parent = avatar
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.AnchorPoint = Vector2.new(0, 0.5)
+	title.Position   = UDim2.fromScale(0.36, 0.5)
+	title.Size       = UDim2.fromScale(0.6, 0.8)
+	title.BackgroundTransparency = 1
+	title.Text = titleText
+	title.TextColor3 = TEXT_COLOR
+	title.Font = FONT
+	title.TextScaled = true
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = bg
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = TEXT_STROKE_Size
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+	stroke.Color = TEXT_STROKE
+	stroke.Transparency = TEXT_STROKE_T
+	stroke.Parent = title
+end
+
+local function isPlotModel(inst: Instance): boolean
+	if not inst:IsA("Model") then return false end
+	local signage = inst:FindFirstChild(SIGN_MODEL_NAME)
+	if not (signage and signage:IsA("Model")) then return false end
+	local screen = signage:FindFirstChild(SIGN_PART_NAME)
+	return (screen ~= nil) and screen:IsA("BasePart")
+end
+
+local function updatePlotSign(plot: Instance)
+	local signage = plot:FindFirstChild(SIGN_MODEL_NAME)
+	if not signage or not signage:IsA("Model") then
+		warn(("[Signage] Missing %s in %s"):format(SIGN_MODEL_NAME, plot:GetFullName()))
+		return
+	end
+	local screen = signage:FindFirstChild(SIGN_PART_NAME) :: BasePart?
+	if not screen or not screen:IsA("BasePart") then
+		warn(("[Signage] Missing %s part under %s"):format(SIGN_PART_NAME, signage:GetFullName()))
+		return
+	end
+
+	local userId = getOwnerUserId(plot)
+	if not userId then
+		clearOldGui(screen)
+		return
+	end
+
+	local playerName, thumbUrl = getNameAndThumb(userId)
+	local title = ("%s Base"):format(possessive(playerName))
+	makeGui(screen, title, thumbUrl)
+	--print(("[Signage] Updated %s -> %s (%d)"):format(plot.Name, playerName, userId))
+end
+
+local function hookOwnerChanges(plot: Instance)
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		plot:GetAttributeChangedSignal(key):Connect(function()
+			updatePlotSign(plot)
+		end)
+	end
+
+	local function watch(iv: IntValue)
+		iv.Changed:Connect(function()
+			updatePlotSign(plot)
+		end)
+	end
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local iv = plot:FindFirstChild(key)
+		if iv and iv:IsA("IntValue") then
+			watch(iv)
+		end
+	end
+	plot.ChildAdded:Connect(function(ch)
+		if ch:IsA("IntValue") and (ch.Name == "OwnerId" or ch.Name == "OwnerUserId") then
+			watch(ch)
+			updatePlotSign(plot)
+		end
+	end)
+end
+
+
+
+function PlotSignageController:Init()
+	-- nothing to wire from other controllers
+end
+
+function PlotSignageController:Start()
+	local container: Instance = Workspace
+	if PLOT_FOLDER_NAME then
+		local f = Workspace:FindFirstChild(PLOT_FOLDER_NAME)
+		if f then container = f end
+	end
+
+
+	for _, inst in ipairs(container:GetDescendants()) do
+		if isPlotModel(inst) then
+			updatePlotSign(inst)
+			hookOwnerChanges(inst)
+		end
+	end
+
+	-- React to new plots added
+	container.DescendantAdded:Connect(function(inst)
+		if isPlotModel(inst) then
+			task.defer(function()
+				updatePlotSign(inst)
+				hookOwnerChanges(inst)
+			end)
+		end
+	end)
+
+--	print("[Signage] Controller started")
+end
+
+return PlotSignageController
+
+---
+
+--- ServerScriptService.Controllers.MoveModelsController (ModuleScript) ---
+--!strict
+local RunService    = game:GetService("RunService")
+local Workspace     = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage")
+
+local TARGET_NAME = "STUDIO_MODELS"
+
+local function move(inst: Instance)
+	if not inst or not inst.Parent or inst.Parent == ServerStorage then return end
+	if RunService:IsClient() then return end
+	inst.Parent = ServerStorage
+	--print(("[STUDIO_MODELS] Moved to ServerStorage: %s"):format(inst:GetFullName()))
+end
+
+local function sweep()
+	local direct = Workspace:FindFirstChild(TARGET_NAME)
+	if direct then move(direct) end
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d.Name == TARGET_NAME and (d:IsA("Folder") or d:IsA("Model")) then
+			move(d)
+		end
+	end
+end
+
+local MoveStudioModelsController = {}
+
+function MoveStudioModelsController:Init(_controllers) end
+
+function MoveStudioModelsController:Start()
+	if RunService:IsClient() then return end
+	sweep()
+	Workspace.ChildAdded:Connect(function(child)
+		if child.Name == TARGET_NAME and (child:IsA("Folder") or child:IsA("Model")) then
+			move(child)
+		end
+	end)
+	Workspace.DescendantAdded:Connect(function(inst)
+		if inst.Name == TARGET_NAME and (inst:IsA("Folder") or inst:IsA("Model")) then
+			task.defer(function()
+				if inst and inst.Parent and inst.Parent ~= ServerStorage then
+					move(inst)
+				end
+			end)
+		end
+	end)
+end
+
+return MoveStudioModelsController
+
+---
+
+--- ServerScriptService.Controllers.GlobalShopController (ModuleScript) ---
+--!strict
+-- GLOBAL SHOP CONTROLLER (Deterministic, Cross-Server Identical + Per-Player Persistent Stock)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local ItemConfigurations = require(Modules:WaitForChild("ItemConfigurations"))
+local WeaponConfigurations = require(Modules:WaitForChild("WeaponConfigurations"))
+
+local GlobalShop = {}
+
+-- ===== CONFIG =====
+local RESTOCK_INTERVAL = 300 -- 5 minutes aligned to wall clock
+local GUARANTEED_BLOCK_ITEMS = { "WoodenFence", "RevolverGuard" }
+
+-- ===== STATE =====
+local _baseline = {
+	Blocks  = {} :: {[string]: number},
+	Weapons = {} :: {[string]: number},
+}
+local _nextRestock = 0
+local _currentBucket = 0
+
+-- Per-player, in-memory counters for the current bucket
+local _pStocks = {
+	Blocks  = {} :: {[Player]: {[string]: number}},
+	Weapons = {} :: {[Player]: {[string]: number}},
+}
+
+-- Optional injected controller for profile persistence
+local PlayerController: any? = nil
+
+-- ===== REMOTES =====
+local Events = ReplicatedStorage:FindFirstChild("Events") or Instance.new("Folder")
+Events.Name = "Events"
+Events.Parent = ReplicatedStorage
+
+local Functions = ReplicatedStorage:FindFirstChild("Functions") or Instance.new("Folder")
+Functions.Name = "Functions"
+Functions.Parent = ReplicatedStorage
+
+local function ensureRemoteEvent(name: string): RemoteEvent
+	local ev = Events:FindFirstChild(name) :: RemoteEvent?
+	if not ev then ev = Instance.new("RemoteEvent"); ev.Name = name; ev.Parent = Events end
+	return ev
+end
+
+local function ensureRemoteFunction(name: string): RemoteFunction
+	local fn = Functions:FindFirstChild(name) :: RemoteFunction?
+	if not fn then fn = Instance.new("RemoteFunction"); fn.Name = name; fn.Parent = Functions end
+	return fn
+end
+
+local UpdateBlockStocks       = ensureRemoteEvent("UpdateBlockStocks")
+local UpdateWeaponStocks      = ensureRemoteEvent("UpdateWeaponStocks")
+local ShowNotification        = ensureRemoteEvent("ShowNotification")
+local GetBlockShopStocks      = ensureRemoteFunction("GetBlockShopStocks")
+local GetWeaponShopStocks     = ensureRemoteFunction("GetWeaponShopStocks")
+local GetBlockShopResetTime   = ensureRemoteFunction("GetBlockShopResetTime")
+local GetWeaponShopResetTime  = ensureRemoteFunction("GetWeaponShopResetTime")
+
+-- ===== UTIL =====
+local bit = bit32
+
+local function cloneMap(m: {[string]: number})
+	local out: {[string]: number} = {}
+	for k, v in pairs(m) do out[k] = v end
+	return out
+end
+
+local function addInto(dst: {[string]: number}, src: {[string]: number}?)
+	if not src then return end
+	for k, v in pairs(src) do
+		dst[k] = (dst[k] or 0) + v
+	end
+end
+
+local function nextAligned(now: number, interval: number): number
+	local base = math.floor(now / interval) * interval
+	return base + interval
+end
+
+local function currentBucket(now: number): number
+	return math.floor(now / RESTOCK_INTERVAL)
+end
+
+-- FNV-1a 32-bit deterministic hash
+local function fnv1a32(str: string): number
+	local h = 2166136261
+	for i = 1, #str do
+		h = bit.band(bit.bxor(h, string.byte(str, i)), 0xFFFFFFFF)
+		h = bit.band((h * 16777619) % 2^32, 0xFFFFFFFF)
+	end
+	return h
+end
+
+local function makeSeed(shopType: string, bucket: number): number
+	local s = string.format("%s:%d", shopType, bucket)
+	local seed = fnv1a32(s) % 0x7FFFFFFF
+	if seed == 0 then seed = 1 end -- avoid 0 seed edge case
+	return seed
+end
+
+local function sortedKeys(t: {[string]: any}): {string}
+	local keys = {}
+	for k in pairs(t) do table.insert(keys, k) end
+	table.sort(keys) -- stable cross-server iteration order
+	return keys
+end
+
+-- Deterministic roll driven by provided Random
+local function rollFromConfigDet(
+	configs: {[string]: any},
+	rnd: Random,
+	filter: (string, any)->boolean?
+): {[string]: number}
+	local res: {[string]: number} = {}
+	local keys = sortedKeys(configs)
+	for _, id in ipairs(keys) do
+		local cfg = configs[id]
+		if filter and not filter(id, cfg) then
+			continue
+		end
+		if cfg.Unlimited then
+			continue
+		end
+		if type(cfg.Chance) == "number" then
+			local hit = (rnd:NextNumber() * 100) <= cfg.Chance
+			if hit then
+				local min = (cfg.StockAmount and cfg.StockAmount.Min) or 1
+				local max = (cfg.StockAmount and cfg.StockAmount.Max) or min
+				res[id] = rnd:NextInteger(min, max)
+			else
+				res[id] = 0
+			end
+		end
+	end
+	return res
+end
+
+-- ===== DETERMINISTIC BASELINES =====
+local function rollBlocksBaseline(bucket: number): {[string]: number}
+	local rnd = Random.new(makeSeed("Blocks", bucket))
+	local stock: {[string]: number} = {}
+
+	-- Guaranteed items first
+	for _, id in ipairs(GUARANTEED_BLOCK_ITEMS) do
+		local cfg = ItemConfigurations[id]
+		if cfg and not cfg.Unlimited then
+			local min = (cfg.StockAmount and cfg.StockAmount.Min) or 1
+			local max = (cfg.StockAmount and cfg.StockAmount.Max) or min
+			stock[id] = rnd:NextInteger(min, max)
+		end
+	end
+
+	-- Other blocks/turrets
+	local rolled = rollFromConfigDet(ItemConfigurations, rnd, function(_, cfg)
+		return (cfg.Type == "Blocks" or cfg.Type == "Turrets")
+	end)
+
+	for id, v in pairs(rolled) do
+		if stock[id] == nil then stock[id] = v end
+	end
+
+	return stock
+end
+
+local function rollWeaponsBaseline(bucket: number): {[string]: number}
+	local rnd = Random.new(makeSeed("Weapons", bucket))
+	return rollFromConfigDet(WeaponConfigurations.Crates, rnd, function(_, cfg)
+		return not cfg.Unlimited and cfg.Price ~= nil
+	end)
+end
+
+-- ===== PROFILE ACCESS / PERSIST =====
+local function getProfile(player: Player)
+	return PlayerController and PlayerController:GetProfile(player) or nil
+end
+
+local function savePlayerStocks(player: Player)
+	local prof = getProfile(player)
+	if not prof then return end
+	prof.Data.ShopState = prof.Data.ShopState or {}
+	prof.Data.ShopState.Bucket = _currentBucket
+	prof.Data.ShopState.Blocks = cloneMap(_pStocks.Blocks[player] or {})
+	prof.Data.ShopState.Weapons = cloneMap(_pStocks.Weapons[player] or {})
+end
+
+-- Ensure in-memory stocks exist, restoring from Profile if same bucket
+local function ensurePlayerStocks(player: Player)
+	if _pStocks.Blocks[player] and _pStocks.Weapons[player] then return end
+
+	local prof = getProfile(player)
+	if not prof then
+		-- Profile not ready yet; PlayerController will call GetPlayer* after profile exists.
+		return
+	end
+
+	if prof.Data and prof.Data.ShopState then
+		local ss = prof.Data.ShopState
+		if ss.Bucket == _currentBucket
+			and typeof(ss.Blocks) == "table"
+			and typeof(ss.Weapons) == "table" then
+			_pStocks.Blocks[player]  = cloneMap(ss.Blocks)
+			_pStocks.Weapons[player] = cloneMap(ss.Weapons)
+			return
+		end
+	end
+
+	-- No saved state for this bucket → seed from baseline and persist
+	_pStocks.Blocks[player]  = cloneMap(_baseline.Blocks)
+	_pStocks.Weapons[player] = cloneMap(_baseline.Weapons)
+	savePlayerStocks(player)
+end
+
+-- ===== GLOBAL RESTOCK =====
+local function doGlobalRestockFor(bucket: number)
+	_baseline.Blocks  = rollBlocksBaseline(bucket)
+	_baseline.Weapons = rollWeaponsBaseline(bucket)
+	_currentBucket    = bucket
+	_nextRestock      = nextAligned(os.time(), RESTOCK_INTERVAL)
+
+	-- Reset each player's personal stocks to the new baseline, persist, and push
+	for _, plr in ipairs(Players:GetPlayers()) do
+		_pStocks.Blocks[plr]  = cloneMap(_baseline.Blocks)
+		_pStocks.Weapons[plr] = cloneMap(_baseline.Weapons)
+
+		savePlayerStocks(plr)
+
+		UpdateBlockStocks:FireClient(plr, cloneMap(_pStocks.Blocks[plr]), _nextRestock)
+		UpdateWeaponStocks:FireClient(plr, cloneMap(_pStocks.Weapons[plr]), _nextRestock)
+	end
+
+	ShowNotification:FireAllClients("The Shops have been restocked!", "Normal")
+end
+
+-- ===== PUBLIC: DEV PRODUCT PERSONAL RESTOCK =====
+function GlobalShop:AddPersonalBlocks(player: Player)
+	ensurePlayerStocks(player)
+	local rnd = Random.new(makeSeed(("Blocks:add:%d"):format(player.UserId), _currentBucket))
+	local add = rollFromConfigDet(ItemConfigurations, rnd, function(_, cfg)
+		return (cfg.Type == "Blocks" or cfg.Type == "Turrets") and not cfg.Unlimited
+	end)
+	addInto(_pStocks.Blocks[player], add)
+	savePlayerStocks(player)
+	UpdateBlockStocks:FireClient(player, cloneMap(_pStocks.Blocks[player]), _nextRestock)
+end
+
+function GlobalShop:AddPersonalWeapons(player: Player)
+	ensurePlayerStocks(player)
+	local rnd = Random.new(makeSeed(("Weapons:add:%d"):format(player.UserId), _currentBucket))
+	local add = rollFromConfigDet(WeaponConfigurations.Crates, rnd, function(_, cfg)
+		return not cfg.Unlimited and cfg.Price ~= nil
+	end)
+	addInto(_pStocks.Weapons[player], add)
+	savePlayerStocks(player)
+	UpdateWeaponStocks:FireClient(player, cloneMap(_pStocks.Weapons[player]), _nextRestock)
+end
+
+-- ===== PUBLIC QUERIES =====
+function GlobalShop:GetPlayerBlocks(player: Player): {[string]: number}
+	ensurePlayerStocks(player)
+	return _pStocks.Blocks[player]
+end
+
+function GlobalShop:GetPlayerWeapons(player: Player): {[string]: number}
+	ensurePlayerStocks(player)
+	return _pStocks.Weapons[player]
+end
+
+function GlobalShop:ConsumeBlocks(player: Player, itemId: string): boolean
+	ensurePlayerStocks(player)
+	local m = _pStocks.Blocks[player]
+	if (m[itemId] or 0) > 0 then
+		m[itemId] -= 1
+		savePlayerStocks(player)
+		UpdateBlockStocks:FireClient(player, cloneMap(m), _nextRestock)
+		return true
+	end
+	return false
+end
+
+function GlobalShop:ConsumeWeapons(player: Player, itemId: string): boolean
+	ensurePlayerStocks(player)
+	local m = _pStocks.Weapons[player]
+	if (m[itemId] or 0) > 0 then
+		m[itemId] -= 1
+		savePlayerStocks(player)
+		UpdateWeaponStocks:FireClient(player, cloneMap(m), _nextRestock)
+		return true
+	end
+	return false
+end
+
+function GlobalShop:GetNextRestock(): number
+	return _nextRestock
+end
+
+-- ===== REMOTES & PLAYER LIFECYCLE =====
+function GlobalShop:BindRemotes()
+	GetBlockShopStocks.OnServerInvoke  = function(player)
+		ensurePlayerStocks(player)
+		return _pStocks.Blocks[player]
+	end
+
+	GetWeaponShopStocks.OnServerInvoke = function(player)
+		ensurePlayerStocks(player)
+		return _pStocks.Weapons[player]
+	end
+
+	GetBlockShopResetTime.OnServerInvoke  = function() return _nextRestock end
+	GetWeaponShopResetTime.OnServerInvoke = function() return _nextRestock end
+
+	Players.PlayerAdded:Connect(function(plr)
+		-- Wait until PlayerController created the profile, then seed/persist
+		while PlayerController and (getProfile(plr) == nil) do task.wait() end
+		ensurePlayerStocks(plr)
+	end)
+
+	Players.PlayerRemoving:Connect(function(plr)
+		_pStocks.Blocks[plr]  = nil
+		_pStocks.Weapons[plr] = nil
+	end)
+end
+
+-- ===== BOOT =====
+function GlobalShop:Init(controllers: {[string]: any}?)
+	if controllers and controllers.PlayerController then
+		PlayerController = controllers.PlayerController
+	end
+
+	local now = os.time() -- UTC
+	_currentBucket = currentBucket(now)
+	_nextRestock   = nextAligned(now, RESTOCK_INTERVAL)
+
+	doGlobalRestockFor(_currentBucket)
+	self:BindRemotes()
+end
+
+-- Called by ShopTimerController every few seconds
+function GlobalShop:CheckAndRestockDue()
+	local nowBucket = currentBucket(os.time())
+	if nowBucket ~= _currentBucket then
+		doGlobalRestockFor(nowBucket)
+	end
+end
+
+return GlobalShop
+
+---
+
+--- ServerScriptService.Controllers.BadgeController (ModuleScript) ---
+--!strict
+
+local Players = game:GetService("Players")
+local BadgeService = game:GetService("BadgeService")
+
+-- Use WaitForChild so require never gets nil.
+local BadgeCatalog = require(game.ReplicatedStorage.Modules:WaitForChild("BadgeConfigurations"))
+
+-- Explicit key type (Luau doesn't support `keyof typeof` in type positions)
+type BadgeKey =
+	"You played!" |
+"Acquired Revolver Cowboy" |
+"Acquired Akimbo Cowboy" |
+"Acquired Uzi Cowboy" |
+"Acquired Shotgun Cowboy" |
+"Acquired Heavy Gunner" |
+"Acquired Rifle Cowboy" |
+"Acquired Mortar Cowboy" |
+"First Mutation"
+
+type AwardCache = {[number]: {[number]: boolean}} -- [userId][badgeId] = true
+type Self = {
+	_has: AwardCache,
+	_next: {[number]: number},
+	CD: number,
+}
+
+local BadgeController: Self = {
+	_has = {},
+	_next = {},
+	CD = 0.2,
+}
+
+local function mark(self: Self, userId: number, badgeId: number, val: boolean)
+	self._has[userId] = self._has[userId] or {}
+	self._has[userId][badgeId] = val
+end
+
+local function cached(self: Self, userId: number, badgeId: number): boolean?
+	local m = self._has[userId]
+	return m and m[badgeId] or nil
+end
+
+local function hasBadge(userId: number, badgeId: number): boolean
+	local ok, res = pcall(function()
+		return BadgeService:UserHasBadgeAsync(userId, badgeId)
+	end)
+	if not ok then
+		warn(("[Badge] UserHasBadgeAsync %d/%d failed: %s"):format(userId, badgeId, tostring(res)))
+		return false
+	end
+	return res
+end
+
+local function give(userId: number, badgeId: number): boolean
+	local ok, err = pcall(function()
+		BadgeService:AwardBadge(userId, badgeId)
+	end)
+	if not ok then
+		warn(("[Badge] AwardBadge %d/%d failed: %s"):format(userId, badgeId, tostring(err)))
+		return false
+	end
+	return true
+end
+
+local function award(player: Player, key: BadgeKey): boolean
+	local badgeId = BadgeCatalog[key]
+	if not badgeId then return false end
+	local userId = player.UserId
+	if userId <= 0 then return false end
+
+	local now = time()
+	local nextOk = BadgeController._next[userId]
+	if nextOk and now < nextOk then return false end
+	BadgeController._next[userId] = now + BadgeController.CD
+
+	local c = cached(BadgeController, userId, badgeId)
+	if c == true then return false end
+
+	local owns = c == true and true or hasBadge(userId, badgeId)
+	if owns then
+		mark(BadgeController, userId, badgeId, true)
+		return false
+	end
+
+	if give(userId, badgeId) then
+		mark(BadgeController, userId, badgeId, true)
+		return true
+	end
+	return false
+end
+
+-- ---------- AUTO-DETECTION LOGIC ----------
+
+-- Look inside likely inventory buckets and collect item names (strings)
+local POSSIBLE_INV_KEYS = {
+	"BlockInventory",
+	-- add more buckets if needed, e.g. "GuardsInventory", "OwnedCowboys"
+}
+
+local function collectNames(profileData: any): {string}
+	local out = {} :: {string}
+	if type(profileData) ~= "table" then return out end
+	for _, key in ipairs(POSSIBLE_INV_KEYS) do
+		local bucket = profileData[key]
+		if type(bucket) == "table" then
+			for _, v in pairs(bucket) do
+				if typeof(v) == "string" then
+					table.insert(out, v)
+				elseif type(v) == "table" then
+					local n = (v :: any).Name or (v :: any).id or (v :: any).name
+					if typeof(n) == "string" then
+						table.insert(out, n)
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function hasName(names: {string}, needles: {string}): boolean
+	for _, raw in ipairs(names) do
+		local s = string.lower(raw)
+		for _, n in ipairs(needles) do
+			if string.find(s, string.lower(n), 1, true) then -- plain find
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function anyMutation(names: {string}): boolean
+	for _, raw in ipairs(names) do
+		local s = string.lower(raw)
+		-- Accepts Name_M1 / _M2 / _M3 / _M4 (pattern match)
+		if string.find(s, "_m[1-4]") then
+			return true
+		end
+	end
+	return false
+end
+
+-- Map badge keys -> substrings that qualify
+local BADGE_RULES: {[BadgeKey]: {string}} = {
+	["Acquired Revolver Cowboy"] = { "revolver", "revolverguard" },
+	["Acquired Akimbo Cowboy"]   = { "akimbo", "dualrevolver" },
+	["Acquired Uzi Cowboy"]      = { "uzi" },
+	["Acquired Shotgun Cowboy"]  = { "shotgun" },
+	["Acquired Heavy Gunner"]    = { "heavygunner", "heavy" },
+	["Acquired Rifle Cowboy"]    = { "rifle", "rifleguard" },
+	["Acquired Mortar Cowboy"]   = { "mortar", "mortarguard" },
+	-- "First Mutation" is handled separately by anyMutation()
+}
+
+local function syncCowboyBadges(player: Player, names: {string})
+	for key, needles in pairs(BADGE_RULES) do
+		if hasName(names, needles) then
+			award(player, key)
+		end
+	end
+end
+
+local function syncFirstMutation(player: Player, names: {string})
+	if anyMutation(names) then
+		award(player, "First Mutation")
+	end
+end
+
+-- Public: run a full pass using the given data table (your profile.Data)
+function BadgeController.SyncFor(player: Player, profileData: any)
+	local names = collectNames(profileData)
+	if #names == 0 then return end
+	syncCowboyBadges(player, names)
+	syncFirstMutation(player, names)
+end
+
+-- Call this right after you add a single new item name (string) to inventory.
+function BadgeController.SyncForNewItem(player: Player, itemName: string)
+	if typeof(itemName) ~= "string" then return end
+	local names = { itemName }
+	syncCowboyBadges(player, names)
+	syncFirstMutation(player, names)
+end
+
+-- Boot: grant "You played!" on first join
+Players.PlayerAdded:Connect(function(plr: Player)
+	task.delay(2, function()
+		award(plr, "You played!")
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(plr: Player)
+	BadgeController._has[plr.UserId] = nil
+	BadgeController._next[plr.UserId] = nil
+end)
+
+return BadgeController
+
+---
+
+--- ServerScriptService.Controllers.SettingsController (ModuleScript) ---
+--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local SettingsController = {}
+
+local DEFAULTS = {
+	WeaponSounds = true,
+	Music = true,
+	Performance = false,
+}
+
+local _pc: any
+local _events: Folder
+local _rfGet: RemoteFunction
+local _reSave: RemoteEvent
+local _conns: { RBXScriptConnection } = {}
+
+local function copy(t: {[string]: any})
+	local n: {[string]: any} = {}
+	for k, v in pairs(t) do n[k] = v end
+	return n
+end
+
+local function sanitize(payload: any): ({[string]: any}?)
+	if typeof(payload) ~= "table" then return nil end
+	local ws = payload.WeaponSounds
+	local mu = payload.Music
+	local pf = payload.Performance
+	if typeof(ws) ~= "boolean" or typeof(mu) ~= "boolean" or typeof(pf) ~= "boolean" then
+		return nil
+	end
+	return { WeaponSounds = ws, Music = mu, Performance = pf }
+end
+
+local function normalizeOrDefaults(t: any): {[string]: any}
+	if typeof(t) ~= "table" then return copy(DEFAULTS) end
+	local out = copy(DEFAULTS)
+	for k, v in pairs(DEFAULTS) do
+		if typeof(t[k]) == typeof(v) then out[k] = t[k] end
+	end
+	return out
+end
+
+local function applyAttrs(plr: Player, s: {[string]: any})
+	plr:SetAttribute("Setting_WeaponSounds", s.WeaponSounds)
+	plr:SetAttribute("Setting_Music", s.Music)
+	plr:SetAttribute("Setting_PerformanceMode", s.Performance)
+end
+
+local function ensureRemotes()
+	_events = ReplicatedStorage:FindFirstChild("Events") :: Folder
+	if not _events then
+		_events = Instance.new("Folder")
+		_events.Name = "Events"
+		_events.Parent = ReplicatedStorage
+	end
+
+	_rfGet = _events:FindFirstChild("GetPlayerSettings") :: RemoteFunction
+	if not _rfGet then
+		_rfGet = Instance.new("RemoteFunction")
+		_rfGet.Name = "GetPlayerSettings"
+		_rfGet.Parent = _events
+	end
+
+	_reSave = _events:FindFirstChild("SavePlayerSettings") :: RemoteEvent
+	if not _reSave then
+		_reSave = Instance.new("RemoteEvent")
+		_reSave.Name = "SavePlayerSettings"
+		_reSave.Parent = _events
+	end
+end
+
+function SettingsController:Init(controllers: {[string]: any})
+	_pc = controllers.PlayerController
+	if not _pc or not _pc.GetProfile then
+		warn("[SettingsController] PlayerController manquant ou incomplet (GetProfile).")
+	end
+
+	ensureRemotes()
+
+	_rfGet.OnServerInvoke = function(plr: Player)
+		local prof = _pc and _pc:GetProfile(plr) or nil
+		if not prof then
+			return copy(DEFAULTS)
+		end
+		prof.Data.Settings = normalizeOrDefaults(prof.Data.Settings)
+		return copy(prof.Data.Settings)
+	end
+
+	_conns[#_conns+1] = _reSave.OnServerEvent:Connect(function(plr: Player, payload: any)
+		local prof = _pc and _pc:GetProfile(plr) or nil
+		if not prof then return end
+		local v = sanitize(payload)
+		if not v then return end
+		prof.Data.Settings = v
+		applyAttrs(plr, v)
+	end)
+
+	_conns[#_conns+1] = Players.PlayerAdded:Connect(function(plr)
+		local prof = _pc and _pc:GetProfile(plr) or nil
+		if prof then
+			prof.Data.Settings = normalizeOrDefaults(prof.Data.Settings)
+			applyAttrs(plr, prof.Data.Settings)
+		else
+			applyAttrs(plr, DEFAULTS)
+		end
+	end)
+
+	_conns[#_conns+1] = Players.PlayerRemoving:Connect(function(plr) end)
+end
+
+function SettingsController:Start(_controllers: {[string]: any})
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local prof = _pc and _pc:GetProfile(plr) or nil
+		if prof then
+			prof.Data.Settings = normalizeOrDefaults(prof.Data.Settings)
+			applyAttrs(plr, prof.Data.Settings)
+		else
+			applyAttrs(plr, DEFAULTS)
+		end
+	end
+end
+
+return SettingsController
+
+---
+
 --- ReplicatedStorage.Modules.NumberFormatter (ModuleScript) ---
 --!strict
 

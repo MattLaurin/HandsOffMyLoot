@@ -1,3 +1,162 @@
+--- StarterPlayer.StarterPlayerScripts.WorldUIController (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/WorldUIController.lua
+-- Manages in-world UI elements, like the shop restock timers.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+-- Find shop models
+local blocksShop = Workspace:WaitForChild("BlocksShop")
+local weaponsShop = Workspace:WaitForChild("WeaponsShop")
+
+-- Find the timer labels
+local blocksTimerLabel = blocksShop:WaitForChild("Touch"):WaitForChild("RestockGUI"):WaitForChild("TimerLabel")
+local weaponsTimerLabel = weaponsShop:WaitForChild("Touch"):WaitForChild("RestockGUI"):WaitForChild("TimerLabel")
+
+-- Remotes
+local getBlocksResetTime = ReplicatedStorage.Functions:WaitForChild("GetBlockShopResetTime")
+local getWeaponsResetTime = ReplicatedStorage.Functions:WaitForChild("GetWeaponShopResetTime")
+local updateBlocksStockEvent = ReplicatedStorage.Events:WaitForChild("UpdateBlockStocks")
+local updateWeaponsStockEvent = ReplicatedStorage.Events:WaitForChild("UpdateWeaponStocks")
+
+local activeTimers: {[string]: RBXScriptConnection?} = {
+	Blocks = nil,
+	Weapons = nil,
+}
+
+local function formatRemaining(seconds: number): string
+	if seconds <= 0 then return "00:00" end
+	local min = math.floor(seconds / 60)
+	local sec = seconds % 60
+	return string.format("%02d:%02d", min, sec)
+end
+
+-- Accepts optional 'nextTime' (server gives it in the broadcast).
+local function startTimer(shopName: "Blocks" | "Weapons", nextTime: number?)
+	if activeTimers[shopName] then
+		activeTimers[shopName]:Disconnect()
+		activeTimers[shopName] = nil
+	end
+
+	local label = if shopName == "Blocks" then blocksTimerLabel else weaponsTimerLabel
+
+	local function bind(ts: number)
+		activeTimers[shopName] = RunService.Heartbeat:Connect(function()
+			local remaining = ts - os.time()
+			label.Text = formatRemaining(remaining)
+		end)
+	end
+
+	if nextTime and typeof(nextTime) == "number" then
+		bind(nextTime)
+	else
+		-- Fetch from server on first run / fallback
+		local fn = if shopName == "Blocks" then getBlocksResetTime else getWeaponsResetTime
+		local ok, ts = pcall(fn.InvokeServer, fn)
+		if ok and typeof(ts) == "number" then
+			bind(ts)
+		else
+			warn("[WorldUIController] Failed to get reset time for", shopName, ok, ts)
+			label.Text = "--:--"
+		end
+	end
+end
+
+-- When server restocks, it now sends (stocks, nextRestockTime).
+updateBlocksStockEvent.OnClientEvent:Connect(function(_, newRestockTime: number?)
+	startTimer("Blocks", newRestockTime)
+end)
+
+updateWeaponsStockEvent.OnClientEvent:Connect(function(_, newRestockTime: number?)
+	startTimer("Weapons", newRestockTime)
+end)
+
+-- Initial timers (will fetch from server)
+startTimer("Blocks")
+startTimer("Weapons")
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.WaveUIController (LocalScript) ---
+--!strict
+-- Manages the wave progress bar UI and the next boss indicator.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+-- ## ADDED ## Require WaveConfigurations to know which waves have bosses
+local WaveConfigurations = require(ReplicatedStorage.Modules.WaveConfigurations)
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local waveBar = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Top"):WaitForChild("WaveBar")
+local progressBar = waveBar:WaitForChild("Progress")
+local textLabel = waveBar:WaitForChild("Text")
+local mysteryLabel = waveBar:WaitForChild("Mystery")
+
+local WaveUIStateChanged = ReplicatedStorage.Events:WaitForChild("WaveUIStateChanged")
+local ZombieKilled = ReplicatedStorage.Events:WaitForChild("ZombieKilled")
+
+local totalEnemiesInWave = 0
+local currentWaveDisplaying = 0
+
+local bossWaveNumbers = {}
+for waveNum, config in pairs(WaveConfigurations) do
+	if config.IsBossWave then
+		table.insert(bossWaveNumbers, waveNum)
+	end
+end
+table.sort(bossWaveNumbers)
+
+local function updateNextBossLabel(currentWaveNumber: number)
+	local nextBossWave: number? = nil
+
+	for _, bossWave in ipairs(bossWaveNumbers) do
+		if bossWave > currentWaveNumber then
+			nextBossWave = bossWave
+			break
+		end
+	end
+
+	if nextBossWave then
+		mysteryLabel.Text = `??? at Wave {nextBossWave}`
+		mysteryLabel.Visible = true
+	else
+		mysteryLabel.Visible = false
+	end
+end
+
+
+WaveUIStateChanged.OnClientEvent:Connect(function(isFighting: boolean, waveNumber: number?, totalEnemies: number?)
+	waveBar.Visible = isFighting
+	mysteryLabel.Visible = isFighting
+
+	if isFighting and waveNumber and totalEnemies then
+		totalEnemiesInWave = totalEnemies
+		currentWaveDisplaying = waveNumber
+		textLabel.Text = "Wave " .. tostring(waveNumber)
+		progressBar:TweenSize(UDim2.new(0, 0, 1, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.1)
+
+		updateNextBossLabel(waveNumber)
+	end
+end)
+
+ZombieKilled.OnClientEvent:Connect(function(killedCount: number, eventWaveNumber: number)
+	if eventWaveNumber ~= currentWaveDisplaying then return end
+
+	if totalEnemiesInWave > 0 then
+		local percentage = math.clamp(killedCount / totalEnemiesInWave, 0, 1)
+		progressBar:TweenSize(UDim2.new(percentage, 0, 1, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.3)
+	end
+end)
+
+waveBar.Visible = false
+mysteryLabel.Visible = false
+---
+
 --- StarterPlayer.StarterPlayerScripts.UpgradeBillboardHandler (LocalScript) ---
 --!strict
 local Players           = game:GetService("Players")
@@ -195,6 +354,138 @@ end
 player.CharacterAdded:Connect(initializeUI)
 if player.Character then
 	initializeUI()
+end
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.TeleportController (LocalScript) ---
+--[[
+	TeleportController Script
+
+	Description: Manages the client-side logic for teleporting the player to various
+	locations via UI buttons. Now includes success notifications.
+
+	Location: StarterPlayerScripts
+]]
+--!strict
+
+-- Services
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+-- Modules
+local NotificationManager = require(ReplicatedStorage.Modules.NotificationManager)
+
+-- Player and Plot References
+local localPlayer: Player = Players.LocalPlayer
+local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
+local SHOP_TELEPORT_PART = Workspace:WaitForChild("ShopTeleport")
+
+-- ===== Helpers =====
+
+local function teleportCharacter(targetCFrame: CFrame, successMessage: string)
+	local character = localPlayer.Character
+	if not character then
+		warn("Teleport failed: Character not found.")
+		return
+	end
+
+	local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not hrp then
+		warn("Teleport failed: HumanoidRootPart not found.")
+		return
+	end
+
+	-- small y offset to avoid ground clipping
+	hrp.CFrame = targetCFrame * CFrame.new(0, 3, 0)
+	NotificationManager.show(successMessage, "Success")
+end
+
+-- OwnerId can be number or string (depending on how it was written server-side)
+local function isOwnedByLocalPlayer(plot: Instance): boolean
+	local ownerAttr = plot:GetAttribute("OwnerId")
+	if ownerAttr == nil then return false end
+	return tostring(ownerAttr) == tostring(localPlayer.UserId)
+end
+
+-- Find SpawnPart anywhere under the plot, or by tag "PlotSpawn" within this plot
+local function findSpawnPartInPlot(plot: Instance): BasePart?
+	-- recursive name search
+	local inst = plot:FindFirstChild("SpawnPart", true)
+	if inst and inst:IsA("BasePart") then
+		return inst
+	end
+
+	-- fallback: tagged part inside this plot
+	for _, tagged in ipairs(CollectionService:GetTagged("PlotSpawn")) do
+		if tagged:IsA("BasePart") and plot:IsAncestorOf(tagged) then
+			return tagged
+		end
+	end
+
+	return nil
+end
+
+local function getPlayerPlot(): Model?
+	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do
+		if plot:IsA("Model") and isOwnedByLocalPlayer(plot) then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function debugNoSpawnPart(plot: Model)
+	-- Print useful info once to help diagnose hierarchy/naming
+	warn(("[Teleport] Could not find SpawnPart under plot %s. Children:"):format(plot.Name))
+	for _, d in ipairs(plot:GetDescendants()) do
+		if d:IsA("BasePart") then
+			print("  -", d:GetFullName())
+		end
+	end
+end
+
+-- Connect buttons
+local function initializeTeleporters()
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+	local buttonsContainer = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Top"):WaitForChild("Buttons")
+
+	local plotTeleportButton: TextButton = buttonsContainer:WaitForChild("PlotTeleport") :: TextButton
+	local shopTeleportButton: TextButton = buttonsContainer:WaitForChild("ShopTeleport") :: TextButton
+
+	plotTeleportButton.MouseButton1Click:Connect(function()
+		print("Plot teleport requested.")
+		local playerPlot = getPlayerPlot()
+		if not playerPlot then
+			warn("Could not teleport to plot: Player plot not found.")
+			return
+		end
+
+		local spawnPart = findSpawnPartInPlot(playerPlot)
+		if spawnPart then
+			teleportCharacter(spawnPart.CFrame, "Teleported to your plot!")
+		else
+			warn("Could not teleport to plot: SpawnPart is missing (not found recursively or by tag 'PlotSpawn').")
+			debugNoSpawnPart(playerPlot)
+		end
+	end)
+
+	shopTeleportButton.MouseButton1Click:Connect(function()
+		print("Shop teleport requested.")
+		if SHOP_TELEPORT_PART and SHOP_TELEPORT_PART:IsA("BasePart") then
+			teleportCharacter(SHOP_TELEPORT_PART.CFrame, "Teleported to the shop!")
+		else
+			warn("Could not teleport to shop: ShopTeleport part is missing in Workspace.")
+		end
+	end)
+end
+
+-- Rebind on character spawns (and immediately if already spawned)
+localPlayer.CharacterAdded:Connect(initializeTeleporters)
+if localPlayer.Character then
+	initializeTeleporters()
 end
 
 ---
@@ -494,6 +785,106 @@ local PlacementHandler = require(ReplicatedStorage.Modules:WaitForChild("Placeme
 PlacementHandler:Init()
 ---
 
+--- StarterPlayer.StarterPlayerScripts.OnboardingController (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/OnboardingController.lua
+-- Manages the visual elements for the new player onboarding experience.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- References
+local startOnboardingEvent = ReplicatedStorage.Events:WaitForChild("StartOnboarding")
+local updateOnboardingStepEvent = ReplicatedStorage.Events:WaitForChild("UpdateOnboardingStep")
+local endOnboardingEvent = ReplicatedStorage.Events:WaitForChild("EndOnboarding")
+local beamTemplate = ReplicatedStorage.Templates:WaitForChild("OnboardingBeam")
+local instructionsLabel = playerGui:WaitForChild("GUI"):WaitForChild("Frames"):WaitForChild("Instructions")
+local blocksShop = Workspace:WaitForChild("BlocksShop")
+local shopTouchPart = blocksShop:WaitForChild("Touch")
+local waveButton = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Top"):WaitForChild("Buttons"):WaitForChild("WaveButton")
+local onboardingHighlight = waveButton:WaitForChild("Onboarding") -- ## ADDED ##
+
+-- Variables
+local beam: Beam?
+local attachment0: Attachment?
+local attachment1: Attachment?
+
+local function startOnboarding()
+	if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+		player.CharacterAdded:Wait()
+	end
+
+	local humanoidRootPart = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then return end
+
+	instructionsLabel.Text = "Buy your first turret!"
+	instructionsLabel.Visible = true
+
+	attachment0 = Instance.new("Attachment")
+	attachment0.Parent = humanoidRootPart
+
+	attachment1 = Instance.new("Attachment")
+	attachment1.Parent = shopTouchPart
+
+	beam = beamTemplate:Clone()
+	beam.Attachment0 = attachment1
+	beam.Attachment1 = attachment0
+	beam.Parent = humanoidRootPart
+end
+
+local function updateOnboarding(stepName: string)
+	if stepName == "Step2_PlaceTurret" then
+		instructionsLabel.Text = "Place your turret on your plot!"
+
+		local plotNum = player:GetAttribute("PlotNumber")
+		if not plotNum then return end
+		local playerPlot = Workspace.Plots:FindFirstChild("Plot" .. tostring(plotNum))
+		if not playerPlot then return end
+		local plotBase = playerPlot:FindFirstChild("Base")
+
+		if attachment1 and plotBase then
+			attachment1.Parent = plotBase
+		end
+	elseif stepName == "Step3_FightButton" then
+		instructionsLabel.Text = "Press the Fight button to start the wave!"
+
+		-- ## MODIFIED ## Remove the beam and show the button highlight instead
+		if beam then
+			beam:Destroy()
+			beam = nil
+		end
+		if attachment1 then
+			attachment1:Destroy()
+			attachment1 = nil
+		end
+
+		if onboardingHighlight then
+			onboardingHighlight.Visible = true
+		end
+	end
+end
+
+local function endOnboarding()
+	instructionsLabel.Visible = false
+	if beam then beam:Destroy() end
+	if attachment0 then attachment0:Destroy() end
+	if attachment1 then attachment1:Destroy() end
+
+	-- ## ADDED ## Make sure to hide the highlight when onboarding ends
+	if onboardingHighlight then
+		onboardingHighlight.Visible = false
+	end
+end
+
+startOnboardingEvent.OnClientEvent:Connect(startOnboarding)
+updateOnboardingStepEvent.OnClientEvent:Connect(updateOnboarding)
+endOnboardingEvent.OnClientEvent:Connect(endOnboarding)
+---
+
 --- StarterPlayer.StarterPlayerScripts.NotificationClient (LocalScript) ---
 --[[
 	SCRIPT: NotificationClient (LocalScript)
@@ -516,6 +907,171 @@ local showNotificationEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild
 showNotificationEvent.OnClientEvent:Connect(function(message: string, messageType: string?)
 	NotificationManager.show(message, messageType)
 end)
+---
+
+--- StarterPlayer.StarterPlayerScripts.MusicController (LocalScript) ---
+--!strict
+-- StarterPlayerScripts/MusicController.client.lua
+local Players           = game:GetService("Players")
+local SoundService      = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local NormalMusic   = SoundService:WaitForChild("NormalMusic") :: Sound
+local FightingMusic = SoundService:WaitForChild("FightingMusic") :: Sound
+local BossMusic     = SoundService:WaitForChild("BossMusic") :: Sound
+local WaveUIStateChanged = ReplicatedStorage.Events:WaitForChild("WaveUIStateChanged") :: RemoteEvent
+
+local TRACKS = { NormalMusic, FightingMusic, BossMusic }
+local FADE_TIME = 1.5
+
+-- remember base volumes
+local function rememberBaseVolume(s: Sound)
+	if s:GetAttribute("BaseVolume") == nil then
+		s:SetAttribute("BaseVolume", s.Volume)
+	end
+end
+for _, s in ipairs(TRACKS) do rememberBaseVolume(s) end
+local function baseVolume(s: Sound): number
+	local v = s:GetAttribute("BaseVolume")
+	return (typeof(v) == "number") and v or 1
+end
+
+-- state
+local intendedTrack: Sound? = NormalMusic
+local nowPlayingId = 0
+local activeTweens: {[Sound]: Tween} = {}
+
+local function isMusicEnabled(): boolean
+	local v = LocalPlayer:GetAttribute("Setting_Music")
+	if typeof(v) ~= "boolean" then return true end
+	return v
+end
+
+local function stopTweens()
+	for snd, tw in pairs(activeTweens) do
+		if tw then
+			pcall(function() tw:Cancel() end)
+		end
+		activeTweens[snd] = nil
+	end
+end
+
+local function hardStopAll()
+	stopTweens()
+	for _, s in ipairs(TRACKS) do
+		if s.IsPlaying then s:Stop() end
+		s.Volume = baseVolume(s) -- reset target volume for next time
+	end
+end
+
+local function fadeOutAndStop(id: number, s: Sound)
+	if not s.IsPlaying then return end
+	local tw = TweenService:Create(s, TweenInfo.new(FADE_TIME), { Volume = 0 })
+	activeTweens[s] = tw
+	tw.Completed:Once(function()
+		-- only stop if we're still on the same request id
+		if id == nowPlayingId then
+			s:Stop()
+			s.Volume = baseVolume(s)
+		end
+		activeTweens[s] = nil
+	end)
+	tw:Play()
+end
+
+local function fadeIn(id: number, s: Sound)
+	-- ensure playing
+	if not s.IsPlaying then
+		s.Volume = 0
+		s:Play()
+	end
+	local goal = baseVolume(s)
+	local tw = TweenService:Create(s, TweenInfo.new(FADE_TIME), { Volume = goal })
+	activeTweens[s] = tw
+	tw.Completed:Once(function()
+		if activeTweens[s] == tw then
+			activeTweens[s] = nil
+		end
+	end)
+	tw:Play()
+end
+
+local function requestPlay(track: Sound)
+	-- de-dupe same request
+	if intendedTrack == track and not (track ~= nil and not track.IsPlaying and isMusicEnabled()) then
+		intendedTrack = track
+		-- still proceed to enforce exclusivity below
+	else
+		intendedTrack = track
+	end
+
+	nowPlayingId += 1
+	local myId = nowPlayingId
+
+	-- cancel any ongoing tweens; we’re taking over
+	stopTweens()
+
+	if not isMusicEnabled() then
+		hardStopAll()
+		return
+	end
+
+	-- fade out all others, fade in target
+	for _, s in ipairs(TRACKS) do
+		if s ~= track then
+			fadeOutAndStop(myId, s)
+		end
+	end
+	fadeIn(myId, track)
+end
+
+-- react to game events
+WaveUIStateChanged.OnClientEvent:Connect(function(isFighting: boolean, _waveNumber: number?, _totalEnemies: number?, isBossWave: boolean?)
+	if isFighting then
+		if isBossWave then
+			requestPlay(BossMusic)
+		else
+			requestPlay(FightingMusic)
+		end
+	else
+		requestPlay(NormalMusic)
+	end
+end)
+
+-- react to setting toggles in real time
+LocalPlayer:GetAttributeChangedSignal("Setting_Music"):Connect(function()
+	if isMusicEnabled() then
+		requestPlay(intendedTrack or NormalMusic)
+	else
+		hardStopAll()
+	end
+end)
+
+-- guard: if any of these tracks gets played by another script, enforce exclusivity
+for _, s in ipairs(TRACKS) do
+	s:GetPropertyChangedSignal("Playing"):Connect(function()
+		if s.IsPlaying then
+			-- if a non-intended track was forced to play, reclaim control
+			if not isMusicEnabled() then
+				hardStopAll()
+			elseif intendedTrack and s ~= intendedTrack then
+				requestPlay(intendedTrack)
+			end
+		end
+	end)
+end
+
+-- init
+intendedTrack = NormalMusic
+if isMusicEnabled() then
+	requestPlay(NormalMusic)
+else
+	hardStopAll()
+end
+
 ---
 
 --- StarterPlayer.StarterPlayerScripts.ModelAwardHandler (LocalScript) ---
@@ -575,6 +1131,179 @@ showModelAwardEvent.OnClientEvent:Connect(function(modelName: string, imageId: s
 		awardFrame.Visible = false
 	end)
 end)
+---
+
+--- StarterPlayer.StarterPlayerScripts.HealthUIController (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/HealthUIController.lua
+-- DESCRIPTION: Manages both the Plot Health and Boss Health bars on the player's HUD.
+
+-- Services
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ## MODIFIED ## Use WaitForChild to safely load modules
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local FrameManager = require(Modules:WaitForChild("FrameManager"))
+local ModelProgression = require(Modules:WaitForChild("ModelProgression"))
+
+-- Player and UI References
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+local hud = playerGui:WaitForChild("GUI"):WaitForChild("HUD")
+
+-- Events
+local WaveStateChangedEvent = ReplicatedStorage.Events:WaitForChild("WaveStateChanged")
+local UpdateProtectionModelFX = ReplicatedStorage.Events:WaitForChild("UpdateProtectionModelFX")
+local BossWaveStarted = ReplicatedStorage.Events:WaitForChild("BossWaveStarted")
+local BossWaveEnded = ReplicatedStorage.Events:WaitForChild("BossWaveEnded")
+
+-------------------------------------------------------------------
+-- ## PLOT HEALTH UI ##
+-------------------------------------------------------------------
+
+local plotHealthFrame = hud:WaitForChild("PlotHealth")
+local plotProgressBar = plotHealthFrame:WaitForChild("Progress")
+local plotTextLabel = plotHealthFrame:WaitForChild("Text")
+local plotModelImage = plotHealthFrame:WaitForChild("Image")
+local plotNextLabel = plotHealthFrame:WaitForChild("Next")
+local bottomFrame = hud:WaitForChild("Bottom")
+
+local plotHealthConnection: RBXScriptConnection?
+local plotHealthPart: BasePart?
+local plotMaxHealth = 100
+
+local function updateNextUnlockLabel(currentModelIndex: number)
+	local nextIndex = currentModelIndex + 1
+	local nextModelData = ModelProgression[nextIndex]
+
+	if nextModelData and nextModelData.WaveRequirement then
+		plotNextLabel.Text = `Bigger stack of Gold at Wave {nextModelData.WaveRequirement}`
+		plotNextLabel.Visible = true
+	else
+		-- This happens if the player has unlocked all models
+		plotNextLabel.Text = "All Cars Unlocked"
+		plotNextLabel.Visible = true
+	end
+end
+
+local function updatePlotHealthUI(currentHealth: number, newMaxHealth: number)
+	plotMaxHealth = newMaxHealth
+	currentHealth = math.clamp(currentHealth, 0, plotMaxHealth)
+	local percentage = currentHealth / plotMaxHealth
+
+	plotProgressBar:TweenSize(UDim2.new(percentage, 0, 1, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+	plotTextLabel.Text = tostring(math.floor(currentHealth)) .. " / " .. tostring(plotMaxHealth)
+end
+
+task.spawn(function()
+	local playerPlot: Model?
+	while not playerPlot do
+		for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+			if plot:IsA("Model") and plot:GetAttribute("OwnerId") == localPlayer.UserId then
+				playerPlot = plot
+				break
+			end
+		end
+		if not playerPlot then
+			task.wait(1)
+		end
+	end
+
+	plotHealthPart = playerPlot:FindFirstChild("PlotHealth")
+	if plotHealthPart then
+		if plotHealthConnection then plotHealthConnection:Disconnect() end
+		plotHealthConnection = plotHealthPart:GetAttributeChangedSignal("Health"):Connect(function()
+			updatePlotHealthUI(plotHealthPart:GetAttribute("Health"), plotMaxHealth)
+		end)
+	end
+end)
+
+UpdateProtectionModelFX.OnClientEvent:Connect(function(imageId: string, newMaxHealth: number?, currentModelIndex: number?)
+	plotModelImage.Image = imageId
+	if newMaxHealth and plotHealthPart then
+		updatePlotHealthUI(newMaxHealth, newMaxHealth)
+	end
+
+	if currentModelIndex then
+		updateNextUnlockLabel(currentModelIndex)
+	end
+end)
+
+WaveStateChangedEvent.OnClientEvent:Connect(function(isFighting: boolean, currentHealth: number?, newMaxHealth: number?)
+	plotHealthFrame.Visible = isFighting
+	bottomFrame.Visible = not isFighting
+
+	if not isFighting then
+		plotNextLabel.Visible = false
+	end
+
+	if isFighting and currentHealth and newMaxHealth then
+		updatePlotHealthUI(currentHealth, newMaxHealth)
+	end
+
+	if isFighting then
+		local openFrameName = FrameManager.getOpenFrameName()
+		if openFrameName then
+			FrameManager.close(openFrameName)
+		end
+	end
+end)
+
+
+-------------------------------------------------------------------
+-- ## BOSS HEALTH UI ##
+-------------------------------------------------------------------
+
+local bossHealthFrame = hud:WaitForChild("BossHealth")
+local bossProgressBar = bossHealthFrame:WaitForChild("Progress")
+local bossTextLabel = bossHealthFrame:WaitForChild("Text")
+local bossImage = bossHealthFrame:WaitForChild("Image")
+
+local bossHealthConnection: RBXScriptConnection?
+
+local function updateBossHealthUI(humanoid: Humanoid)
+	local currentHealth = humanoid.Health
+	local maxHealth = humanoid.MaxHealth
+	local percentage = math.clamp(currentHealth / maxHealth, 0, 1)
+
+	bossProgressBar:TweenSize(UDim2.new(percentage, 0, 1, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2)
+	bossTextLabel.Text = `BOSS: {math.floor(currentHealth)} / {maxHealth}`
+end
+
+BossWaveStarted.OnClientEvent:Connect(function(bossHumanoid: Humanoid, imageId: string)
+	if not bossHumanoid then return end
+
+	if bossHealthConnection then
+		bossHealthConnection:Disconnect()
+	end
+
+	bossImage.Image = imageId
+	bossHealthFrame.Visible = true
+	updateBossHealthUI(bossHumanoid)
+
+	bossHealthConnection = bossHumanoid.HealthChanged:Connect(function()
+		updateBossHealthUI(bossHumanoid)
+	end)
+end)
+
+BossWaveEnded.OnClientEvent:Connect(function()
+	bossHealthFrame.Visible = false
+	if bossHealthConnection then
+		bossHealthConnection:Disconnect()
+		bossHealthConnection = nil
+	end
+end)
+
+
+-------------------------------------------------------------------
+-- ## INITIAL SETUP ##
+-------------------------------------------------------------------
+plotHealthFrame.Visible = false
+bottomFrame.Visible = true
+bossHealthFrame.Visible = false
+plotNextLabel.Visible = false
 ---
 
 --- StarterPlayer.StarterPlayerScripts.HUDButtons (LocalScript) ---
@@ -1103,6 +1832,434 @@ ProximityPromptService.PromptShown:Connect(onPromptShown)
 ProximityPromptService.PromptHidden:Connect(onPromptHidden)
 ---
 
+--- StarterPlayer.StarterPlayerScripts.ClientFXController (LocalScript) ---
+--!strict
+-- LOCATION: StarterPlayerScripts/ClientFXController.lua
+-- DESCRIPTION: Manages all client-side visual effects, including UI, cash, and in-world FX.
+
+-- Services
+local CollectionService = game:GetService("CollectionService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+
+-- Player and UI
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+-- Modules
+local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+
+-- Templates
+local shineTemplate: ImageLabel? = ReplicatedStorage.Templates:WaitForChild("ShineEffectTemplate")
+
+--================================================================
+-- ## UI ELEMENT EFFECTS ##
+--================================================================
+
+local activeHoverTweens: {[GuiObject]: {Tween}} = {}
+local activeShineThreads: {[GuiObject]: thread} = {}
+local sunburstObjects: {[GuiObject]: boolean} = {}
+
+-- We keep the table for potential color restore, but sizing is now via UIScale
+local buttonStates: {[GuiObject]: {originalSize: UDim2, originalColor: Color3?}} = {}
+local partButtonStates: {[BasePart]: {Debounce: boolean, Connections: {RBXScriptConnection}}} = {}
+
+-- ===== Helpers for UIScale-based animations (prevents layout shrink) =====
+local function getUIScale(gui: GuiObject): UIScale
+	local s = gui:FindFirstChildOfClass("UIScale") :: UIScale?
+	if not s then
+		s = Instance.new("UIScale")
+		s.Scale = 1
+		s.Parent = gui
+	end
+	return s
+end
+
+-- (Optional) If you want to skip FX inside the RobuxStore entirely, set this to true.
+local SKIP_ROBUX_STORE_BUTTON_FX = false
+local function isInsideRobuxStore(inst: Instance): boolean
+	local p = inst
+	while p and not p:IsA("ScreenGui") do p = p.Parent end
+	return p ~= nil and p.Name == "RobuxStore"
+end
+
+-- ----- Button hover/click using UIScale (no Size tweening) -----
+local HOVER_TWEEN_INFO: TweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local CLICK_TWEEN_INFO: TweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)
+local HOVER_SCALE: number = 1.05
+local CLICK_SCALE: number = 0.95
+
+local function getButtonColor(button: GuiButton): Color3?
+	if button:IsA("TextButton") then return button.BackgroundColor3 end
+	if button:IsA("ImageButton") then return button.ImageColor3 end
+	return nil
+end
+
+local function tweenColor(button: GuiButton, tweenInfo: TweenInfo, color: Color3)
+	local prop = button:IsA("TextButton") and "BackgroundColor3" or "ImageColor3"
+	TweenService:Create(button, tweenInfo, {[prop] = color}):Play()
+end
+
+local function applyButtonAnimation(button: GuiButton)
+	-- Skip if already bound
+	if buttonStates[button] then return end
+	-- (Optional) don’t animate anything inside the RobuxStore
+	if SKIP_ROBUX_STORE_BUTTON_FX and isInsideRobuxStore(button) then return end
+
+	-- Prepare state + UIScale (safe for any Size/Offset layout)
+	local scaleObj = getUIScale(button)
+	buttonStates[button] = {
+		originalSize = button.Size, -- kept for compatibility
+		originalColor = getButtonColor(button),
+	}
+
+	button.MouseEnter:Connect(function()
+		TweenService:Create(scaleObj, HOVER_TWEEN_INFO, {Scale = HOVER_SCALE}):Play()
+		local color = buttonStates[button].originalColor
+		if color then tweenColor(button, HOVER_TWEEN_INFO, color:Lerp(Color3.new(1,1,1), 0.1)) end
+	end)
+
+	button.MouseLeave:Connect(function()
+		TweenService:Create(scaleObj, HOVER_TWEEN_INFO, {Scale = 1}):Play()
+		local color = buttonStates[button].originalColor
+		if color then tweenColor(button, HOVER_TWEEN_INFO, color) end
+	end)
+
+	button.MouseButton1Down:Connect(function()
+		TweenService:Create(scaleObj, CLICK_TWEEN_INFO, {Scale = CLICK_SCALE}):Play()
+		local color = buttonStates[button].originalColor
+		if color then tweenColor(button, CLICK_TWEEN_INFO, color:Lerp(Color3.new(0,0,0), 0.2)) end
+	end)
+
+	button.MouseButton1Up:Connect(function()
+		TweenService:Create(scaleObj, CLICK_TWEEN_INFO, {Scale = HOVER_SCALE}):Play()
+		local color = buttonStates[button].originalColor
+		if color then tweenColor(button, CLICK_TWEEN_INFO, color:Lerp(Color3.new(1,1,1), 0.1)) end
+	end)
+end
+
+-- ----- Sunburst rotation -----
+local SUNBURST_ROTATION_SPEED = 20
+local function applySunburstEffect(guiObject: GuiObject)
+	sunburstObjects[guiObject] = true
+end
+
+RunService.Heartbeat:Connect(function(dt: number)
+	for guiObject, _ in pairs(sunburstObjects) do
+		if guiObject.Parent then
+			guiObject.Rotation += SUNBURST_ROTATION_SPEED * dt
+		else
+			sunburstObjects[guiObject] = nil
+		end
+	end
+end)
+
+-- ----- Gentle hover bob -----
+local HOVER_OFFSET = 5
+local HOVER_DURATION = 1.5
+local HOVER_TWEEN_INFO_EFFECT = TweenInfo.new(HOVER_DURATION / 2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+
+local function applyHoverEffect(guiObject: GuiObject)
+	local originalPosition = guiObject.Position
+	local targetPositionUp = originalPosition + UDim2.fromOffset(0, -HOVER_OFFSET)
+	local tweenUp = TweenService:Create(guiObject, HOVER_TWEEN_INFO_EFFECT, {Position = targetPositionUp})
+	local tweenDown = TweenService:Create(guiObject, HOVER_TWEEN_INFO_EFFECT, {Position = originalPosition})
+
+	activeHoverTweens[guiObject] = {tweenUp, tweenDown}
+
+	task.spawn(function()
+		while guiObject.Parent do
+			tweenUp:Play()
+			tweenUp.Completed:Wait()
+			if not guiObject.Parent then break end
+			tweenDown:Play()
+			tweenDown.Completed:Wait()
+		end
+		if activeHoverTweens[guiObject] then
+			for _, tween in ipairs(activeHoverTweens[guiObject]) do tween:Cancel() end
+			activeHoverTweens[guiObject] = nil
+		end
+	end)
+end
+
+-- ----- Shine pings -----
+local SHINE_MIN_DELAY, SHINE_MAX_DELAY = 1, 4
+local SHINE_FADE_IN_TIME, SHINE_FADE_OUT_TIME = 0.3, 0.7
+
+local function applyShineEffect(guiObject: GuiObject)
+	if not shineTemplate then return end
+	activeShineThreads[guiObject] = task.spawn(function()
+		while guiObject.Parent do
+			task.wait(math.random() * (SHINE_MAX_DELAY - SHINE_MIN_DELAY) + SHINE_MIN_DELAY)
+			if not guiObject.Parent then break end
+
+			local newShine = shineTemplate:Clone()
+			newShine.Position = UDim2.fromScale(math.random(), math.random())
+			newShine.ImageTransparency = 1
+			newShine.Rotation = math.random(-45, 45)
+			newShine.Parent = guiObject
+
+			local fadeIn = TweenService:Create(newShine, TweenInfo.new(SHINE_FADE_IN_TIME), {ImageTransparency = 0})
+			local fadeOut = TweenService:Create(newShine, TweenInfo.new(SHINE_FADE_OUT_TIME), {ImageTransparency = 1})
+
+			fadeIn:Play()
+			fadeIn.Completed:Wait()
+			if not newShine.Parent then break end
+			fadeOut:Play()
+			fadeOut.Completed:Wait()
+			newShine:Destroy()
+		end
+	end)
+end
+
+-- ----- 3D part press effect -----
+local PRESS_DEPTH = 0.4
+local PRESS_TWEEN_INFO = TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local POP_UP_TWEEN_INFO = TweenInfo.new(1, Enum.EasingStyle.Elastic, Enum.EasingDirection.Out)
+
+local function applyPressEffect(part: BasePart)
+	if not part:IsA("BasePart") or partButtonStates[part] then return end
+
+	local originalPosition = part.Position
+	partButtonStates[part] = { Debounce = false, Connections = {} }
+
+	local conn = part.Touched:Connect(function(hit)
+		if partButtonStates[part].Debounce then return end
+		if not (localPlayer.Character and hit:IsDescendantOf(localPlayer.Character)) then return end
+
+		partButtonStates[part].Debounce = true
+		local press = TweenService:Create(part, PRESS_TWEEN_INFO, { Position = originalPosition - Vector3.new(0, PRESS_DEPTH, 0) })
+		press:Play()
+		press.Completed:Wait()
+
+		local popUp = TweenService:Create(part, POP_UP_TWEEN_INFO, { Position = originalPosition })
+		popUp:Play()
+		popUp.Completed:Wait()
+
+		partButtonStates[part].Debounce = false
+	end)
+
+	table.insert(partButtonStates[part].Connections, conn)
+end
+
+--================================================================
+-- ## MODEL HOVER EFFECT ##
+--================================================================
+
+local activeModelHoverTweens = {}
+local MODEL_HOVER_OFFSET = 0.5
+local MODEL_HOVER_DURATION = 2
+local MODEL_HOVER_TWEEN_INFO = TweenInfo.new(MODEL_HOVER_DURATION / 2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+
+local function applyModelHoverEffect(model: Model)
+	-- ## MODIFIED ## Added a 1-second delay
+	task.wait(1)
+
+	-- Added model.Parent check in case the model is destroyed during the delay
+	if not model:IsA("Model") or not model.Parent or not model.PrimaryPart then
+		return
+	end
+
+	local primaryPart = model.PrimaryPart
+	local originalCFrame = primaryPart.CFrame
+	local targetCFrameUp = originalCFrame * CFrame.new(0, MODEL_HOVER_OFFSET, 0)
+
+	local tweenUp = TweenService:Create(primaryPart, MODEL_HOVER_TWEEN_INFO, {CFrame = targetCFrameUp})
+	local tweenDown = TweenService:Create(primaryPart, MODEL_HOVER_TWEEN_INFO, {CFrame = originalCFrame})
+
+	activeModelHoverTweens[model] = {tweenUp, tweenDown}
+
+	task.spawn(function()
+		while model.Parent do
+			tweenUp:Play()
+			tweenUp.Completed:Wait()
+			if not model.Parent then break end
+			tweenDown:Play()
+			tweenDown.Completed:Wait()
+		end
+		if activeModelHoverTweens[model] then
+			for _, tween in ipairs(activeModelHoverTweens[model]) do tween:Cancel() end
+			activeModelHoverTweens[model] = nil
+		end
+	end)
+end
+
+local function cleanupModelHoverEffect(model: Model)
+	if activeModelHoverTweens[model] then
+		for _, tween in ipairs(activeModelHoverTweens[model]) do tween:Cancel() end
+		activeModelHoverTweens[model] = nil
+	end
+end
+
+--================================================================
+-- ## CASH ANIMATION, ITEM DAMAGE, TURRET FX, ZOMBIE HIGHLIGHTS ##
+--================================================================
+
+local cashAmountLabel = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Cash"):WaitForChild("Amount")
+local oldCashValue = 0
+local cashAnimConnection: RBXScriptConnection?
+
+local function animateCashIncrease(startValue: number, endValue: number)
+	local duration, startTime, delta = 0.5, os.clock(), endValue - startValue
+	if cashAnimConnection then cashAnimConnection:Disconnect() end
+	cashAnimConnection = RunService.Heartbeat:Connect(function()
+		local progress = math.min((os.clock() - startTime) / duration, 1)
+		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		cashAmountLabel.Text = NumberFormatter.formatNumber(math.floor(startValue + delta * alpha), "$")
+		if progress >= 1 then
+			if cashAnimConnection then cashAnimConnection:Disconnect() cashAnimConnection = nil end
+		end
+	end)
+end
+
+task.spawn(function()
+	local leaderstats = localPlayer:WaitForChild("leaderstats")
+	local cash = leaderstats:WaitForChild("Cash")
+	oldCashValue = cash.Value
+	cashAmountLabel.Text = NumberFormatter.formatNumber(cash.Value, "$")
+	cash.Changed:Connect(function(newValue)
+		if newValue > oldCashValue then
+			animateCashIncrease(oldCashValue, newValue)
+		else
+			cashAmountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
+		end
+		oldCashValue = newValue
+	end)
+end)
+
+local itemDamageData = {}
+
+local function updateItemColor(itemModel: Instance)
+	local data = itemDamageData[itemModel]
+	if not data then return end
+	local config = ItemConfigurations[itemModel.Name]
+	local currentHealth = itemModel:GetAttribute("Health")
+	if not (config and config.Health and typeof(currentHealth) == "number") then return end
+
+	local healthPercent = math.clamp(currentHealth / config.Health, 0, 1)
+	local lerpAlpha = (1 - healthPercent) * 0.8
+	for part, originalColor in pairs(data.originalColors) do
+		if part.Parent then
+			part.Color = originalColor:Lerp(Color3.new(0, 0, 0), lerpAlpha)
+		end
+	end
+end
+
+local function setupItemVFX(itemModel: Instance)
+	if itemDamageData[itemModel] or not itemModel:GetAttribute("IsPlacedItem") then return end
+	local config = ItemConfigurations[itemModel.Name]
+	if not (itemModel:IsA("Model") and config and config.Health) then return end
+
+	local data = { originalColors = {}, healthConnection = nil }
+	for _, descendant in ipairs(itemModel:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			data.originalColors[descendant] = descendant.Color
+		end
+	end
+	data.healthConnection = itemModel:GetAttributeChangedSignal("Health"):Connect(function()
+		updateItemColor(itemModel)
+	end)
+	itemDamageData[itemModel] = data
+	updateItemColor(itemModel)
+end
+
+local function cleanupItemVFX(itemModel: Instance)
+	local data = itemDamageData[itemModel]
+	if data then
+		if data.healthConnection then data.healthConnection:Disconnect() end
+		itemDamageData[itemModel] = nil
+	end
+end
+
+task.spawn(function()
+	local playerPlot: Model?
+	while not playerPlot do
+		for _, plot in ipairs(Workspace.Plots:GetChildren()) do
+			if plot:IsA("Model") and plot:GetAttribute("OwnerId") == localPlayer.UserId then
+				playerPlot = plot
+				break
+			end
+		end
+		if not playerPlot then task.wait(1) end
+	end
+
+	for _, child in ipairs(playerPlot:GetChildren()) do
+		setupItemVFX(child)
+	end
+	playerPlot.ChildAdded:Connect(setupItemVFX)
+	playerPlot.ChildRemoved:Connect(cleanupItemVFX)
+end)
+
+local turretFiredEvent = ReplicatedStorage.Events:WaitForChild("TurretFiredFX")
+local effectsFolder = Workspace:FindFirstChild("Effects") or Instance.new("Folder", Workspace)
+effectsFolder.Name = "Effects"
+
+turretFiredEvent.OnClientEvent:Connect(function(turretModel: Model, startPos: Vector3, endPos: Vector3)
+	local distance = (startPos - endPos).Magnitude
+	local tracer = Instance.new("Part")
+	tracer.Anchored, tracer.CanCollide, tracer.CanTouch, tracer.CastShadow = true, false, false, false
+	tracer.Color, tracer.Material = Color3.new(1, 1, 0), Enum.Material.Neon
+	tracer.Size = Vector3.new(0.1, 0.1, distance)
+	tracer.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
+	tracer.Parent = effectsFolder
+	Debris:AddItem(tracer, 0.1)
+
+	if turretModel then
+		local fireSound = turretModel:FindFirstChild("FireSound", true)
+		if fireSound and fireSound:IsA("Sound") then fireSound:Play() end
+	end
+end)
+
+local highlightZombieEvent = ReplicatedStorage.Events:WaitForChild("HighlightZombie")
+highlightZombieEvent.OnClientEvent:Connect(function(zombieModel: Model)
+	if not zombieModel or not zombieModel.Parent then return end
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = Color3.fromRGB(255, 0, 0)
+	highlight.FillTransparency = 0.5
+	highlight.OutlineTransparency = 1
+	highlight.Parent = zombieModel
+	Debris:AddItem(highlight, 0.2)
+end)
+
+--================================================================
+-- ## INITIALIZATION ##
+--================================================================
+
+local function setupTag(tagName: string, applyFn: (Instance) -> (), cleanupFn: (Instance) -> ())
+	for _, instance in ipairs(CollectionService:GetTagged(tagName)) do
+		task.spawn(applyFn, instance)
+	end
+	CollectionService:GetInstanceAddedSignal(tagName):Connect(applyFn)
+	CollectionService:GetInstanceRemovedSignal(tagName):Connect(cleanupFn)
+end
+
+setupTag("ButtonAnimation", applyButtonAnimation, function(inst) buttonStates[inst] = nil end)
+setupTag("SunburstEffect", applySunburstEffect, function(inst) sunburstObjects[inst] = nil end)
+setupTag("HoverEffect", applyHoverEffect, function(inst)
+	if activeHoverTweens[inst] then
+		for _,t in pairs(activeHoverTweens[inst]) do t:Cancel() end
+		activeHoverTweens[inst] = nil
+	end
+end)
+setupTag("ShineEffect", applyShineEffect, function(inst)
+	if activeShineThreads[inst] then task.cancel(activeShineThreads[inst]) activeShineThreads[inst] = nil end
+end)
+setupTag("PartButton", applyPressEffect, function(inst)
+	if partButtonStates[inst] then
+		for _,c in pairs(partButtonStates[inst].Connections) do c:Disconnect() end
+		partButtonStates[inst] = nil
+	end
+end)
+setupTag("ModelHoverEffect", applyModelHoverEffect, cleanupModelHoverEffect)
+
+---
+
 --- StarterPlayer.StarterPlayerScripts.ClientCrateHandler (LocalScript) ---
 --!strict
 -- Manages the client-side visual timer for placed crates.
@@ -1628,6 +2785,75 @@ button.Activated:Connect(function()
 	local patchNotes = frames:WaitForChild("PatchNotes")
 	if patchNotes and patchNotes:IsA("Frame") then
 		patchNotes.Visible = true
+	end
+end)
+
+---
+
+--- StarterGui.GUI.HUD.Bottom2.Ammo.AmmoUIController (LocalScript) ---
+--!strict
+-- LocalScript controlling ammo UI
+local Players = game:GetService("Players")
+local CAS = game:GetService("ContextActionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local frame = script.Parent :: Frame
+local ammoLbl = frame:WaitForChild("AmmoCount") :: TextLabel
+local Events = ReplicatedStorage:WaitForChild("Events")
+local GunUI = Events:WaitForChild("GunUI") :: RemoteEvent
+local GunRequest = Events:WaitForChild("GunRequest") :: RemoteEvent
+
+frame.Visible = false
+local equipped = false
+local ammo = 0
+local clip = 0
+
+local function render()
+	ammoLbl.Text = string.format("%d/%d", ammo, clip)
+end
+
+local function show(v: boolean)
+	frame.Visible = v
+end
+
+local function bindReload()
+	CAS:BindAction("Reload", function(_, state)
+		if state == Enum.UserInputState.Begin and equipped then
+			GunRequest:FireServer("Reload")
+		end
+	end, false, Enum.KeyCode.R)
+end
+
+local function unbindReload()
+	pcall(function() CAS:UnbindAction("Reload") end)
+end
+
+GunUI.OnClientEvent:Connect(function(kind, data)
+	if kind == "Equipped" then
+		equipped = true
+		ammo = data.Ammo or 0
+		clip = data.Clip or 0
+		show(true)
+		render()
+		bindReload()
+
+	elseif kind == "Unequipped" then
+		equipped = false
+		show(false)
+		unbindReload()
+
+	elseif kind == "Ammo" then
+		ammo = data.Ammo or ammo
+		clip = data.Clip or clip
+		render()
+
+	elseif kind == "Reloading" then
+		if data.State then
+			ammoLbl.Text = "Reloading..."
+		else
+			render()
+		end
 	end
 end)
 
