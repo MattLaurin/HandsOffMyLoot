@@ -2757,11 +2757,14 @@ local ProfileTemplate = {
 	StarterPackOwned = false,
 	Minigun = false,
 	StarterPackOfferEndsAt = 0,
-	
+
 	DailyRewards = {
 		CurrentDay = 1,
 		LastClaimDayId = 0,
 	},
+
+	-- Simple map: [enemyId] = count
+	EnemyInventory = {},
 
 	FastForwardUnlocked = false,
 
@@ -2816,7 +2819,6 @@ function PlayerController:GetProfile(player: Player)
 	return _profiles[player]
 end
 
-
 function PlayerController:SetupSharedInstances() end
 
 local function ensureEvents()
@@ -2844,6 +2846,7 @@ local function ensureEvents()
 		_remotes[name] = ev
 		return ev
 	end
+
 	local function ensureRemoteFunction(name: string, parent: Instance): RemoteFunction
 		local fn = parent:FindFirstChild(name) :: RemoteFunction?
 		if not fn then
@@ -2866,6 +2869,7 @@ local function ensureEvents()
 	ensureRemoteFunction("GetStarterPackOwned", functions)
 	ensureRemoteFunction("GetStarterPackOfferEndsAt", functions)
 
+	-- NOTE: original bug (GetPlayerSettings under events) kept as-is for compat
 	ensureRemoteFunction("GetPlayerSettings", events)
 	ensureRemoteEvent("SavePlayerSettings", events)
 
@@ -2876,6 +2880,12 @@ local function ensureEvents()
 	ensureRemoteEvent("StartOnboarding", events)
 
 	ensureRemoteEvent("GuardsInventoryUpdated", events)
+
+	-- Enemy inventory + lasso
+	ensureRemoteEvent("EnemyInventoryUpdated", events)
+	ensureRemoteEvent("LassoCaptureRequest", events)
+	ensureRemoteFunction("GetEnemyInventory", functions)
+
 	ensureRemoteEvent("TileUnlocked", events)
 	ensureRemoteEvent("PlotResetNotice", events)
 
@@ -2920,7 +2930,6 @@ local function onPlayerAdded(player: Player)
 		player:SetAttribute("HasCrateSlotsPass", owns)
 	end
 
-
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
 	leaderstats.Parent = player
@@ -2937,7 +2946,6 @@ local function onPlayerAdded(player: Player)
 
 	player:SetAttribute("Gemstone", profile.Data.Gemstone or 0)
 
-
 	if not profile.Data.StarterPackOwned and (profile.Data.StarterPackOfferEndsAt or 0) == 0 then
 		profile.Data.StarterPackOfferEndsAt = os.time() + STARTERPACK_OFFER_SECONDS
 	end
@@ -2945,7 +2953,6 @@ local function onPlayerAdded(player: Player)
 	if _remotes["CashUpdated"] then
 		_remotes["CashUpdated"]:FireClient(player, profile.Data.Cash)
 	end
-
 
 	if profile.Data.LastEquippedWeapon then
 		player:SetAttribute("LastEquippedWeapon", profile.Data.LastEquippedWeapon)
@@ -2969,8 +2976,16 @@ local function onPlayerAdded(player: Player)
 	_remotes["PlotUpgradesUpdated"]:FireClient(player, profile.Data.PlotUpgrades)
 
 	local gi = _remotes["GuardsInventoryUpdated"]
-	if gi and gi:IsA("RemoteEvent") then gi:FireClient(player, profile.Data.GuardsInventory) end
+	if gi and gi:IsA("RemoteEvent") then
+		gi:FireClient(player, profile.Data.GuardsInventory)
+	end
 
+	-- Enemy inventory sync (simple table [enemyId] = count)
+	local ei = _remotes["EnemyInventoryUpdated"]
+	if ei and ei:IsA("RemoteEvent") then
+		profile.Data.EnemyInventory = profile.Data.EnemyInventory or {}
+		ei:FireClient(player, profile.Data.EnemyInventory)
+	end
 
 	if _controllers.GlobalShopController then
 		_controllers.GlobalShopController:GetPlayerBlocks(player)
@@ -2985,7 +3000,9 @@ local function onPlayerAdded(player: Player)
 	end
 	if profile.Data.StarterPackOwned then
 		local ownedEv = _remotes["StarterPackOwned"]
-		if ownedEv and ownedEv:IsA("RemoteEvent") then ownedEv:FireClient(player) end
+		if ownedEv and ownedEv:IsA("RemoteEvent") then
+			ownedEv:FireClient(player)
+		end
 	end
 
 	if not profile.Data.HasCompletedOnboarding then
@@ -3009,7 +3026,7 @@ local function onPlayerRemoving(player: Player)
 end
 
 --------------------------
--- NEW CENTRALIZED CASH FUNCTIONS
+-- CENTRALIZED CASH
 --------------------------
 
 local function syncLeaderstats(player: Player, cashValue: number)
@@ -3059,7 +3076,6 @@ function PlayerController.RemoveCash(player: Player, amount: number): boolean
 end
 
 local function onPlayerCashRequested(player: Player): number?
-	-- Wait until the profile exists instead of returning nil
 	local profile = PlayerController:GetProfile(player)
 	while not profile do
 		task.wait()
@@ -3069,9 +3085,51 @@ local function onPlayerCashRequested(player: Player): number?
 	return profile.Data.Cash or 0
 end
 
+--------------------------
+-- ENEMY INVENTORY API
+--------------------------
+
+-- Called by the lasso / Scene minigame to award a capture.
+function PlayerController.AddCapturedEnemy(player: Player, enemyId: string)
+	if not enemyId or enemyId == "" then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	local inv = profile.Data.EnemyInventory or {}
+	inv[enemyId] = (inv[enemyId] or 0) + 1
+	profile.Data.EnemyInventory = inv
+
+	local ev = _remotes["EnemyInventoryUpdated"]
+	if ev and ev:IsA("RemoteEvent") then
+		ev:FireClient(player, inv)
+	end
+end
+
+-- Helper for later when we implement placing / releasing
+function PlayerController.TryConsumeEnemy(player: Player, enemyId: string): boolean
+	if not enemyId or enemyId == "" then return false end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return false end
+
+	local inv = profile.Data.EnemyInventory or {}
+	local current = inv[enemyId] or 0
+	if current <= 0 then return false end
+
+	inv[enemyId] = current - 1
+	profile.Data.EnemyInventory = inv
+
+	local ev = _remotes["EnemyInventoryUpdated"]
+	if ev and ev:IsA("RemoteEvent") then
+		ev:FireClient(player, inv)
+	end
+
+	return true
+end
 
 --------------------------
--- GEMSTONE FUNCTIONS (RETAINED DATA ONLY)
+-- GEMSTONE FUNCTIONS
 --------------------------
 
 function PlayerController.AddGems(player: Player, amount: number)
@@ -3082,7 +3140,6 @@ function PlayerController.AddGems(player: Player, amount: number)
 	profile.Data.Gemstone = (profile.Data.Gemstone or 0) + amount
 	player:SetAttribute("Gemstone", profile.Data.Gemstone)
 end
-
 
 function PlayerController.GetGems(player: Player): number
 	local profile = _profiles[player]
@@ -3098,7 +3155,6 @@ function PlayerController._SetGemsAbsolute(player: Player, newAmount: number)
 	player:SetAttribute("Gemstone", newAmount)
 end
 
-
 function PlayerController.TrySpendGems(player: Player, cost: number): boolean
 	cost = math.max(0, math.floor(tonumber(cost) or 0))
 	if cost <= 0 then return true end
@@ -3110,18 +3166,31 @@ function PlayerController.TrySpendGems(player: Player, cost: number): boolean
 	return true
 end
 
-
 --------------------------
 -- INITIALIZATION
 --------------------------
 
 function PlayerController:Init(controllers: {[string]: any})
-	ensureEvents() 
+	ensureEvents()
 
 	_controllers = controllers
 
-	if _remotes["GetPlayerCash"] then
-		_remotes["GetPlayerCash"].OnServerInvoke = onPlayerCashRequested
+	local getCashFn = _remotes["GetPlayerCash"]
+	if getCashFn and getCashFn:IsA("RemoteFunction") then
+		getCashFn.OnServerInvoke = onPlayerCashRequested
+	end
+
+	local getEnemyInvFn = _remotes["GetEnemyInventory"]
+	if getEnemyInvFn and getEnemyInvFn:IsA("RemoteFunction") then
+		getEnemyInvFn.OnServerInvoke = function(player: Player)
+			local profile = PlayerController:GetProfile(player)
+			while not profile do
+				task.wait()
+				profile = PlayerController:GetProfile(player)
+			end
+			profile.Data.EnemyInventory = profile.Data.EnemyInventory or {}
+			return profile.Data.EnemyInventory
+		end
 	end
 end
 
@@ -3150,7 +3219,10 @@ function PlayerController:Start()
 	if getSettingsFn and getSettingsFn:IsA("RemoteFunction") then
 		getSettingsFn.OnServerInvoke = function(plr: Player)
 			local p = _profiles[plr]
-			while not p do task.wait(); p = _profiles[plr] end
+			while not p do
+				task.wait()
+				p = _profiles[plr]
+			end
 			p.Data.Settings = p.Data.Settings or table.clone(defaults)
 			return p.Data.Settings
 		end
@@ -3191,7 +3263,9 @@ function PlayerController:MarkStarterPackOwned(player: Player)
 	if profile.Data.StarterPackOwned then return end
 	profile.Data.StarterPackOwned = true
 	local ev = _remotes["StarterPackOwned"]
-	if ev and ev:IsA("RemoteEvent") then ev:FireClient(player) end
+	if ev and ev:IsA("RemoteEvent") then
+		ev:FireClient(player)
+	end
 end
 
 function PlayerController:GrantFastForward(player: Player)
@@ -3209,6 +3283,7 @@ function PlayerController:GetPlotUpgrades(player: Player)
 end
 
 return PlayerController
+
 ---
 
 --- ServerScriptService.Controllers.PlacementController (ModuleScript) ---

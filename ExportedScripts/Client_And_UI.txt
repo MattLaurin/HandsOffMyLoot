@@ -4107,6 +4107,127 @@ frame.Visible = false
 
 ---
 
+--- StarterGui.GUI.Frames.EnemyInventory.EnemyInventoryHandler (LocalScript) ---
+--!strict
+-- StarterGui.GUI.Frames.EnemyInventory.EnemiesInventoryHandler
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local EnemyConfigurations = require(Modules:WaitForChild("EnemyConfigurations"))
+
+local player = Players.LocalPlayer
+
+local inventoryFrame = script.Parent :: Frame
+local scrollingFrame = inventoryFrame:WaitForChild("ScrollingFrame") :: ScrollingFrame
+
+local templatesFolder = ReplicatedStorage:WaitForChild("Templates")
+local enemyTemplate = templatesFolder:WaitForChild("EnemyInventoryTemplate") :: Frame
+
+local myEnemies: {[string]: number} = {}
+
+local function clearList()
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if child:IsA("GuiObject") and child ~= enemyTemplate then
+			child:Destroy()
+		end
+	end
+end
+
+local function getSortedEnemyIds(): {string}
+	local list = {}
+	for enemyId, count in pairs(myEnemies) do
+		if count and count > 0 then
+			table.insert(list, enemyId)
+		end
+	end
+
+	table.sort(list, function(a, b)
+		local cfgA = EnemyConfigurations[a]
+		local cfgB = EnemyConfigurations[b]
+		local nameA = (cfgA and cfgA.DisplayName) or a
+		local nameB = (cfgB and cfgB.DisplayName) or b
+		return nameA < nameB
+	end)
+
+	return list
+end
+
+local function redraw()
+	clearList()
+
+	local sortedIds = getSortedEnemyIds()
+	for _, enemyId in ipairs(sortedIds) do
+		local count = myEnemies[enemyId]
+		if count and count > 0 then
+			local item = enemyTemplate:Clone()
+			item.Name = enemyId
+			item.Visible = true
+
+			local nameLabel = item:FindFirstChild("Name")
+			local countLabel = item:FindFirstChild("Count")
+			local rarityLabel = item:FindFirstChild("Rarity")
+
+			local cfg = EnemyConfigurations[enemyId]
+
+			if nameLabel and nameLabel:IsA("TextLabel") then
+				nameLabel.Text = (cfg and cfg.DisplayName) or enemyId
+			end
+
+			if countLabel and countLabel:IsA("TextLabel") then
+				countLabel.Text = "x" .. tostring(count)
+			end
+
+			-- Optional: only shows something if you later add cfg.Rarity
+			if rarityLabel and rarityLabel:IsA("TextLabel") then
+				local rarity = cfg and cfg.Rarity
+				rarityLabel.Text = typeof(rarity) == "string" and rarity or ""
+			end
+
+			item.Parent = scrollingFrame
+		end
+	end
+end
+
+-- Remote hooks
+local eventsFolder = ReplicatedStorage:WaitForChild("Events")
+local enemyInvUpdatedEvent = eventsFolder:WaitForChild("EnemyInventoryUpdated") :: RemoteEvent
+
+enemyInvUpdatedEvent.OnClientEvent:Connect(function(data: {[string]: number}?)
+	myEnemies = data or {}
+	if inventoryFrame.Visible then
+		redraw()
+	end
+end)
+
+-- Refresh when frame is opened (FrameManager will toggle visibility)
+inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if inventoryFrame.Visible then
+		redraw()
+	end
+end)
+
+-- Initial pull (in case we opened before first event)
+task.spawn(function()
+	local functionsFolder = ReplicatedStorage:WaitForChild("Functions")
+	local fn = functionsFolder:FindFirstChild("GetEnemyInventory") :: RemoteFunction?
+	if not fn then return end
+
+	local ok, result = pcall(function()
+		return fn:InvokeServer()
+	end)
+
+	if ok and typeof(result) == "table" then
+		myEnemies = result :: {[string]: number}
+		if inventoryFrame.Visible then
+			redraw()
+		end
+	end
+end)
+
+---
+
 --- StarterGui.MutationsGui.LevelUpHandler (LocalScript) ---
 --!strict
 -- Client Level-Up handler (UI + billboard + interactions)
