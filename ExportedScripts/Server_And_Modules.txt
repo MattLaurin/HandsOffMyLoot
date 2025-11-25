@@ -19,66 +19,86 @@ Bootstrap(ServerScriptService.Controllers)
 
 ---
 
---- ServerScriptService.Modules.Utils (ModuleScript) ---
+--- ServerScriptService.Modules.Bootstrap (ModuleScript) ---
 --!strict
-local Utils = {}
 
-function Utils.ToggleRagdoll(character: Model, enabled: boolean)
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if humanoid then
-		if enabled then
-			humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-		else
-			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+local Extensions = require(script:WaitForChild("Extensions"))
+
+local Bootstrap = {}
+
+local isRunning: boolean = false
+local controllers: {[string]: any} = {}
+
+function Bootstrap(container: Instance)
+	if isRunning then
+		error("[Bootstrap] Already initialized!")
+	end
+	isRunning = true
+
+	-- Load controllers
+	for _, module: Instance in container:GetDescendants() do
+		if module:IsA("ModuleScript") and module.Name:match("Controller$") then
+			local controllerName: string = module.Name
+			local success, requiredModule = pcall(require, module)
+			if success then
+				setmetatable(requiredModule, Extensions.Controller)
+				requiredModule._bs_name = controllerName
+				controllers[controllerName] = requiredModule
+			end
+		end
+	end
+
+	-- This block fixes the race condition by setting up instances first.
+	local playerController = controllers.PlayerController
+	if playerController and playerController.SetupSharedInstances then
+		playerController:SetupSharedInstances()
+	else
+		warn("[Bootstrap] Could not find PlayerController to set up shared instances!")
+	end
+
+	-- Initialize controllers
+	for _, controller in controllers do
+		if controller.Init then
+			controller:Init(controllers)
+		end
+	end
+
+	-- Start controllers
+	for _, controller in controllers do
+		if controller.Start then
+			task.spawn(function()
+				pcall(controller.Start, controller, controllers)
+			end)
 		end
 	end
 end
 
-return Utils
+return Bootstrap
 ---
 
---- ServerScriptService.Modules.DataAccessor (ModuleScript) ---
+--- ServerScriptService.Modules.Bootstrap.Extensions (ModuleScript) ---
 --[[
-    SCRIPT: DataAccessor (MODULE SCRIPT) - SIMPLIFIED
+    SCRIPT: Extensions (MODULE SCRIPT) - OPTIMIZED
     
-    Location: ServerScriptService/Modules/DataAccessor
+    Location: ServerScriptService/Modules/Bootstrap/Extensions
     
-    Description: Optional wrapper for profile data access.
-    Optimized: Strict typing, added key get/set for convenience.
+    Description: Base metatable for controllers with shared methods.
+    Clean code: Strict typing, simplified.
 --]]
 --!strict
 
-local ServerScriptService = game:GetService("ServerScriptService")
+local Extensions = {}
 
-local PlayerController = require(ServerScriptService.Controllers.PlayerController)
+local Controller = {}
+Controller.__index = Controller
 
-local DataAccessor = {}
-
-function DataAccessor:GetData(player: Player): table?
-	local profile = PlayerController:GetProfile(player)
-	return profile and profile.Data
+function Controller:IsInitialized(): boolean
+	return self._bs_initialized or false
 end
 
-function DataAccessor:SaveData(player: Player)
-	local profile = PlayerController:GetProfile(player)
-	if profile then
-		profile:Save()
-	end
-end
+Extensions.Controller = Controller
 
-function DataAccessor:GetKey(player: Player, key: string): any?
-	local data = self:GetData(player)
-	return data and data[key]
-end
-
-function DataAccessor:SetKey(player: Player, key: string, value: any)
-	local data = self:GetData(player)
-	if data then
-		data[key] = value
-	end
-end
-
-return DataAccessor
+return Extensions
 ---
 
 --- ServerScriptService.Modules.ProfileService (ModuleScript) ---
@@ -2327,86 +2347,66 @@ end)
 return ProfileStore
 ---
 
---- ServerScriptService.Modules.Bootstrap (ModuleScript) ---
---!strict
-
-local Extensions = require(script:WaitForChild("Extensions"))
-
-local Bootstrap = {}
-
-local isRunning: boolean = false
-local controllers: {[string]: any} = {}
-
-function Bootstrap(container: Instance)
-	if isRunning then
-		error("[Bootstrap] Already initialized!")
-	end
-	isRunning = true
-
-	-- Load controllers
-	for _, module: Instance in container:GetDescendants() do
-		if module:IsA("ModuleScript") and module.Name:match("Controller$") then
-			local controllerName: string = module.Name
-			local success, requiredModule = pcall(require, module)
-			if success then
-				setmetatable(requiredModule, Extensions.Controller)
-				requiredModule._bs_name = controllerName
-				controllers[controllerName] = requiredModule
-			end
-		end
-	end
-
-	-- This block fixes the race condition by setting up instances first.
-	local playerController = controllers.PlayerController
-	if playerController and playerController.SetupSharedInstances then
-		playerController:SetupSharedInstances()
-	else
-		warn("[Bootstrap] Could not find PlayerController to set up shared instances!")
-	end
-
-	-- Initialize controllers
-	for _, controller in controllers do
-		if controller.Init then
-			controller:Init(controllers)
-		end
-	end
-
-	-- Start controllers
-	for _, controller in controllers do
-		if controller.Start then
-			task.spawn(function()
-				pcall(controller.Start, controller, controllers)
-			end)
-		end
-	end
-end
-
-return Bootstrap
----
-
---- ServerScriptService.Modules.Bootstrap.Extensions (ModuleScript) ---
+--- ServerScriptService.Modules.DataAccessor (ModuleScript) ---
 --[[
-    SCRIPT: Extensions (MODULE SCRIPT) - OPTIMIZED
+    SCRIPT: DataAccessor (MODULE SCRIPT) - SIMPLIFIED
     
-    Location: ServerScriptService/Modules/Bootstrap/Extensions
+    Location: ServerScriptService/Modules/DataAccessor
     
-    Description: Base metatable for controllers with shared methods.
-    Clean code: Strict typing, simplified.
+    Description: Optional wrapper for profile data access.
+    Optimized: Strict typing, added key get/set for convenience.
 --]]
 --!strict
 
-local Extensions = {}
+local ServerScriptService = game:GetService("ServerScriptService")
 
-local Controller = {}
-Controller.__index = Controller
+local PlayerController = require(ServerScriptService.Controllers.PlayerController)
 
-function Controller:IsInitialized(): boolean
-	return self._bs_initialized or false
+local DataAccessor = {}
+
+function DataAccessor:GetData(player: Player): table?
+	local profile = PlayerController:GetProfile(player)
+	return profile and profile.Data
 end
 
-Extensions.Controller = Controller
+function DataAccessor:SaveData(player: Player)
+	local profile = PlayerController:GetProfile(player)
+	if profile then
+		profile:Save()
+	end
+end
 
-return Extensions
+function DataAccessor:GetKey(player: Player, key: string): any?
+	local data = self:GetData(player)
+	return data and data[key]
+end
+
+function DataAccessor:SetKey(player: Player, key: string, value: any)
+	local data = self:GetData(player)
+	if data then
+		data[key] = value
+	end
+end
+
+return DataAccessor
+---
+
+--- ServerScriptService.Modules.Utils (ModuleScript) ---
+--!strict
+local Utils = {}
+
+function Utils.ToggleRagdoll(character: Model, enabled: boolean)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		if enabled then
+			humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		else
+			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end
+	end
+end
+
+return Utils
 ---
 
 --- ServerScriptService.Controllers.BlocksShopController (ModuleScript) ---
@@ -2757,6 +2757,11 @@ local ProfileTemplate = {
 	StarterPackOwned = false,
 	Minigun = false,
 	StarterPackOfferEndsAt = 0,
+	
+	DailyRewards = {
+		CurrentDay = 1,
+		LastClaimDayId = 0,
+	},
 
 	FastForwardUnlocked = false,
 
@@ -3054,12 +3059,16 @@ function PlayerController.RemoveCash(player: Player, amount: number): boolean
 end
 
 local function onPlayerCashRequested(player: Player): number?
+	-- Wait until the profile exists instead of returning nil
 	local profile = PlayerController:GetProfile(player)
-	if profile then
-		return profile.Data.Cash
+	while not profile do
+		task.wait()
+		profile = PlayerController:GetProfile(player)
 	end
-	return nil
+
+	return profile.Data.Cash or 0
 end
+
 
 --------------------------
 -- GEMSTONE FUNCTIONS (RETAINED DATA ONLY)
@@ -4739,6 +4748,7 @@ local CrateController       : any
 local BlocksShopController  : any
 local GlobalShopController  : any
 local RepairSignController  : any
+local LevelUpController     : any
 
 local MAX_CRATES = 3
 
@@ -4750,7 +4760,7 @@ local PRODUCT_SERVERLUCK_X2       = 3446300267 -- 2x (299R$)
 local PRODUCT_SERVERLUCK_X4       = 3446300425 -- 4x (799R$)
 local PRODUCT_SERVERLUCK_ADD15M   = 3446300596 -- +15m (699R$)
 
-local PRODUCT_MUTATION_SKIP       = 3445097534 -- mutationSkipTimer
+local PRODUCT_LEVELUP_SKIP        = 3445097534 -- level-up skip timer
 local PRODUCT_REPAIR_ALL          = 3444162940 -- revive/repair all
 
 
@@ -4844,7 +4854,7 @@ local function processReceipt(receiptInfo: {[string]: any})
 		return decision
 	end
 
-	-- ===== Server luck products (centralized here) =====
+	-- ===== Server luck products =====
 	if productId == PRODUCT_SERVERLUCK_X2 then
 		pcall(function() TotalLuckController:StartServerLuck(nil, 2) end)
 		showNotificationEvent:FireClient(player, "Server Luck set to 2x!", "Success")
@@ -4860,7 +4870,18 @@ local function processReceipt(receiptInfo: {[string]: any})
 		showNotificationEvent:FireClient(player, "+15 minutes added to Server Luck!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
 	end
-	-- ================================================
+
+	-- ===== Level-up skip product =====
+	if productId == PRODUCT_LEVELUP_SKIP then
+		if LevelUpController then
+			local ok = LevelUpController:SkipActiveJob(player)
+			if ok then
+				return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
+			end
+		end
+		-- If we can't skip for some reason, don't consume the purchase.
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
 
 	-- ===== Config-mapped products =====
 	local itemId, config, productType = getProductConfig(productId)
@@ -4880,7 +4901,6 @@ local function processReceipt(receiptInfo: {[string]: any})
 		end
 
 	elseif productType == "Cash" then
-		-- Use centralized cash handling
 		PlayerController.AddCash(player, config.CashAmount)
 		showNotificationEvent:FireClient(
 			player,
@@ -4902,15 +4922,21 @@ local function processReceipt(receiptInfo: {[string]: any})
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted)
 
 	elseif productType == "Crate" then
-		-- Gold crate = instant open
 		if productId == WeaponConfigurations.Crates.GoldCrate.ProductID then
 			local loot = config.Loot
-			local total = 0; for _, l in ipairs(loot) do total += l.Weight end
+			local total = 0
+			for _, l in ipairs(loot) do total += l.Weight end
 			local roll = math.random() * total
 			local chosen = loot[#loot].Item
 			for _, l in ipairs(loot) do
-				if roll <= l.Weight then chosen = l.Item; break else roll -= l.Weight end
+				if roll <= l.Weight then
+					chosen = l.Item
+					break
+				else
+					roll -= l.Weight
+				end
 			end
+
 			local profile = PlayerController:GetProfile(player)
 			if chosen and profile and not table.find(profile.Data.WeaponInventory, chosen) then
 				table.insert(profile.Data.WeaponInventory, chosen)
@@ -4932,7 +4958,9 @@ local function processReceipt(receiptInfo: {[string]: any})
 		else
 			local profile = PlayerController:GetProfile(player)
 			if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
-			if #profile.Data.Crates >= MAX_CRATES then return Enum.ProductPurchaseDecision.NotProcessedYet end
+			if #profile.Data.Crates >= MAX_CRATES then
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
 			while not CrateController do task.wait() end
 			if CrateController:PurchaseCrate(player, itemId, true) then
 				showNotificationEvent:FireClient(player, "Purchase Successful!", "Success")
@@ -4994,6 +5022,7 @@ function ShopController:Init(controllers: {[string]: any})
 	BlocksShopController  = controllers.BlocksShopController
 	GlobalShopController  = controllers.GlobalShopController
 	RepairSignController  = controllers.RepairSignController
+	LevelUpController     = controllers.LevelUpController -- <- make sure you pass this in
 end
 
 function ShopController:Start()
@@ -5978,285 +6007,6 @@ end)
 
 ---
 
---- ServerScriptService.Controllers.PlotSignagneController (ModuleScript) ---
---!strict
-local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-
-local PlotSignageController = {}
-
-
-local PLOT_FOLDER_NAME: string? = "Plots" 
-local SIGN_MODEL_NAME = "PlotSignage"
-local SIGN_PART_NAME  = "Screen"
-local GUI_NAME        = "SignGui"
-
--- SurfaceGui sizing
-local CANVAS_SIZE = Vector2.new(900, 400)
-local PIXELS_PER_STUD = 75
-
--- Visual style
-local BG_TRANSPARENCY = 1
-local TEXT_COLOR      = Color3.fromRGB(255,255,255)
-local TEXT_STROKE     = Color3.fromRGB(0,0,0)
-local TEXT_STROKE_T   = 0
-local TEXT_STROKE_Size = 3
-local FONT            = Enum.Font.FredokaOne
-local AVATAR_SIZE     = UDim2.fromScale(0.28, 0.8)
-local AVATAR_ASPECT   = 1.0
-
-
-
-
-local function possessive(name: string): string
-	local last = name:sub(-1):lower()
-	if last == "s" then
-		return name .. "’"
-	else
-		return name .. "'s"
-	end
-end
-
-local function getOwnerUserId(plot: Instance): number?
-	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
-		local attr = plot:GetAttribute(key)
-		if typeof(attr) == "number" then
-			return attr
-		end
-	end
-	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
-		local iv = plot:FindFirstChild(key)
-		if iv and iv:IsA("IntValue") then
-			return iv.Value
-		end
-	end
-	return nil
-end
-
-local function getNameAndThumb(userId: number): (string, string)
-	local okName, playerName = pcall(Players.GetNameFromUserIdAsync, Players, userId)
-	if not okName then
-		playerName = ("User %d"):format(userId)
-	end
-	local thumbUrl = ""
-	local okThumb, url = pcall(Players.GetUserThumbnailAsync, Players, userId,
-		Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
-	if okThumb then
-		thumbUrl = url
-	end
-	return playerName, thumbUrl
-end
-
-local function clearOldGui(screen: BasePart)
-	for _, child in ipairs(screen:GetChildren()) do
-		if child:IsA("SurfaceGui") and child.Name == GUI_NAME then
-			child:Destroy()
-		end
-	end
-end
-
-local function makeGui(screen: BasePart, titleText: string, thumbUrl: string)
-	clearOldGui(screen)
-
-	local gui = Instance.new("SurfaceGui")
-	gui.Name = GUI_NAME
-	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-	gui.PixelsPerStud = PIXELS_PER_STUD
-	gui.CanvasSize = CANVAS_SIZE
-	gui.Adornee = screen
-	gui.Face = Enum.NormalId.Front
-	gui.AlwaysOnTop = false
-	gui.Parent = screen
-
-	local bg = Instance.new("Frame")
-	bg.Name = "BG"
-	bg.Size = UDim2.fromScale(1,1)
-	bg.BackgroundTransparency = BG_TRANSPARENCY
-	bg.Parent = gui
-
-	local avatar = Instance.new("ImageLabel")
-	avatar.Name = "Avatar"
-	avatar.Size = AVATAR_SIZE
-	avatar.Position = UDim2.fromScale(0.05, 0.1)
-	avatar.BackgroundTransparency = 1
-	avatar.Image = (thumbUrl ~= "" and thumbUrl) or "rbxassetid://0"
-	avatar.Parent = bg
-	local uic = Instance.new("UICorner")
-	uic.CornerRadius = UDim.new(0, 30)
-	uic.Parent = avatar
-	local uiAspect = Instance.new("UIAspectRatioConstraint")
-	uiAspect.AspectRatio = AVATAR_ASPECT
-	uiAspect.Parent = avatar
-
-	local title = Instance.new("TextLabel")
-	title.Name = "Title"
-	title.AnchorPoint = Vector2.new(0, 0.5)
-	title.Position   = UDim2.fromScale(0.36, 0.5)
-	title.Size       = UDim2.fromScale(0.6, 0.8)
-	title.BackgroundTransparency = 1
-	title.Text = titleText
-	title.TextColor3 = TEXT_COLOR
-	title.Font = FONT
-	title.TextScaled = true
-	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Parent = bg
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = TEXT_STROKE_Size
-	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
-	stroke.Color = TEXT_STROKE
-	stroke.Transparency = TEXT_STROKE_T
-	stroke.Parent = title
-end
-
-local function isPlotModel(inst: Instance): boolean
-	if not inst:IsA("Model") then return false end
-	local signage = inst:FindFirstChild(SIGN_MODEL_NAME)
-	if not (signage and signage:IsA("Model")) then return false end
-	local screen = signage:FindFirstChild(SIGN_PART_NAME)
-	return (screen ~= nil) and screen:IsA("BasePart")
-end
-
-local function updatePlotSign(plot: Instance)
-	local signage = plot:FindFirstChild(SIGN_MODEL_NAME)
-	if not signage or not signage:IsA("Model") then
-		warn(("[Signage] Missing %s in %s"):format(SIGN_MODEL_NAME, plot:GetFullName()))
-		return
-	end
-	local screen = signage:FindFirstChild(SIGN_PART_NAME) :: BasePart?
-	if not screen or not screen:IsA("BasePart") then
-		warn(("[Signage] Missing %s part under %s"):format(SIGN_PART_NAME, signage:GetFullName()))
-		return
-	end
-
-	local userId = getOwnerUserId(plot)
-	if not userId then
-		clearOldGui(screen)
-		return
-	end
-
-	local playerName, thumbUrl = getNameAndThumb(userId)
-	local title = ("%s Base"):format(possessive(playerName))
-	makeGui(screen, title, thumbUrl)
-	--print(("[Signage] Updated %s -> %s (%d)"):format(plot.Name, playerName, userId))
-end
-
-local function hookOwnerChanges(plot: Instance)
-	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
-		plot:GetAttributeChangedSignal(key):Connect(function()
-			updatePlotSign(plot)
-		end)
-	end
-
-	local function watch(iv: IntValue)
-		iv.Changed:Connect(function()
-			updatePlotSign(plot)
-		end)
-	end
-	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
-		local iv = plot:FindFirstChild(key)
-		if iv and iv:IsA("IntValue") then
-			watch(iv)
-		end
-	end
-	plot.ChildAdded:Connect(function(ch)
-		if ch:IsA("IntValue") and (ch.Name == "OwnerId" or ch.Name == "OwnerUserId") then
-			watch(ch)
-			updatePlotSign(plot)
-		end
-	end)
-end
-
-
-
-function PlotSignageController:Init()
-	-- nothing to wire from other controllers
-end
-
-function PlotSignageController:Start()
-	local container: Instance = Workspace
-	if PLOT_FOLDER_NAME then
-		local f = Workspace:FindFirstChild(PLOT_FOLDER_NAME)
-		if f then container = f end
-	end
-
-
-	for _, inst in ipairs(container:GetDescendants()) do
-		if isPlotModel(inst) then
-			updatePlotSign(inst)
-			hookOwnerChanges(inst)
-		end
-	end
-
-	-- React to new plots added
-	container.DescendantAdded:Connect(function(inst)
-		if isPlotModel(inst) then
-			task.defer(function()
-				updatePlotSign(inst)
-				hookOwnerChanges(inst)
-			end)
-		end
-	end)
-
---	print("[Signage] Controller started")
-end
-
-return PlotSignageController
-
----
-
---- ServerScriptService.Controllers.MoveModelsController (ModuleScript) ---
---!strict
-local RunService    = game:GetService("RunService")
-local Workspace     = game:GetService("Workspace")
-local ServerStorage = game:GetService("ServerStorage")
-
-local TARGET_NAME = "STUDIO_MODELS"
-
-local function move(inst: Instance)
-	if not inst or not inst.Parent or inst.Parent == ServerStorage then return end
-	if RunService:IsClient() then return end
-	inst.Parent = ServerStorage
-	--print(("[STUDIO_MODELS] Moved to ServerStorage: %s"):format(inst:GetFullName()))
-end
-
-local function sweep()
-	local direct = Workspace:FindFirstChild(TARGET_NAME)
-	if direct then move(direct) end
-	for _, d in ipairs(Workspace:GetDescendants()) do
-		if d.Name == TARGET_NAME and (d:IsA("Folder") or d:IsA("Model")) then
-			move(d)
-		end
-	end
-end
-
-local MoveStudioModelsController = {}
-
-function MoveStudioModelsController:Init(_controllers) end
-
-function MoveStudioModelsController:Start()
-	if RunService:IsClient() then return end
-	sweep()
-	Workspace.ChildAdded:Connect(function(child)
-		if child.Name == TARGET_NAME and (child:IsA("Folder") or child:IsA("Model")) then
-			move(child)
-		end
-	end)
-	Workspace.DescendantAdded:Connect(function(inst)
-		if inst.Name == TARGET_NAME and (inst:IsA("Folder") or inst:IsA("Model")) then
-			task.defer(function()
-				if inst and inst.Parent and inst.Parent ~= ServerStorage then
-					move(inst)
-				end
-			end)
-		end
-	end)
-end
-
-return MoveStudioModelsController
-
----
-
 --- ServerScriptService.Controllers.GlobalShopController (ModuleScript) ---
 --!strict
 -- GLOBAL SHOP CONTROLLER (Deterministic, Cross-Server Identical + Per-Player Persistent Stock)
@@ -6451,10 +6201,11 @@ end
 local function ensurePlayerStocks(player: Player)
 	if _pStocks.Blocks[player] and _pStocks.Weapons[player] then return end
 
+	-- Wait for profile instead of bailing
 	local prof = getProfile(player)
-	if not prof then
-		-- Profile not ready yet; PlayerController will call GetPlayer* after profile exists.
-		return
+	while not prof do
+		task.wait()
+		prof = getProfile(player)
 	end
 
 	if prof.Data and prof.Data.ShopState then
@@ -6473,6 +6224,7 @@ local function ensurePlayerStocks(player: Player)
 	_pStocks.Weapons[player] = cloneMap(_baseline.Weapons)
 	savePlayerStocks(player)
 end
+
 
 -- ===== GLOBAL RESTOCK =====
 local function doGlobalRestockFor(bucket: number)
@@ -6813,6 +6565,285 @@ return BadgeController
 
 ---
 
+--- ServerScriptService.Controllers.PlotSignagneController (ModuleScript) ---
+--!strict
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local PlotSignageController = {}
+
+
+local PLOT_FOLDER_NAME: string? = "Plots" 
+local SIGN_MODEL_NAME = "PlotSignage"
+local SIGN_PART_NAME  = "Screen"
+local GUI_NAME        = "SignGui"
+
+-- SurfaceGui sizing
+local CANVAS_SIZE = Vector2.new(900, 400)
+local PIXELS_PER_STUD = 75
+
+-- Visual style
+local BG_TRANSPARENCY = 1
+local TEXT_COLOR      = Color3.fromRGB(255,255,255)
+local TEXT_STROKE     = Color3.fromRGB(0,0,0)
+local TEXT_STROKE_T   = 0
+local TEXT_STROKE_Size = 3
+local FONT            = Enum.Font.FredokaOne
+local AVATAR_SIZE     = UDim2.fromScale(0.28, 0.8)
+local AVATAR_ASPECT   = 1.0
+
+
+
+
+local function possessive(name: string): string
+	local last = name:sub(-1):lower()
+	if last == "s" then
+		return name .. "’"
+	else
+		return name .. "'s"
+	end
+end
+
+local function getOwnerUserId(plot: Instance): number?
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local attr = plot:GetAttribute(key)
+		if typeof(attr) == "number" then
+			return attr
+		end
+	end
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local iv = plot:FindFirstChild(key)
+		if iv and iv:IsA("IntValue") then
+			return iv.Value
+		end
+	end
+	return nil
+end
+
+local function getNameAndThumb(userId: number): (string, string)
+	local okName, playerName = pcall(Players.GetNameFromUserIdAsync, Players, userId)
+	if not okName then
+		playerName = ("User %d"):format(userId)
+	end
+	local thumbUrl = ""
+	local okThumb, url = pcall(Players.GetUserThumbnailAsync, Players, userId,
+		Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+	if okThumb then
+		thumbUrl = url
+	end
+	return playerName, thumbUrl
+end
+
+local function clearOldGui(screen: BasePart)
+	for _, child in ipairs(screen:GetChildren()) do
+		if child:IsA("SurfaceGui") and child.Name == GUI_NAME then
+			child:Destroy()
+		end
+	end
+end
+
+local function makeGui(screen: BasePart, titleText: string, thumbUrl: string)
+	clearOldGui(screen)
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = GUI_NAME
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = PIXELS_PER_STUD
+	gui.CanvasSize = CANVAS_SIZE
+	gui.Adornee = screen
+	gui.Face = Enum.NormalId.Front
+	gui.AlwaysOnTop = false
+	gui.Parent = screen
+
+	local bg = Instance.new("Frame")
+	bg.Name = "BG"
+	bg.Size = UDim2.fromScale(1,1)
+	bg.BackgroundTransparency = BG_TRANSPARENCY
+	bg.Parent = gui
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Name = "Avatar"
+	avatar.Size = AVATAR_SIZE
+	avatar.Position = UDim2.fromScale(0.05, 0.1)
+	avatar.BackgroundTransparency = 1
+	avatar.Image = (thumbUrl ~= "" and thumbUrl) or "rbxassetid://0"
+	avatar.Parent = bg
+	local uic = Instance.new("UICorner")
+	uic.CornerRadius = UDim.new(0, 30)
+	uic.Parent = avatar
+	local uiAspect = Instance.new("UIAspectRatioConstraint")
+	uiAspect.AspectRatio = AVATAR_ASPECT
+	uiAspect.Parent = avatar
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.AnchorPoint = Vector2.new(0, 0.5)
+	title.Position   = UDim2.fromScale(0.36, 0.5)
+	title.Size       = UDim2.fromScale(0.6, 0.8)
+	title.BackgroundTransparency = 1
+	title.Text = titleText
+	title.TextColor3 = TEXT_COLOR
+	title.Font = FONT
+	title.TextScaled = true
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = bg
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = TEXT_STROKE_Size
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+	stroke.Color = TEXT_STROKE
+	stroke.Transparency = TEXT_STROKE_T
+	stroke.Parent = title
+end
+
+local function isPlotModel(inst: Instance): boolean
+	if not inst:IsA("Model") then return false end
+	local signage = inst:FindFirstChild(SIGN_MODEL_NAME)
+	if not (signage and signage:IsA("Model")) then return false end
+	local screen = signage:FindFirstChild(SIGN_PART_NAME)
+	return (screen ~= nil) and screen:IsA("BasePart")
+end
+
+local function updatePlotSign(plot: Instance)
+	local signage = plot:FindFirstChild(SIGN_MODEL_NAME)
+	if not signage or not signage:IsA("Model") then
+		warn(("[Signage] Missing %s in %s"):format(SIGN_MODEL_NAME, plot:GetFullName()))
+		return
+	end
+	local screen = signage:FindFirstChild(SIGN_PART_NAME) :: BasePart?
+	if not screen or not screen:IsA("BasePart") then
+		warn(("[Signage] Missing %s part under %s"):format(SIGN_PART_NAME, signage:GetFullName()))
+		return
+	end
+
+	local userId = getOwnerUserId(plot)
+	if not userId then
+		clearOldGui(screen)
+		return
+	end
+
+	local playerName, thumbUrl = getNameAndThumb(userId)
+	local title = ("%s Base"):format(possessive(playerName))
+	makeGui(screen, title, thumbUrl)
+	--print(("[Signage] Updated %s -> %s (%d)"):format(plot.Name, playerName, userId))
+end
+
+local function hookOwnerChanges(plot: Instance)
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		plot:GetAttributeChangedSignal(key):Connect(function()
+			updatePlotSign(plot)
+		end)
+	end
+
+	local function watch(iv: IntValue)
+		iv.Changed:Connect(function()
+			updatePlotSign(plot)
+		end)
+	end
+	for _, key in ipairs({ "OwnerId", "OwnerUserId" }) do
+		local iv = plot:FindFirstChild(key)
+		if iv and iv:IsA("IntValue") then
+			watch(iv)
+		end
+	end
+	plot.ChildAdded:Connect(function(ch)
+		if ch:IsA("IntValue") and (ch.Name == "OwnerId" or ch.Name == "OwnerUserId") then
+			watch(ch)
+			updatePlotSign(plot)
+		end
+	end)
+end
+
+
+
+function PlotSignageController:Init()
+	-- nothing to wire from other controllers
+end
+
+function PlotSignageController:Start()
+	local container: Instance = Workspace
+	if PLOT_FOLDER_NAME then
+		local f = Workspace:FindFirstChild(PLOT_FOLDER_NAME)
+		if f then container = f end
+	end
+
+
+	for _, inst in ipairs(container:GetDescendants()) do
+		if isPlotModel(inst) then
+			updatePlotSign(inst)
+			hookOwnerChanges(inst)
+		end
+	end
+
+	-- React to new plots added
+	container.DescendantAdded:Connect(function(inst)
+		if isPlotModel(inst) then
+			task.defer(function()
+				updatePlotSign(inst)
+				hookOwnerChanges(inst)
+			end)
+		end
+	end)
+
+--	print("[Signage] Controller started")
+end
+
+return PlotSignageController
+
+---
+
+--- ServerScriptService.Controllers.MoveModelsController (ModuleScript) ---
+--!strict
+local RunService    = game:GetService("RunService")
+local Workspace     = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage")
+
+local TARGET_NAME = "STUDIO_MODELS"
+
+local function move(inst: Instance)
+	if not inst or not inst.Parent or inst.Parent == ServerStorage then return end
+	if RunService:IsClient() then return end
+	inst.Parent = ServerStorage
+	--print(("[STUDIO_MODELS] Moved to ServerStorage: %s"):format(inst:GetFullName()))
+end
+
+local function sweep()
+	local direct = Workspace:FindFirstChild(TARGET_NAME)
+	if direct then move(direct) end
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d.Name == TARGET_NAME and (d:IsA("Folder") or d:IsA("Model")) then
+			move(d)
+		end
+	end
+end
+
+local MoveStudioModelsController = {}
+
+function MoveStudioModelsController:Init(_controllers) end
+
+function MoveStudioModelsController:Start()
+	if RunService:IsClient() then return end
+	sweep()
+	Workspace.ChildAdded:Connect(function(child)
+		if child.Name == TARGET_NAME and (child:IsA("Folder") or child:IsA("Model")) then
+			move(child)
+		end
+	end)
+	Workspace.DescendantAdded:Connect(function(inst)
+		if inst.Name == TARGET_NAME and (inst:IsA("Folder") or inst:IsA("Model")) then
+			task.defer(function()
+				if inst and inst.Parent and inst.Parent ~= ServerStorage then
+					move(inst)
+				end
+			end)
+		end
+	end)
+end
+
+return MoveStudioModelsController
+
+---
+
 --- ServerScriptService.Controllers.SettingsController (ModuleScript) ---
 --!strict
 local Players = game:GetService("Players")
@@ -6939,6 +6970,440 @@ function SettingsController:Start(_controllers: {[string]: any})
 end
 
 return SettingsController
+
+---
+
+--- ServerScriptService.Controllers.LevelUpController (ModuleScript) ---
+--!strict
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local PlayerController = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+local Config           = require(ReplicatedStorage.Modules:WaitForChild("LevelUpConfiguration"))
+
+local LevelUpController = {}
+LevelUpController._started = false
+
+local SKIP_PRODUCT_ID  = 3445097534
+local SKIP_TOKENS_KEY  = "LevelUpSkipTokens"
+
+-- ===== Remotes =====
+local function ensureEvents()
+	local events = ReplicatedStorage:FindFirstChild("Events")
+	if not events then
+		events = Instance.new("Folder")
+		events.Name = "Events"
+		events.Parent = ReplicatedStorage
+	end
+
+	local function rf(name: string)
+		local x = events:FindFirstChild(name) :: RemoteFunction?
+		if not x then
+			x = Instance.new("RemoteFunction")
+			x.Name = name
+			x.Parent = events
+		end
+		return x
+	end
+
+	local function re(name: string)
+		local x = events:FindFirstChild(name) :: RemoteEvent?
+		if not x then
+			x = Instance.new("RemoteEvent")
+			x.Name = name
+			x.Parent = events
+		end
+		return x
+	end
+
+	-- 🔹 make sure we have BlockInventoryUpdated here too
+	local blockInvUpdated = events:FindFirstChild("BlockInventoryUpdated") :: RemoteEvent?
+	if not blockInvUpdated then
+		blockInvUpdated = Instance.new("RemoteEvent")
+		blockInvUpdated.Name = "BlockInventoryUpdated"
+		blockInvUpdated.Parent = events
+	end
+
+	return {
+		List               = rf("LevelUp_List"),
+		Start              = re("LevelUp_Start"),
+		Claim              = rf("LevelUp_Claim"),
+		JobPush            = re("LevelUp_JobUpdated"),
+		PromptSkip         = re("PromptLevelUpSkipPurchase"),
+		ShowNotification   = events:FindFirstChild("ShowNotification") :: RemoteEvent?,
+		PromptAnyProduct   = events:WaitForChild("PromptSkipTimerRequest") :: RemoteEvent,
+		BlockInventoryUpdated = blockInvUpdated, -- 🔹 expose it
+	}
+end
+
+local Events = ensureEvents()
+
+local function now()
+	return os.time()
+end
+
+local function getProfile(p: Player)
+	local prof = PlayerController:GetProfile(p)
+	while not prof do
+		task.wait()
+		prof = PlayerController:GetProfile(p)
+	end
+	return prof
+end
+
+local function getCost(baseId: string, tier: number)
+	local rules = Config.RULES[baseId]
+	if not rules then return nil, "No rules" end
+	tier = tonumber(tier) or 1
+	local r = rules[tier]
+	if not r then return nil, "Invalid tier" end
+
+	local consumeId = (tier > 1) and Config.ResultId(baseId, tier - 1) or baseId
+	local seconds   = Config.TIER_SECONDS[math.clamp(tier,1,#Config.TIER_SECONDS)] or 0
+
+	return {
+		consumeId = consumeId,
+		units     = r.units,
+		cash      = r.cash or 0,
+		seconds   = seconds,
+	}, nil
+end
+
+-- ===== Payload =====
+local function buildList(player: Player)
+	local d = getProfile(player).Data
+	d[Config.PROFILE_KEYS.UNITS] = d[Config.PROFILE_KEYS.UNITS] or {}
+	d[SKIP_TOKENS_KEY]           = d[SKIP_TOKENS_KEY]           or 0
+
+	local units = {}
+	for _, id in ipairs(Config.MUTABLE) do
+		table.insert(units, {
+			id    = id,
+			count = tonumber(d[Config.PROFILE_KEYS.UNITS][id] or 0) or 0,
+		})
+	end
+
+	local cash = tonumber(d.Cash or 0) or 0
+
+	return {
+		cash       = cash,
+		units      = units,
+		job        = d[Config.PROFILE_KEYS.JOB],
+		inv        = d[Config.PROFILE_KEYS.UNITS],
+		skipTokens = d[SKIP_TOKENS_KEY],
+	}
+end
+
+-- ===== Core ops =====
+local function claimJob(player: Player)
+	local d = getProfile(player).Data
+	local job = d[Config.PROFILE_KEYS.JOB]
+	if not job then return false, "No active level-up." end
+	if now() < (job.finishesAt or 0) then return false, "Still leveling." end
+
+	d[Config.PROFILE_KEYS.JOB] = nil
+	d[Config.PROFILE_KEYS.UNITS] = d[Config.PROFILE_KEYS.UNITS] or {}
+	d[Config.PROFILE_KEYS.UNITS][job.output] =
+		(d[Config.PROFILE_KEYS.UNITS][job.output] or 0) + 1
+
+	-- 🔹 notify client inventory changed
+	if Events.BlockInventoryUpdated then
+		Events.BlockInventoryUpdated:FireClient(player, d[Config.PROFILE_KEYS.UNITS])
+	end
+
+	Events.JobPush:FireClient(player, { claimed = true, output = job.output })
+	return true, job.output
+end
+
+local function fastFinishIfAny(player: Player): boolean
+	local d = getProfile(player).Data
+	d[SKIP_TOKENS_KEY] = d[SKIP_TOKENS_KEY] or 0
+	local job = d[Config.PROFILE_KEYS.JOB]
+	if not job then return false end
+
+	if (d[SKIP_TOKENS_KEY] or 0) > 0 then
+		d[SKIP_TOKENS_KEY] -= 1
+	end
+
+	job.finishesAt = now()
+	local ok = select(1, claimJob(player))
+	if ok and Events.ShowNotification then
+		Events.ShowNotification:FireClient(player, "Level up skipped! New unit claimed.", "Success")
+	end
+	return ok
+end
+
+local function startJob(player: Player, baseId: string, tier: number?)
+	tier = tonumber(tier) or 1
+	local d = getProfile(player).Data
+	if d[Config.PROFILE_KEYS.JOB] then return false, "Level up already running." end
+
+	local cost, err = getCost(baseId, tier)
+	if not cost then return false, err end
+
+	local inv = d[Config.PROFILE_KEYS.UNITS]
+	inv = inv or {}
+	d[Config.PROFILE_KEYS.UNITS] = inv
+
+	local haveUnits = tonumber(inv[cost.consumeId] or 0) or 0
+	local cash = tonumber(d.Cash or 0) or 0
+
+	if haveUnits < cost.units then return false, "Not enough units." end
+	if cash < (cost.cash or 0) then return false, "Not enough cash." end
+
+	-- spend units
+	inv[cost.consumeId] = haveUnits - cost.units
+
+	-- 🔹 notify client inventory changed after spending input units
+	if Events.BlockInventoryUpdated then
+		Events.BlockInventoryUpdated:FireClient(player, inv)
+	end
+
+	if cost.cash and cost.cash > 0 then
+		if not PlayerController.RemoveCash(player, cost.cash) then
+			return false, "Not enough cash."
+		end
+	end
+
+	local job = {
+		input      = baseId,
+		tier       = tier,
+		output     = Config.ResultId(baseId, tier),
+		startedAt  = now(),
+		finishesAt = now() + cost.seconds,
+	}
+
+	d[Config.PROFILE_KEYS.JOB] = job
+	Events.JobPush:FireClient(player, job)
+
+	d[SKIP_TOKENS_KEY] = d[SKIP_TOKENS_KEY] or 0
+	if d[SKIP_TOKENS_KEY] > 0 then
+		fastFinishIfAny(player)
+	end
+
+	return true, job
+end
+
+function LevelUpController:SkipActiveJob(player: Player)
+	local d = getProfile(player).Data
+	local job = d[Config.PROFILE_KEYS.JOB]
+	if not job then
+		if Events.ShowNotification then
+			Events.ShowNotification:FireClient(player, "No active level up to skip.", "Warning")
+		end
+		return false
+	end
+
+	job.finishesAt = now()
+	local ok = select(1, claimJob(player))
+	if ok and Events.ShowNotification then
+		Events.ShowNotification:FireClient(player, "Level up skipped! New unit claimed.", "Success")
+	end
+	return ok
+end
+
+function LevelUpController:Init(_controllers: {[string]: any}?) end
+
+function LevelUpController:Start()
+	if self._started then return end
+	self._started = true
+
+	local E = Events
+
+	E.PromptSkip.OnServerEvent:Connect(function(player: Player)
+		local d = getProfile(player).Data
+		if d[Config.PROFILE_KEYS.JOB] then
+			E.PromptAnyProduct:FireClient(player, SKIP_PRODUCT_ID)
+		else
+			if E.ShowNotification then
+				E.ShowNotification:FireClient(player, "No active level up to skip.", "Warning")
+			end
+		end
+	end)
+
+	E.List.OnServerInvoke = function(p: Player)
+		return buildList(p)
+	end
+
+	E.Start.OnServerEvent:Connect(function(p: Player, baseId: string, tier: number?)
+		local ok, msg = startJob(p, baseId, tier)
+		if not ok then
+			E.JobPush:FireClient(p, { error = msg })
+		end
+	end)
+
+	E.Claim.OnServerInvoke = function(p: Player)
+		return claimJob(p)
+	end
+end
+
+return LevelUpController
+
+---
+
+--- ServerScriptService.Controllers.RewardController (ModuleScript) ---
+--!strict
+-- ServerScriptService/Controllers/RewardsController
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local PlayerController    = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+local RewardConfiguration = require(ReplicatedStorage.Modules:WaitForChild("RewardConfiguration"))
+
+local RewardsController = {}
+local _remotes: {[string]: RemoteFunction} = {}
+
+local function getFunctionsFolder(): Folder
+	local f = ReplicatedStorage:FindFirstChild("Functions")
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = "Functions"
+		f.Parent = ReplicatedStorage
+	end
+	return f
+end
+
+local function ensureRemoteFunction(name: string): RemoteFunction
+	local parent = getFunctionsFolder()
+	local fn = parent:FindFirstChild(name)
+	if not fn then
+		fn = Instance.new("RemoteFunction")
+		fn.Name = name
+		fn.Parent = parent
+	end
+	_remotes[name] = fn :: RemoteFunction
+	return fn :: RemoteFunction
+end
+
+----------------------------------------------------------------
+-- DAILY HELPERS
+----------------------------------------------------------------
+
+local function getDayId(unixTime: number): number
+	return math.floor(unixTime / 86400)
+end
+
+local function getDailyStateTable(profileData: any)
+	profileData.DailyRewards = profileData.DailyRewards or {
+		CurrentDay = 1,
+		LastClaimDayId = 0,
+	}
+	local daily = profileData.DailyRewards
+	daily.CurrentDay = daily.CurrentDay or 1
+	daily.LastClaimDayId = daily.LastClaimDayId or 0
+	return daily
+end
+
+local function buildDailyInfo(profileData: any)
+	local daily = getDailyStateTable(profileData)
+	local now = os.time()
+	local todayId = getDayId(now)
+
+	local currentDay = math.clamp(daily.CurrentDay, 1, RewardConfiguration.MaxDailyDay)
+	local alreadyClaimedToday = (daily.LastClaimDayId == todayId)
+
+	local secondsUntilNextClaim = 0
+	if alreadyClaimedToday then
+		local nextDayStart = (todayId + 1) * 86400
+		secondsUntilNextClaim = math.max(0, nextDayStart - now)
+	end
+
+	return {
+		currentDay = currentDay,
+		alreadyClaimedToday = alreadyClaimedToday,
+		secondsUntilNextClaim = secondsUntilNextClaim,
+	}
+end
+
+local function applyDailyReward(player: Player, profileData: any, dayIndex: number): string
+	local def = RewardConfiguration.DailyRewards[dayIndex]
+	if not def then
+		return "No reward configured."
+	end
+
+	if def.Type == "Cash" then
+		PlayerController.AddCash(player, def.Amount or 0)
+		return def.Label or ("You received " .. tostring(def.Amount) .. " Cash!")
+	end
+
+	-- Everything else is TODO later; just text for now.
+	return def.Label or "Reward claimed."
+end
+
+----------------------------------------------------------------
+-- REMOTE HANDLERS
+----------------------------------------------------------------
+
+local function waitForProfile(player: Player)
+	local profile = PlayerController:GetProfile(player)
+	while not profile do
+		task.wait()
+		profile = PlayerController:GetProfile(player)
+	end
+	return profile
+end
+
+local function onGetDailyRewardsState(player: Player)
+	local profile = waitForProfile(player)
+	return buildDailyInfo(profile.Data)
+end
+
+
+local function onClaimDailyReward(player: Player)
+	local profile = PlayerController:GetProfile(player)
+	if not profile then
+		return false, "No profile.", {
+			currentDay = 1,
+			alreadyClaimedToday = false,
+			secondsUntilNextClaim = 0,
+		}
+	end
+
+	local data = profile.Data
+	local daily = getDailyStateTable(data)
+
+	local now = os.time()
+	local todayId = getDayId(now)
+
+	local infoBefore = buildDailyInfo(data)
+
+	if infoBefore.alreadyClaimedToday then
+		return false, "You already claimed today's reward.", infoBefore
+	end
+
+	local dayIndex = infoBefore.currentDay
+	local msg = applyDailyReward(player, data, dayIndex)
+
+	-- progress to next day
+	daily.LastClaimDayId = todayId
+	if daily.CurrentDay < RewardConfiguration.MaxDailyDay then
+		daily.CurrentDay += 1
+	end
+
+	local infoAfter = buildDailyInfo(data)
+	return true, msg, infoAfter
+end
+
+----------------------------------------------------------------
+-- STANDARD CONTROLLER API
+----------------------------------------------------------------
+
+function RewardsController:Init()
+	local getStateFn = ensureRemoteFunction("GetDailyRewardsState")
+	getStateFn.OnServerInvoke = onGetDailyRewardsState
+
+	local claimFn = ensureRemoteFunction("ClaimDailyReward")
+	claimFn.OnServerInvoke = onClaimDailyReward
+end
+
+function RewardsController:Start()
+	-- nothing
+end
+
+return RewardsController
 
 ---
 
@@ -10781,7 +11246,7 @@ local WeaponConfigurations = {
 	Crates = {
 		--ROBUX
 		GoldCrate = {
-			DisplayName = "Gold Crate",
+			DisplayName = "Gold Weapon Crate",
 			ImageId = "rbxassetid://103369512470336",
 			ProductID = 3433548997,
 			Loot = {
@@ -10794,7 +11259,7 @@ local WeaponConfigurations = {
 		},
 		--SHOP
 		WoodCrate = {
-			DisplayName = "Wood Crate",
+			DisplayName = "Wood Weapon Crate",
 			Price = 600,
 			ImageId = "rbxassetid://71941897708431",
 			ProductID = 3433106911,
@@ -10810,7 +11275,7 @@ local WeaponConfigurations = {
 			}
 		},
 		MetalCrate = {
-			DisplayName = "Metal Crate",
+			DisplayName = "Metal Weapon Crate",
 			Price = 4500,
 			ImageId = "rbxassetid://83369732207805",
 			ProductID = 3433107064,
@@ -10827,7 +11292,7 @@ local WeaponConfigurations = {
 			}
 		},
 		LavaCrate = {
-			DisplayName = "Mystic Crate",
+			DisplayName = "Mystic Weapon Crate",
 			Price = 10500,
 			ImageId = "rbxassetid://123400851920868",
 			ProductID = 3451490544,
@@ -11189,5 +11654,460 @@ local BadgeCatalog: {[BadgeKey]: number} = {
 }
 
 return BadgeCatalog
+
+---
+
+--- ReplicatedStorage.Modules.LevelUpConfiguration (ModuleScript) ---
+--!strict
+local Config = {
+	PROFILE_KEYS = {
+		UNITS = "BlockInventory",      -- where all guard counts live
+		JOB   = "ActiveLevelUpJob",    -- current running job
+	},
+
+	-- We have 5 levels: L1 (base), L2, L3, L4, L5
+	-- Tier index is the "merge step":
+	--   tier 1 => L1 -> L2
+	--   tier 2 => L2 -> L3
+	--   tier 3 => L3 -> L4
+	--   tier 4 => L4 -> L5 (max)
+	MAX_TIER   = 4,
+
+	DAMAGE_MULT  = { 1.10, 1.25, 1.45, 1.70 },  -- for L2..L5
+	HEALTH_MULT  = { 1.10, 1.25, 1.40, 1.60 },
+
+	-- Time per level-up job (you can tweak)
+	TIER_SECONDS = {
+		15 * 60,  -- tier 1
+		30 * 60,  -- tier 2
+		45 * 60,  -- tier 3
+		60 * 60,  -- tier 4
+	},
+
+	-- Result id helper:
+	--   baseId, tier=1 => baseId_M1 (L2)
+	--   baseId, tier=2 => baseId_M2 (L3)
+	--   baseId, tier=3 => baseId_M3 (L4)
+	--   baseId, tier=4 => baseId_M4 (L5)
+	ResultId = function(baseId: string, tier: number): string
+		return string.format("%s_M%d", baseId, tier)
+	end,
+
+	-- Level-up rules: units + optional cash per tier.
+	-- You can change the cash values whenever.
+	RULES = {
+		RevolverGuard = {
+			[1] = { units = 10, cash = 0 },    -- L1 -> L2
+			[2] = { units =  6, cash = 0 },    -- L2 -> L3
+			[3] = { units =  4, cash = 0 },    -- L3 -> L4 (set >0 for money cost)
+			[4] = { units =  2, cash = 0 },    -- L4 -> L5 (set >0 for money cost)
+		},
+		DualRevolverGuard = {
+			[1] = { units = 10, cash = 0 },
+			[2] = { units =  6, cash = 0 },
+			[3] = { units =  4, cash = 0 },
+			[4] = { units =  2, cash = 0 },
+		},
+		SubmachineGunGuard = {
+			[1] = { units = 10, cash = 0 },
+			[2] = { units =  6, cash = 0 },
+			[3] = { units =  4, cash = 0 },
+			[4] = { units =  2, cash = 0 },
+		},
+		RifleGuard = {
+			[1] = { units = 10, cash = 0 },
+			[2] = { units =  6, cash = 0 },
+			[3] = { units =  4, cash = 0 },
+			[4] = { units =  2, cash = 0 },
+		},
+		ShotgunGuard = {
+			[1] = { units = 10, cash = 0 },
+			[2] = { units =  6, cash = 0 },
+			[3] = { units =  4, cash = 0 },
+			[4] = { units =  2, cash = 0 },
+		},
+		GatlingGuard = {
+			[1] = { units = 10, cash = 0 },
+			[2] = { units =  6, cash = 0 },
+			[3] = { units =  4, cash = 0 },
+			[4] = { units =  2, cash = 0 },
+		},
+	},
+
+	MUTABLE = {
+		"RevolverGuard","DualRevolverGuard","RifleGuard",
+		"ShotgunGuard","GatlingGuard","SubmachineGunGuard",
+	},
+
+	-- Parse helper: "RevolverGuard_M3" -> "RevolverGuard", 3
+	ParseMutationId = function(id: string): (string?, number?)
+		local base, t = string.match(id, "^(.-)_M(%d+)$")
+		if base and t then return base, tonumber(t) end
+		return nil, nil
+	end,
+
+	-- Apply tier stat multipliers (for your tower stats module)
+	ApplyTierBoost = function(baseStats: {[string]: any}, tier: number): {[string]: any}
+		local dmgMul = (Config.DAMAGE_MULT[tier] or 1)
+		local hpMul  = (Config.HEALTH_MULT[tier] or 1)
+		local copy = table.clone(baseStats)
+		if copy.Damage then copy.Damage = math.floor(copy.Damage * dmgMul) end
+		if copy.Health then copy.Health = math.floor(copy.Health * hpMul) end
+		return copy
+	end,
+}
+
+return Config
+
+---
+
+--- ReplicatedStorage.Modules.RewardConfiguration (ModuleScript) ---
+--!strict
+-- ReplicatedStorage/Modules/RewardConfiguration
+
+local RewardConfiguration = {}
+
+-- Daily rewards list (index = day)
+-- You can tweak the "Type" handling later; for now only "Cash" is actually
+-- granted, the rest just show a notification text.
+
+RewardConfiguration.DailyRewards = {
+	[1] = { 
+		Id = 1,
+		Type = "Cash",
+		Amount = 50_000,
+		Label = "50,000 Cash",
+	},
+
+
+	[2] = { 
+		Id = 2,
+		Type = "Cash",
+		Amount = 75_000,
+		Label = "75,000 Cash",
+	},
+
+	[3] = {
+		Id = 3,
+		Type = "Cowboy",
+		CowboyId = "ShotgunCowboy",
+		Label = "Shotgun Cowboy (to be implemented)",
+	},
+
+	[4] = {
+		Id = 4,
+		Type = "Cash",
+		Amount = 100_000,
+		Label = "100,000 Cash",
+	},
+
+	[5] = {
+		Id = 5,
+		Type = "TimedMinigun",
+		DurationSeconds = 60 * 60,
+		Label = "1 Hour of Minigun (to be implemented)",
+	},
+
+	[6] = {
+		Id = 6,
+		Type = "PermanentLuck",
+		Amount = 1,
+		Label = "Permanent +1 Luck (to be implemented)",
+	},
+
+	[7] = {
+		Id = 7,
+		Type = "Cowboy",
+		CowboyId = "OPCowboy",
+		Label = "OP Cowboy (to be implemented)",
+	},
+}
+
+RewardConfiguration.MaxDailyDay = #RewardConfiguration.DailyRewards
+
+return RewardConfiguration
+
+---
+
+--- ReplicatedStorage.Modules.DailyRewardsHandler (ModuleScript) ---
+--!strict
+-- ReplicatedStorage/Modules/DailyRewardsHandler
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local NotificationManager = require(ReplicatedStorage.Modules:WaitForChild("NotificationManager"))
+
+local DailyRewardsHandler = {}
+
+----------------------------------------------------------------
+-- REMOTES
+----------------------------------------------------------------
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local GetDailyRewardsStateFn = Functions:WaitForChild("GetDailyRewardsState") :: RemoteFunction
+local ClaimDailyRewardFn     = Functions:WaitForChild("ClaimDailyReward")     :: RemoteFunction
+
+----------------------------------------------------------------
+-- UI REFERENCES
+----------------------------------------------------------------
+
+-- DailyRewards frame: PlayerGui/ScreenGui/DailyRewards
+local MainScreenGui     = playerGui:WaitForChild("ScreenGui") :: ScreenGui
+local DailyRewardsFrame = MainScreenGui:WaitForChild("DailyRewards") :: Frame
+local CloseButton       = DailyRewardsFrame:WaitForChild("xbutton") :: ImageButton
+
+-- HUD button: PlayerGui/GUI/HUD/Right/Buttons/Rewards
+local GuiRoot   = playerGui:WaitForChild("GUI") :: ScreenGui
+local HUD       = GuiRoot:WaitForChild("HUD") :: Frame
+local RightSide = HUD:WaitForChild("Right") :: Frame
+local Buttons   = RightSide:WaitForChild("Buttons") :: Frame
+local RewardsButton = Buttons:WaitForChild("Rewards") :: ImageButton
+
+-- Layout:
+-- DailyRewards > Container > Day7
+-- DailyRewards > Container > Grid > Day1..Day6
+local Container = DailyRewardsFrame:WaitForChild("Container") :: Frame
+local Grid      = Container:WaitForChild("Grid") :: Frame
+local Day7Frame = Container:WaitForChild("Day7") :: Frame
+
+-- Day slots & clickable buttons
+local DaySlots:   {[number]: Frame | TextButton} = {}
+local DayButtons: {[number]: TextButton} = {}
+
+-- Day1..Day6 are TextButtons directly under Grid with those names
+for i = 1, 6 do
+	local btn = Grid:WaitForChild("Day" .. i) :: TextButton
+	DaySlots[i] = btn
+	DayButtons[i] = btn
+end
+
+-- Day7Frame has a TextButton child named "Day7"
+local day7Btn = Day7Frame:WaitForChild("Day7") :: TextButton
+DaySlots[7]   = day7Btn
+DayButtons[7] = day7Btn
+
+----------------------------------------------------------------
+-- STYLE TEMPLATES
+----------------------------------------------------------------
+
+type DayStyle = {
+	PosColor: Color3?,
+	TextColor: Color3?,
+}
+
+local ClaimedStyle: DayStyle = {}
+local UnclaimedStyle: DayStyle = {}
+
+local function extractStyle(slot: Frame | TextButton): DayStyle
+	local posImg = slot:FindFirstChild("pos")
+	local txt    = slot:FindFirstChild("TextLabel")
+
+	local posColor: Color3? = nil
+	local textColor: Color3? = nil
+
+	if posImg and posImg:IsA("ImageLabel") then
+		posColor = posImg.ImageColor3
+	end
+	if txt and txt:IsA("TextLabel") then
+		textColor = txt.TextColor3
+	end
+
+	return {
+		PosColor = posColor,
+		TextColor = textColor,
+	}
+end
+
+local function cacheStyles()
+	local d1 = DaySlots[1]
+	local d2 = DaySlots[2]
+
+	if d1 then ClaimedStyle = extractStyle(d1) end
+	if d2 then UnclaimedStyle = extractStyle(d2) end
+end
+
+----------------------------------------------------------------
+-- STATE
+----------------------------------------------------------------
+
+local dailyState = {
+	currentDay = 1,              -- NEXT day index (1..7) they will eventually claim
+	alreadyClaimedToday = false, -- true if claim already done for this calendar day
+	secondsUntilNextClaim = 0,   -- only meaningful when alreadyClaimedToday == true
+}
+
+----------------------------------------------------------------
+-- RENDER HELPERS
+----------------------------------------------------------------
+
+local function applyClaimed(slot: Frame | TextButton)
+	local posImg = slot:FindFirstChild("pos")
+	local txt    = slot:FindFirstChild("TextLabel")
+
+	if posImg and posImg:IsA("ImageLabel") and ClaimedStyle.PosColor then
+		posImg.ImageColor3 = ClaimedStyle.PosColor
+	end
+
+	if txt and txt:IsA("TextLabel") then
+		txt.Text = "Claimed!"
+		if ClaimedStyle.TextColor then
+			txt.TextColor3 = ClaimedStyle.TextColor
+		end
+	end
+end
+
+local function applyUnclaimedLabel(slot: Frame | TextButton, text: string)
+	local posImg = slot:FindFirstChild("pos")
+	local txt    = slot:FindFirstChild("TextLabel")
+
+	if posImg and posImg:IsA("ImageLabel") and UnclaimedStyle.PosColor then
+		posImg.ImageColor3 = UnclaimedStyle.PosColor
+	end
+
+	if txt and txt:IsA("TextLabel") then
+		txt.Text = text
+		if UnclaimedStyle.TextColor then
+			txt.TextColor3 = UnclaimedStyle.TextColor
+		end
+	end
+end
+
+local function formatTime(secs: number): string
+	secs = math.max(0, math.floor(secs + 0.5))
+	local h = math.floor(secs / 3600)
+	local m = math.floor((secs % 3600) / 60)
+	local s = secs % 60
+	return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+-- Claimed days are ALWAYS 1..(currentDay-1), regardless of "alreadyClaimedToday".
+-- "alreadyClaimedToday" just toggles if you can click again today.
+local function refreshDailyUI()
+	local currentDay = math.clamp(dailyState.currentDay, 1, 7)
+	local lastClaimedDay = math.clamp(currentDay - 1, 0, 7)
+
+	for i = 1, 7 do
+		local slot = DaySlots[i]
+		if slot then
+			if i <= lastClaimedDay then
+				applyClaimed(slot)
+			else
+				if i == 7 then
+					applyUnclaimedLabel(slot, "Day 7")
+				else
+					applyUnclaimedLabel(slot, "Day " .. tostring(i))
+				end
+			end
+		end
+	end
+
+	-- If they already claimed today, draw a countdown on the NEXT day (currentDay)
+	if dailyState.alreadyClaimedToday and dailyState.secondsUntilNextClaim > 0 then
+		local slot = DaySlots[currentDay]
+		if slot then
+			local label = slot:FindFirstChild("TextLabel")
+			if label and label:IsA("TextLabel") then
+				label.Text = formatTime(dailyState.secondsUntilNextClaim)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- NOTIFICATIONS
+----------------------------------------------------------------
+
+local function notify(msg: any)
+	if msg == nil then return end
+	local text = tostring(msg)
+	if text == "" then return end
+
+	if typeof(NotificationManager) == "table" and typeof(NotificationManager.show) == "function" then
+		NotificationManager.show(text, "Normal")
+	end
+end
+
+----------------------------------------------------------------
+-- CLAIM LOGIC
+----------------------------------------------------------------
+
+local function tryClaimCurrentDay()
+	local success, msg, newInfo = ClaimDailyRewardFn:InvokeServer()
+
+	if newInfo and typeof(newInfo) == "table" then
+		dailyState.currentDay            = newInfo.currentDay or dailyState.currentDay
+		dailyState.alreadyClaimedToday   = newInfo.alreadyClaimedToday or false
+		dailyState.secondsUntilNextClaim = newInfo.secondsUntilNextClaim or 0
+	end
+
+	refreshDailyUI()
+	notify(msg)
+end
+
+local function hookDayClicks()
+	for dayIndex, button in pairs(DayButtons) do
+		button.MouseButton1Click:Connect(function()
+			-- only allow clicking the NEXT day and only if you haven't claimed today
+			local nextDayIndex   = dailyState.currentDay
+			local canClaimToday  = not dailyState.alreadyClaimedToday
+
+			if not canClaimToday then
+				return
+			end
+			if dayIndex ~= nextDayIndex then
+				return
+			end
+
+			tryClaimCurrentDay()
+		end)
+	end
+end
+
+----------------------------------------------------------------
+-- PUBLIC API
+----------------------------------------------------------------
+
+function DailyRewardsHandler.Init()
+	DailyRewardsFrame.Visible = false
+
+	RewardsButton.MouseButton1Click:Connect(function()
+		DailyRewardsFrame.Visible = not DailyRewardsFrame.Visible
+	end)
+
+	CloseButton.MouseButton1Click:Connect(function()
+		DailyRewardsFrame.Visible = false
+	end)
+
+	cacheStyles()
+
+	-- initial state from server
+	local info = GetDailyRewardsStateFn:InvokeServer()
+	if info and typeof(info) == "table" then
+		dailyState.currentDay            = info.currentDay or 1
+		dailyState.alreadyClaimedToday   = info.alreadyClaimedToday or false
+		dailyState.secondsUntilNextClaim = info.secondsUntilNextClaim or 0
+	end
+
+	refreshDailyUI()
+	hookDayClicks()
+
+	-- simple client-side countdown for the timer text
+	RunService.Heartbeat:Connect(function(dt)
+		if dailyState.alreadyClaimedToday and dailyState.secondsUntilNextClaim > 0 then
+			dailyState.secondsUntilNextClaim -= dt
+			if dailyState.secondsUntilNextClaim < 0 then
+				dailyState.secondsUntilNextClaim = 0
+			end
+			refreshDailyUI()
+		end
+	end)
+end
+
+return DailyRewardsHandler
 
 ---
