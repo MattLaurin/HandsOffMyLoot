@@ -2766,6 +2766,12 @@ local ProfileTemplate = {
 	-- Simple map: [enemyId] = count
 	EnemyInventory = {},
 
+	-- Cages: [slotIndex] = { EnemyId, Banked, LastTick, LastOfflineEarned, Mutation? }
+	CageSlots = {},
+
+	-- Unlock state: [slotIndex] = true/false
+	CageUnlocks = {},
+
 	FastForwardUnlocked = false,
 
 	PlotUpgrades = {
@@ -2789,12 +2795,12 @@ local ProfileTemplate = {
 		Weapons = {},
 	},
 
-	Gemstone = 0, 
+	Gemstone = 0,
 	GuardsInventory = {},
 	ActiveMutationJob = nil,
 	OwnsExtraCrateGP = false,
 
-	LuckBoostUntil = 0, 
+	LuckBoostUntil = 0,
 	UnlockedTiles = {},
 	HasAppliedTileMigration = false,
 
@@ -2807,9 +2813,9 @@ local ProfileTemplate = {
 
 local GameProfileStore = ProfileService.New("LiveData", ProfileTemplate)
 local _profiles: {[Player]: any} = {}
-local _controllers = {}
+local _controllers: {[string]: any} = {}
 
-local _remotes: {[string]: any} = {}
+local _remotes: {[string]: Instance} = {}
 
 --------------------------
 -- CORE PROFILE HANDLING
@@ -2881,10 +2887,18 @@ local function ensureEvents()
 
 	ensureRemoteEvent("GuardsInventoryUpdated", events)
 
-	-- Enemy inventory + lasso
+	-- Enemy inventory + lasso (lasso events can stay even if unused)
 	ensureRemoteEvent("EnemyInventoryUpdated", events)
 	ensureRemoteEvent("LassoCaptureRequest", events)
+	ensureRemoteEvent("LassoSceneStarted", events)
+	ensureRemoteEvent("LassoSceneFinished", events)
+	ensureRemoteEvent("LassoClickEnemy", events)
 	ensureRemoteFunction("GetEnemyInventory", functions)
+
+	-- enemy auto-sell + placement tools
+	ensureRemoteEvent("EnemyAutoSellUpdated", events)
+	ensureRemoteEvent("SetEnemyAutoSell", events)
+	ensureRemoteEvent("RequestEnemyPlacementTool", events)
 
 	ensureRemoteEvent("TileUnlocked", events)
 	ensureRemoteEvent("PlotResetNotice", events)
@@ -2895,7 +2909,7 @@ end
 local function fireOwned(player: Player)
 	local ev = _remotes["FastForwardUnlocked"]
 	if ev and ev:IsA("RemoteEvent") then
-		ev:FireClient(player)
+		(ev :: RemoteEvent):FireClient(player)
 	end
 end
 
@@ -2950,8 +2964,9 @@ local function onPlayerAdded(player: Player)
 		profile.Data.StarterPackOfferEndsAt = os.time() + STARTERPACK_OFFER_SECONDS
 	end
 
-	if _remotes["CashUpdated"] then
-		_remotes["CashUpdated"]:FireClient(player, profile.Data.Cash)
+	local cashEv = _remotes["CashUpdated"]
+	if cashEv and cashEv:IsA("RemoteEvent") then
+		(cashEv :: RemoteEvent):FireClient(player, profile.Data.Cash)
 	end
 
 	if profile.Data.LastEquippedWeapon then
@@ -2970,21 +2985,37 @@ local function onPlayerAdded(player: Player)
 		BadgeController.SyncFor(player, profile.Data)
 	end
 
-	_remotes["WeaponInventoryUpdated"]:FireClient(player, profile.Data.WeaponInventory)
-	_remotes["BlockInventoryUpdated"]:FireClient(player, profile.Data.BlockInventory)
-	_remotes["CrateDataUpdated"]:FireClient(player, profile.Data.Crates)
-	_remotes["PlotUpgradesUpdated"]:FireClient(player, profile.Data.PlotUpgrades)
+	-- initial syncs
+	local wEv = _remotes["WeaponInventoryUpdated"]
+	if wEv and wEv:IsA("RemoteEvent") then
+		(wEv :: RemoteEvent):FireClient(player, profile.Data.WeaponInventory)
+	end
+
+	local bEv = _remotes["BlockInventoryUpdated"]
+	if bEv and bEv:IsA("RemoteEvent") then
+		(bEv :: RemoteEvent):FireClient(player, profile.Data.BlockInventory)
+	end
+
+	local cEv = _remotes["CrateDataUpdated"]
+	if cEv and cEv:IsA("RemoteEvent") then
+		(cEv :: RemoteEvent):FireClient(player, profile.Data.Crates)
+	end
+
+	local pEv = _remotes["PlotUpgradesUpdated"]
+	if pEv and pEv:IsA("RemoteEvent") then
+		(pEv :: RemoteEvent):FireClient(player, profile.Data.PlotUpgrades)
+	end
 
 	local gi = _remotes["GuardsInventoryUpdated"]
 	if gi and gi:IsA("RemoteEvent") then
-		gi:FireClient(player, profile.Data.GuardsInventory)
+		(gi :: RemoteEvent):FireClient(player, profile.Data.GuardsInventory)
 	end
 
-	-- Enemy inventory sync (simple table [enemyId] = count)
+	-- Enemy inventory sync
 	local ei = _remotes["EnemyInventoryUpdated"]
 	if ei and ei:IsA("RemoteEvent") then
 		profile.Data.EnemyInventory = profile.Data.EnemyInventory or {}
-		ei:FireClient(player, profile.Data.EnemyInventory)
+		(ei :: RemoteEvent):FireClient(player, profile.Data.EnemyInventory)
 	end
 
 	if _controllers.GlobalShopController then
@@ -2996,21 +3027,30 @@ local function onPlayerAdded(player: Player)
 
 	local offerEv = _remotes["StarterPackOfferEndsAtUpdated"]
 	if offerEv and offerEv:IsA("RemoteEvent") then
-		offerEv:FireClient(player, profile.Data.StarterPackOfferEndsAt or 0)
+		(offerEv :: RemoteEvent):FireClient(player, profile.Data.StarterPackOfferEndsAt or 0)
 	end
+
 	if profile.Data.StarterPackOwned then
 		local ownedEv = _remotes["StarterPackOwned"]
 		if ownedEv and ownedEv:IsA("RemoteEvent") then
-			ownedEv:FireClient(player)
+			(ownedEv :: RemoteEvent):FireClient(player)
 		end
 	end
 
 	if not profile.Data.HasCompletedOnboarding then
-		_remotes["StartOnboarding"]:FireClient(player)
+		local so = _remotes["StartOnboarding"]
+		if so and so:IsA("RemoteEvent") then
+			(so :: RemoteEvent):FireClient(player)
+		end
 	end
 
+	-- Plot + cages
 	if _controllers.PlotController and _controllers.PlotController.OnPlayerProfileLoaded then
 		_controllers.PlotController:OnPlayerProfileLoaded(player)
+	end
+
+	if _controllers.CageController and _controllers.CageController.OnPlayerProfileLoaded then
+		_controllers.CageController:OnPlayerProfileLoaded(player)
 	end
 
 	print(`Player {player.Name} joined and data was loaded successfully.`)
@@ -3048,8 +3088,9 @@ function PlayerController.AddCash(player: Player, amount: number)
 
 	syncLeaderstats(player, newCash)
 
-	if _remotes["CashUpdated"] then
-		_remotes["CashUpdated"]:FireClient(player, newCash)
+	local ev = _remotes["CashUpdated"]
+	if ev and ev:IsA("RemoteEvent") then
+		(ev :: RemoteEvent):FireClient(player, newCash)
 	end
 end
 
@@ -3060,14 +3101,14 @@ function PlayerController.RemoveCash(player: Player, amount: number): boolean
 
 	if (profile.Data.Cash or 0) >= amount then
 		local newCash = profile.Data.Cash - amount
-
 		profile.Data.Cash = newCash
 		profile:Save()
 
 		syncLeaderstats(player, newCash)
 
-		if _remotes["CashUpdated"] then
-			_remotes["CashUpdated"]:FireClient(player, newCash)
+		local ev = _remotes["CashUpdated"]
+		if ev and ev:IsA("RemoteEvent") then
+			(ev :: RemoteEvent):FireClient(player, newCash)
 		end
 		return true
 	end
@@ -3089,7 +3130,6 @@ end
 -- ENEMY INVENTORY API
 --------------------------
 
--- Called by the lasso / Scene minigame to award a capture.
 function PlayerController.AddCapturedEnemy(player: Player, enemyId: string)
 	if not enemyId or enemyId == "" then return end
 
@@ -3102,11 +3142,10 @@ function PlayerController.AddCapturedEnemy(player: Player, enemyId: string)
 
 	local ev = _remotes["EnemyInventoryUpdated"]
 	if ev and ev:IsA("RemoteEvent") then
-		ev:FireClient(player, inv)
+		(ev :: RemoteEvent):FireClient(player, inv)
 	end
 end
 
--- Helper for later when we implement placing / releasing
 function PlayerController.TryConsumeEnemy(player: Player, enemyId: string): boolean
 	if not enemyId or enemyId == "" then return false end
 
@@ -3122,14 +3161,14 @@ function PlayerController.TryConsumeEnemy(player: Player, enemyId: string): bool
 
 	local ev = _remotes["EnemyInventoryUpdated"]
 	if ev and ev:IsA("RemoteEvent") then
-		ev:FireClient(player, inv)
+		(ev :: RemoteEvent):FireClient(player, inv)
 	end
 
 	return true
 end
 
 --------------------------
--- GEMSTONE FUNCTIONS
+-- GEMSTONE FUNCTIONS (unchanged for now)
 --------------------------
 
 function PlayerController.AddGems(player: Player, amount: number)
@@ -3177,33 +3216,30 @@ function PlayerController:Init(controllers: {[string]: any})
 
 	local getCashFn = _remotes["GetPlayerCash"]
 	if getCashFn and getCashFn:IsA("RemoteFunction") then
-		getCashFn.OnServerInvoke = onPlayerCashRequested
+		(getCashFn :: RemoteFunction).OnServerInvoke = onPlayerCashRequested
 	end
 
 	local getEnemyInvFn = _remotes["GetEnemyInventory"]
 	if getEnemyInvFn and getEnemyInvFn:IsA("RemoteFunction") then
-		getEnemyInvFn.OnServerInvoke = function(player: Player)
-			local profile = PlayerController:GetProfile(player)
+		(getEnemyInvFn :: RemoteFunction).OnServerInvoke = function(plr: Player)
+			local profile = PlayerController:GetProfile(plr)
 			while not profile do
 				task.wait()
-				profile = PlayerController:GetProfile(player)
+				profile = PlayerController:GetProfile(plr)
 			end
 			profile.Data.EnemyInventory = profile.Data.EnemyInventory or {}
 			return profile.Data.EnemyInventory
 		end
 	end
-end
 
-function PlayerController:Start()
-	Players.PlayerAdded:Connect(onPlayerAdded)
-	Players.PlayerRemoving:Connect(onPlayerRemoving)
-
-	local refresh = _remotes["RefreshFastForwardOwnership"]
-	if refresh and refresh:IsA("RemoteEvent") then
-		refresh.OnServerEvent:Connect(function(player: Player)
-			local profile = _profiles[player]
-			if not profile then return end
-			checkAndApplyGamePass(player, profile)
+	-- tool request -> forward to CageController
+	local requestToolEv = _remotes["RequestEnemyPlacementTool"]
+	if requestToolEv and requestToolEv:IsA("RemoteEvent") then
+		(requestToolEv :: RemoteEvent).OnServerEvent:Connect(function(plr: Player, enemyId: string)
+			local cageCtrl = _controllers.CageController
+			if cageCtrl and cageCtrl.GivePlacementTool then
+				cageCtrl:GivePlacementTool(plr, enemyId)
+			end
 		end)
 	end
 
@@ -3217,7 +3253,7 @@ function PlayerController:Start()
 
 	local getSettingsFn = _remotes["GetPlayerSettings"]
 	if getSettingsFn and getSettingsFn:IsA("RemoteFunction") then
-		getSettingsFn.OnServerInvoke = function(plr: Player)
+		(getSettingsFn :: RemoteFunction).OnServerInvoke = function(plr: Player)
 			local p = _profiles[plr]
 			while not p do
 				task.wait()
@@ -3230,7 +3266,7 @@ function PlayerController:Start()
 
 	local saveSettingsEv = _remotes["SavePlayerSettings"]
 	if saveSettingsEv and saveSettingsEv:IsA("RemoteEvent") then
-		saveSettingsEv.OnServerEvent:Connect(function(plr: Player, payload)
+		(saveSettingsEv :: RemoteEvent).OnServerEvent:Connect(function(plr: Player, payload)
 			local p = _profiles[plr]
 			if not p then return end
 			local v = sanitize(payload)
@@ -3242,16 +3278,31 @@ function PlayerController:Start()
 		end)
 	end
 
-	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, gamePassId: number, wasPurchased: boolean)
+	local refresh = _remotes["RefreshFastForwardOwnership"]
+	if refresh and refresh:IsA("RemoteEvent") then
+		(refresh :: RemoteEvent).OnServerEvent:Connect(function(plr: Player)
+			local profile = _profiles[plr]
+			if not profile then return end
+			checkAndApplyGamePass(plr, profile)
+		end)
+	end
+
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(plr: Player, gamePassId: number, wasPurchased: boolean)
 		if gamePassId ~= GAMEPASS_ID_EXTRA_CRATES then return end
-		local p = _profiles[player]
+		local p = _profiles[plr]
 		if not p then return end
 		if wasPurchased then
 			p.Data.OwnsExtraCrateGP = true
-			player:SetAttribute("HasCrateSlotsPass", true)
+			plr:SetAttribute("HasCrateSlotsPass", true)
 		end
 	end)
+end
 
+function PlayerController:Start()
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+	-- for existing players in Studio
 	for _, plr in ipairs(Players:GetPlayers()) do
 		task.spawn(onPlayerAdded, plr)
 	end
@@ -3264,7 +3315,7 @@ function PlayerController:MarkStarterPackOwned(player: Player)
 	profile.Data.StarterPackOwned = true
 	local ev = _remotes["StarterPackOwned"]
 	if ev and ev:IsA("RemoteEvent") then
-		ev:FireClient(player)
+		(ev :: RemoteEvent):FireClient(player)
 	end
 end
 
@@ -3798,21 +3849,13 @@ local PlacementController
 local WeaponController
 local PlotController
 
-
 local WaveConfigurations = require(ReplicatedStorage.Modules.WaveConfigurations)
 local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
 local EnemyConfigurations = require(ReplicatedStorage.Modules.EnemyConfigurations)
 local ModelProgression = require(ReplicatedStorage.Modules.ModelProgression)
 
 local INTERMISSION_TIME = 1
-local NO_ACTIVITY_TIMEOUT = 40 -- seconds of no spawns/kills to skip non-boss waves
-
-local BossGemDrop = {
-	BaseChance = .25,
-	Amount     = { Min = 1, Max = 4 },
-	MaxPerKill = 6,
-	MaxFinalChance = 1,
-}
+local NO_ACTIVITY_TIMEOUT = 40
 
 local RNG = Random.new()
 
@@ -3950,7 +3993,6 @@ startNextWave = function(player: Player, plot: Model)
 		return nil
 	end
 
-	-- activity tracking
 	local lastActivityT = os.clock()
 	local function markActivity()
 		lastActivityT = os.clock()
@@ -4009,36 +4051,8 @@ startNextWave = function(player: Player, plot: Model)
 			state.EnemiesKilledInWave += 1
 			markActivity()
 
-			if conf and conf.CashReward then
-				local ls = player:FindFirstChild("leaderstats")
-				local cash = ls and ls:FindFirstChild("Cash")
-				if cash then
-					local per = conf.CashReward
-					if waveConfig.KillCashMultiplier then per = math.floor(per * waveConfig.KillCashMultiplier) end
-					cash.Value += per
-				end
-			end
-
-			if waveConfig.IsBossWave then
-				local ownerPlot = enemy:FindFirstChild("OwnerPlot")
-				local plotModel: Model? = ownerPlot and ownerPlot.Value
-				local ownerId = plotModel and plotModel:GetAttribute("OwnerId")
-				local killer = ownerId and Players:GetPlayerByUserId(ownerId)
-				if killer then
-					local effective = TotalLuckController:GetEffectiveFactor(killer)
-					local finalChance = math.min(BossGemDrop.MaxFinalChance, BossGemDrop.BaseChance * effective)
-					if RNG:NextNumber() < finalChance then
-						local minA, maxA = BossGemDrop.Amount.Min, BossGemDrop.Amount.Max
-						local count = RNG:NextInteger(minA, maxA)
-						if count > BossGemDrop.MaxPerKill then count = BossGemDrop.MaxPerKill end
-						PlayerController.AddGems(killer, count)
-						local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
-						if notify then
-							local text = (count == 1) and "+1 Gemstone" or ("+"..tostring(count).." Gemstones")
-							notify:FireClient(killer, text, "Gemstone")
-						end
-					end
-				end
+			if conf then
+				PlayerController.HandleEnemyKill(player, enemy.Name, waveConfig.KillCashMultiplier)
 			end
 
 			ReplicatedStorage.Events.ZombieKilled:FireClient(player, state.EnemiesKilledInWave, state.CurrentWave)
@@ -4108,7 +4122,6 @@ startNextWave = function(player: Player, plot: Model)
 		end
 	end)
 
-	-- watchdog: auto-finish stalled non-boss waves
 	task.spawn(function()
 		while state.IsActive and totalRemaining() > 0 do
 			if not waveConfig.IsBossWave then
@@ -7479,6 +7492,962 @@ function RewardsController:Start()
 end
 
 return RewardsController
+
+---
+
+--- ServerScriptService.Controllers.CageController (ModuleScript) ---
+--!strict
+-- CageController
+-- • Unlock cages via Button1..9 (CagePlatform1..9)
+-- • Place/remove enemies into unlocked cages via ProximityPrompt
+-- • Accumulate value/s into per-cage “Banked” money (not auto-cash)
+-- • Offline earnings (LastTick → os.time diff)
+-- • Collection by walking on the cage platform
+-- • Attributes for client:
+--    EnemyId, DisplayName, Rarity, Mutation, ValuePerSecond, Banked, LastOffline
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+local RunService        = game:GetService("RunService")
+
+local Modules                = ReplicatedStorage:WaitForChild("Modules")
+local EnemyConfigurations    = require(Modules:WaitForChild("EnemyConfigurations"))
+local MutationConfigurations = require(Modules:WaitForChild("MutationConfigurations"))
+
+local CageController = {}
+
+local PlayerController
+local PlotController
+
+local _collectDebounce: {[BasePart]: {[Player]: number}} = {}
+
+local MAX_CAGES = 9
+
+-- all 100k for now
+local CAGE_COSTS: {[number]: number} = {}
+for i = 1, MAX_CAGES do
+	CAGE_COSTS[i] = 100_000
+end
+
+-- Tools folder in ReplicatedStorage
+local ToolsFolder = ReplicatedStorage:FindFirstChild("Tools")
+
+-- Shared Events folder + cage events
+local eventsFolder = ReplicatedStorage:FindFirstChild("Events")
+if not eventsFolder then
+	eventsFolder = Instance.new("Folder")
+	eventsFolder.Name = "Events"
+	eventsFolder.Parent = ReplicatedStorage
+end
+
+local PromptCageUnlock = eventsFolder:FindFirstChild("PromptCageUnlock") :: RemoteEvent?
+if not PromptCageUnlock then
+	PromptCageUnlock = Instance.new("RemoteEvent")
+	PromptCageUnlock.Name = "PromptCageUnlock"
+	PromptCageUnlock.Parent = eventsFolder
+end
+
+local ConfirmCageUnlock = eventsFolder:FindFirstChild("ConfirmCageUnlock") :: RemoteEvent?
+if not ConfirmCageUnlock then
+	ConfirmCageUnlock = Instance.new("RemoteEvent")
+	ConfirmCageUnlock.Name = "ConfirmCageUnlock"
+	ConfirmCageUnlock.Parent = eventsFolder
+end
+
+--------------------------------------------------
+-- Helpers
+--------------------------------------------------
+
+local function getPlotsFolder(): Instance?
+	return Workspace:FindFirstChild("Plots")
+end
+
+local function getPlotForPlayer(player: Player): Model?
+	local plotsFolder = getPlotsFolder()
+	if not plotsFolder then return nil end
+
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function getCageSystem(plot: Model): Instance?
+	return plot:FindFirstChild("CageSystem")
+end
+
+local function getCageIndexFromName(name: string): number?
+	local numStr = string.match(name, "^Cage(%d+)$")
+	if not numStr then return nil end
+	return tonumber(numStr)
+end
+
+local function getCageByIndex(plot: Model, index: number): Model?
+	local cageSystem = getCageSystem(plot)
+	if not cageSystem then return nil end
+	local cage = cageSystem:FindFirstChild("Cage" .. tostring(index))
+	if cage and cage:IsA("Model") then
+		return cage
+	end
+	return nil
+end
+
+local function clearDisplayModel(cage: Model)
+	local existing = cage:FindFirstChild("DisplayEnemy")
+	if existing then
+		existing:Destroy()
+	end
+end
+
+local function createDisplayModel(cage: Model, enemyId: string)
+	clearDisplayModel(cage)
+
+	local enemiesFolder = ReplicatedStorage:FindFirstChild("Enemies")
+	if not enemiesFolder then return end
+	local template = enemiesFolder:FindFirstChild(enemyId)
+	if not template or not template:IsA("Model") then return end
+
+	local clone = template:Clone()
+	clone.Name = "DisplayEnemy"
+
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = true
+			d.CanCollide = false
+		end
+	end
+
+	local platform = cage:FindFirstChild("Platform") :: BasePart?
+	if platform and clone.PrimaryPart then
+		local yOffset = clone.PrimaryPart.Size.Y * 0.5 + 0.5
+		clone:SetPrimaryPartCFrame(platform.CFrame * CFrame.new(0, yOffset, 0))
+	end
+
+	clone.Parent = cage
+end
+
+local function getMutationMultiplier(mutation: string?): number
+	if not mutation or mutation == "" then return 1 end
+	local cfg = MutationConfigurations[mutation]
+	if not cfg then return 1 end
+	return cfg.Multiplier or 1
+end
+
+local function updateCageAttributes(cage: Model, slotData: any?)
+	if not slotData or not slotData.EnemyId then
+		cage:SetAttribute("EnemyId", nil)
+		cage:SetAttribute("DisplayName", nil)
+		cage:SetAttribute("Rarity", nil)
+		cage:SetAttribute("Mutation", nil)
+		cage:SetAttribute("ValuePerSecond", 0)
+		cage:SetAttribute("Banked", 0)
+		cage:SetAttribute("LastOffline", 0)
+		return
+	end
+
+	local enemyId  = slotData.EnemyId :: string
+	local mutation = slotData.Mutation :: string?  -- optional
+	local cfg      = EnemyConfigurations[enemyId]
+
+	local displayName = (cfg and cfg.DisplayName) or enemyId
+	local rarity      = (cfg and cfg.Rarity) or "Common"
+	local baseVps     = (cfg and tonumber(cfg.ValuePerSecond)) or 0
+	local mult        = getMutationMultiplier(mutation)
+	local vps         = baseVps * mult
+	local banked      = math.floor(slotData.Banked or 0)
+	local lastOff     = math.floor(slotData.LastOfflineEarned or 0)
+
+	cage:SetAttribute("EnemyId", enemyId)
+	cage:SetAttribute("DisplayName", displayName)
+	cage:SetAttribute("Rarity", rarity)
+	cage:SetAttribute("Mutation", mutation or "")
+	cage:SetAttribute("ValuePerSecond", vps)
+	cage:SetAttribute("Banked", banked)
+	cage:SetAttribute("LastOffline", lastOff)
+end
+
+--------------------------------------------------
+-- Unlock visuals
+--------------------------------------------------
+
+local function setCageVisual(cage: Model, unlocked: boolean)
+	for _, d in ipairs(cage:GetDescendants()) do
+		if d:IsA("BasePart") then
+			if unlocked then
+				d.Transparency = 0
+				d.CanCollide = true
+				d.CanQuery = true
+			else
+				d.Transparency = 1
+				d.CanCollide = false
+				d.CanQuery = false
+			end
+		end
+	end
+	cage:SetAttribute("Unlocked", unlocked)
+end
+
+local function setButtonVisual(button: BasePart, unlocked: boolean)
+	if unlocked then
+		button.Transparency = 1
+		button.CanCollide = false
+		button.CanTouch = false
+	else
+		button.Transparency = 0
+		button.CanCollide = true
+		button.CanTouch = true
+	end
+end
+
+--------------------------------------------------
+-- Core cage operations
+--------------------------------------------------
+
+function CageController:_OnCagePrompt(player: Player, cage: Model)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+	if not cage:IsDescendantOf(plot) then return end
+	if not (cage:GetAttribute("Unlocked") == true) then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	profile.Data.CageSlots = profile.Data.CageSlots or {}
+	local slots = profile.Data.CageSlots
+
+	local idx = getCageIndexFromName(cage.Name)
+	if not idx then return end
+
+	local slot = slots[idx]
+	local selectedEnemy = player:GetAttribute("SelectedEnemyId")
+	if typeof(selectedEnemy) ~= "string" then
+		selectedEnemy = nil
+	end
+
+	if slot and slot.EnemyId and (not selectedEnemy or selectedEnemy == "") then
+		local enemyId = slot.EnemyId
+		slots[idx] = nil
+		clearDisplayModel(cage)
+		updateCageAttributes(cage, nil)
+		PlayerController.AddCapturedEnemy(player, enemyId)
+		return
+	end
+
+	if not slot or not slot.EnemyId then
+		if not selectedEnemy or selectedEnemy == "" then
+			return
+		end
+
+		if not PlayerController.TryConsumeEnemy(player, selectedEnemy) then
+			return
+		end
+
+		local now = os.time()
+		slots[idx] = {
+			EnemyId = selectedEnemy,
+			Banked = 0,
+			LastTick = now,
+			LastOfflineEarned = 0,
+		}
+
+		createDisplayModel(cage, selectedEnemy)
+		updateCageAttributes(cage, slots[idx])
+
+		player:SetAttribute("SelectedEnemyId", nil)
+	end
+end
+
+function CageController:_OnCollect(player: Player, cage: Model)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+	if not cage:IsDescendantOf(plot) then return end
+	if not (cage:GetAttribute("Unlocked") == true) then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	profile.Data.CageSlots = profile.Data.CageSlots or {}
+	local slots = profile.Data.CageSlots
+
+	local idx = getCageIndexFromName(cage.Name)
+	if not idx then return end
+
+	local slot = slots[idx]
+	if not slot or not slot.EnemyId then return end
+
+	local amount = math.floor(slot.Banked or 0)
+	if amount <= 0 then return end
+
+	slot.Banked = (slot.Banked or 0) - amount
+	slot.LastOfflineEarned = 0
+
+	PlayerController.AddCash(player, amount)
+	updateCageAttributes(cage, slot)
+end
+
+--------------------------------------------------
+-- Prompts + Touch
+--------------------------------------------------
+
+local function setupCageInteractions(cage: Model)
+	if cage:GetAttribute("PromptSetup") then return end
+
+	local platform = cage:FindFirstChild("Platform")
+	if not platform or not platform:IsA("BasePart") then return end
+
+	if not _collectDebounce[platform] then
+		_collectDebounce[platform] = {}
+	end
+
+	local prompt = platform:FindFirstChild("CagePrompt") :: ProximityPrompt?
+	if not prompt then
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "CagePrompt"
+		prompt.ActionText = "Interact"
+		prompt.ObjectText = "Cage"
+		prompt.HoldDuration = 0
+		prompt.RequiresLineOfSight = false
+		prompt.MaxActivationDistance = 8
+		prompt.Parent = platform
+	end
+
+	if not prompt:GetAttribute("Hooked") then
+		prompt.Triggered:Connect(function(player: Player)
+			CageController:_OnCagePrompt(player, cage)
+		end)
+		prompt:SetAttribute("Hooked", true)
+	end
+
+	if not platform:GetAttribute("CollectHooked") then
+		platform.Touched:Connect(function(hit: BasePart)
+			local character = hit:FindFirstAncestorOfClass("Model")
+			if not character then return end
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			if not humanoid then return end
+
+			local player = Players:GetPlayerFromCharacter(character)
+			if not player then return end
+
+			local now = os.clock()
+			local debounces = _collectDebounce[platform]
+			local last = debounces[player] or 0
+			if now - last < 0.5 then return end
+			debounces[player] = now
+
+			CageController:_OnCollect(player, cage)
+		end)
+
+		platform:SetAttribute("CollectHooked", true)
+	end
+
+	cage:SetAttribute("PromptSetup", true)
+end
+
+--------------------------------------------------
+-- Unlock buttons (step → popup, then confirm)
+--------------------------------------------------
+
+local function handleUnlockTouch(button: BasePart, plot: Model, index: number, player: Player)
+	-- Only block if we *know* the player owns some other plot
+	local ownerPlot = getPlotForPlayer(player)
+	if ownerPlot and ownerPlot ~= plot then
+		return
+	end
+
+	-- make sure touch is enabled
+	button.CanTouch = true
+
+	local cost = CAGE_COSTS[index] or 100_000
+	if PromptCageUnlock then
+		PromptCageUnlock:FireClient(player, index, cost)
+	end
+end
+
+local function setupUnlockButtonsForPlot(plot: Model)
+	local cageSystem = getCageSystem(plot)
+	if not cageSystem then return end
+
+	for index = 1, MAX_CAGES do
+		local cp = cageSystem:FindFirstChild("CagePlatform" .. index)
+		if cp and cp:IsA("Model") then
+			local button = cp:FindFirstChild("Button" .. index)
+			if button and button:IsA("BasePart") and not button:GetAttribute("UnlockHooked") then
+				button.CanTouch = true
+
+				button.Touched:Connect(function(hit: BasePart)
+					local character = hit:FindFirstAncestorOfClass("Model")
+					if not character then return end
+					local humanoid = character:FindFirstChildOfClass("Humanoid")
+					if not humanoid then return end
+
+					local plr = Players:GetPlayerFromCharacter(character)
+					if not plr then return end
+
+					handleUnlockTouch(button, plot, index, plr)
+				end)
+
+				button:SetAttribute("UnlockHooked", true)
+			end
+		end
+	end
+end
+
+local function applyUnlockStateForPlayer(player: Player, plot: Model)
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	profile.Data.CageUnlocks = profile.Data.CageUnlocks or {}
+	local unlocks = profile.Data.CageUnlocks
+
+	local cageSystem = getCageSystem(plot)
+	if not cageSystem then return end
+
+	for index = 1, MAX_CAGES do
+		local cage = cageSystem:FindFirstChild("Cage" .. index)
+		local cp   = cageSystem:FindFirstChild("CagePlatform" .. index)
+
+		local unlocked = unlocks[index] == true
+
+		if cage and cage:IsA("Model") then
+			setCageVisual(cage, unlocked)
+			if unlocked then
+				setupCageInteractions(cage)
+			end
+		end
+
+		if cp and cp:IsA("Model") then
+			local button = cp:FindFirstChild("Button" .. index)
+			if button and button:IsA("BasePart") then
+				setButtonVisual(button, unlocked)
+			end
+		end
+	end
+end
+
+--------------------------------------------------
+-- Offline restoration
+--------------------------------------------------
+
+function CageController:OnPlayerProfileLoaded(player: Player)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+
+	setupUnlockButtonsForPlot(plot)
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	applyUnlockStateForPlayer(player, plot)
+
+	profile.Data.CageSlots = profile.Data.CageSlots or {}
+	local slots = profile.Data.CageSlots
+
+	local now = os.time()
+
+	for idx, slot in pairs(slots) do
+		if typeof(idx) == "number" and type(slot) == "table" and slot.EnemyId then
+			local cage = getCageByIndex(plot, idx)
+			if cage then
+				createDisplayModel(cage, slot.EnemyId)
+
+				local cfg  = EnemyConfigurations[slot.EnemyId]
+				local base = (cfg and tonumber(cfg.ValuePerSecond)) or 0
+				local mult = getMutationMultiplier(slot.Mutation)
+				local vps  = base * mult
+
+				local lastTick = slot.LastTick or now
+				local dtOffline = math.max(0, now - lastTick)
+				local offlineEarned = math.floor(vps * dtOffline + 0.5)
+
+				slot.Banked = math.max(0, math.floor((slot.Banked or 0) + offlineEarned))
+				slot.LastOfflineEarned = offlineEarned
+				slot.LastTick = now
+
+				updateCageAttributes(cage, slot)
+			end
+		end
+	end
+end
+
+--------------------------------------------------
+-- Online tick
+--------------------------------------------------
+
+local function heartbeatTick()
+	local now = os.time()
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local profile = PlayerController:GetProfile(player)
+		if not profile then continue end
+
+		local slots = profile.Data.CageSlots
+		if not slots then continue end
+
+		local plot = getPlotForPlayer(player)
+		if not plot then continue end
+
+		for idx, slot in pairs(slots) do
+			if type(slot) == "table" and slot.EnemyId then
+				local cfg  = EnemyConfigurations[slot.EnemyId]
+				local base = (cfg and tonumber(cfg.ValuePerSecond)) or 0
+				local mult = getMutationMultiplier(slot.Mutation)
+				local vps  = base * mult
+
+				local lastTick = slot.LastTick or now
+				local dt = math.max(0, now - lastTick)
+				if dt > 0 and vps > 0 then
+					local inc = vps * dt
+					slot.Banked = math.max(0, (slot.Banked or 0) + inc)
+				end
+				slot.LastTick = now
+
+				local plotModel = getPlotForPlayer(player)
+				if plotModel then
+					local cage = getCageByIndex(plotModel, idx)
+					if cage then
+						updateCageAttributes(cage, slot)
+					end
+				end
+			end
+		end
+	end
+end
+
+--------------------------------------------------
+-- Placement Tool (uses ReplicatedStorage/Tools)
+--------------------------------------------------
+
+function CageController:GivePlacementTool(player: Player, enemyId: string)
+	if not enemyId or enemyId == "" then return end
+
+	local cfg = EnemyConfigurations[enemyId]
+	if not cfg then return end
+
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if not backpack then return end
+
+	local function clearOldPlacers(container: Instance)
+		for _, inst in ipairs(container:GetChildren()) do
+			if inst:IsA("Tool") and inst:GetAttribute("IsEnemyPlacer") == true then
+				inst:Destroy()
+			end
+		end
+	end
+
+	clearOldPlacers(backpack)
+	if player.Character then
+		clearOldPlacers(player.Character)
+	end
+
+	local tool: Tool
+
+	local template: Tool? = nil
+	if ToolsFolder then
+		local byName = ToolsFolder:FindFirstChild(enemyId .. " Placer")
+		if byName and byName:IsA("Tool") then
+			template = byName
+		else
+			local stub = ToolsFolder:FindFirstChild("EnemyPlacerStub")
+			if stub and stub:IsA("Tool") then
+				template = stub
+			end
+		end
+	end
+
+	if template then
+		tool = template:Clone()
+	else
+		tool = Instance.new("Tool")
+		tool.Name = enemyId .. " Placer"
+		tool.RequiresHandle = true
+		tool.CanBeDropped = false
+
+		local handle = Instance.new("Part")
+		handle.Name = "Handle"
+		handle.Size = Vector3.new(1, 1, 1)
+		handle.Transparency = 1
+		handle.CanCollide = false
+		handle.Parent = tool
+	end
+
+	tool:SetAttribute("IsEnemyPlacer", true)
+	tool:SetAttribute("EnemyId", enemyId)
+	tool:SetAttribute("DisplayName", (cfg and cfg.DisplayName) or enemyId)
+
+	if not tool:GetAttribute("Hooked") then
+		tool.Equipped:Connect(function()
+			local eid = tool:GetAttribute("EnemyId")
+			if type(eid) == "string" then
+				player:SetAttribute("SelectedEnemyId", eid)
+			end
+		end)
+
+		tool.Unequipped:Connect(function()
+			player:SetAttribute("SelectedEnemyId", nil)
+		end)
+
+		tool:SetAttribute("Hooked", true)
+	end
+
+	tool.Parent = backpack
+
+	local char = player.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid:EquipTool(tool)
+	end
+end
+
+--------------------------------------------------
+-- Init / Start
+--------------------------------------------------
+
+function CageController:Init(controllers: {[string]: any})
+	PlayerController = controllers.PlayerController
+	PlotController   = controllers.PlotController
+
+	if ConfirmCageUnlock then
+		ConfirmCageUnlock.OnServerEvent:Connect(function(player: Player, index: number)
+			index = tonumber(index) or 0
+			if index < 1 or index > MAX_CAGES then return end
+
+			local plot = getPlotForPlayer(player)
+			if not plot then return end
+
+			local profile = PlayerController:GetProfile(player)
+			if not profile then return end
+
+			profile.Data.CageUnlocks = profile.Data.CageUnlocks or {}
+			local unlocks = profile.Data.CageUnlocks
+
+			for i = 1, index - 1 do
+				if not unlocks[i] then
+					local notify = eventsFolder:FindFirstChild("ShowNotification") :: RemoteEvent?
+					if notify then
+						notify:FireClient(player, "Unlock previous cages first.", "Warning")
+					end
+					return
+				end
+			end
+
+			if unlocks[index] then
+				return
+			end
+
+			local cost = CAGE_COSTS[index] or 100_000
+			if not PlayerController.RemoveCash(player, cost) then
+				local notify = eventsFolder:FindFirstChild("ShowNotification") :: RemoteEvent?
+				if notify then
+					notify:FireClient(player, "Not enough cash!", "Error")
+				end
+				return
+			end
+
+			unlocks[index] = true
+			profile.Data.CageUnlocks = unlocks
+
+			local cageSystem = getCageSystem(plot)
+			if not cageSystem then return end
+
+			local cage = cageSystem:FindFirstChild("Cage" .. index)
+			if cage and cage:IsA("Model") then
+				setCageVisual(cage, true)
+				setupCageInteractions(cage)
+			end
+
+			local cp = cageSystem:FindFirstChild("CagePlatform" .. index)
+			if cp and cp:IsA("Model") then
+				local button = cp:FindFirstChild("Button" .. index)
+				if button and button:IsA("BasePart") then
+					setButtonVisual(button, true)
+				end
+			end
+
+			local notify = eventsFolder:FindFirstChild("ShowNotification") :: RemoteEvent?
+			if notify then
+				notify:FireClient(player, ("Unlocked Cage %d!"):format(index), "Success")
+			end
+		end)
+	end
+
+	local plotsFolder = getPlotsFolder()
+	if plotsFolder then
+		for _, plot in ipairs(plotsFolder:GetChildren()) do
+			if plot:IsA("Model") then
+				setupUnlockButtonsForPlot(plot)
+			end
+		end
+	end
+end
+
+function CageController:Start()
+	RunService.Heartbeat:Connect(heartbeatTick)
+
+	Players.PlayerRemoving:Connect(function(player)
+		for _, debounces in pairs(_collectDebounce) do
+			debounces[player] = nil
+		end
+	end)
+end
+
+return CageController
+
+---
+
+--- ServerScriptService.Controllers.CageUnlockController (ModuleScript) ---
+--!strict
+-- CageUnlockController
+-- Handles unlocking Cage1..9 via CagePlatform1..9.Button#
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local PlayerController
+local PlotController
+
+local CageUnlockController = {}
+
+local CAGE_UNLOCK_COSTS: {[number]: number} = {
+	[1] = 100000,
+	[2] = 100000,
+	[3] = 100000,
+	[4] = 100000,
+	[5] = 100000,
+	[6] = 100000,
+	[7] = 100000,
+	[8] = 100000,
+	[9] = 100000,
+}
+
+local MAX_CAGES = 9
+
+local _buttonDebounce: {[BasePart]: {[Player]: number}} = {}
+
+------------------------------------------------ Helpers
+
+local function getPlotsFolder(): Instance?
+	return Workspace:FindFirstChild("Plots")
+end
+
+local function getPlotForPlayer(player: Player): Model?
+	local plotsFolder = getPlotsFolder()
+	if not plotsFolder then return nil end
+
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function applyCageVisual(cage: Model, unlocked: boolean)
+	cage:SetAttribute("Unlocked", unlocked)
+
+	for _, d in ipairs(cage:GetDescendants()) do
+		if d:IsA("BasePart") then
+			if unlocked then
+				d.Transparency = 0
+				d.CanCollide = true
+			else
+				d.Transparency = 1
+				d.CanCollide = false
+			end
+		end
+	end
+end
+
+local function setButtonActive(button: BasePart, active: boolean)
+	button.Transparency = active and 0 or 1
+	button.CanCollide = active
+	button.CanTouch = active
+end
+
+local function getIndexFromButtonName(name: string): number?
+	local numStr = string.match(name, "^Button(%d+)$")
+	return numStr and tonumber(numStr) or nil
+end
+
+------------------------------------------------ Core
+
+function CageUnlockController:_HandleUnlock(player: Player, button: BasePart)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	local buttonModel = button:FindFirstAncestorOfClass("Model")
+	if not buttonModel then return end
+
+	local idx = getIndexFromButtonName(button.Name)
+	if not idx then return end
+
+	local cage = cageSystem:FindFirstChild("Cage" .. tostring(idx)) :: Model?
+	if not cage or not cage:IsA("Model") then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	profile.Data.UnlockedCages = profile.Data.UnlockedCages or {}
+	local unlockedMap = profile.Data.UnlockedCages
+
+	if unlockedMap[idx] then
+		return
+	end
+
+	if idx > 1 then
+		if not unlockedMap[idx - 1] then
+			return
+		end
+	end
+
+	local cost = CAGE_UNLOCK_COSTS[idx] or 100000
+	if not PlayerController.RemoveCash(player, cost) then
+		local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
+		if notify then
+			notify:FireClient(player, "Not enough cash!", "Error")
+		end
+		return
+	end
+
+	unlockedMap[idx] = true
+	applyCageVisual(cage, true)
+
+	-- hide this button
+	setButtonActive(button, false)
+
+	-- enable next button (if any and not already unlocked)
+	if idx < MAX_CAGES then
+		local nextPlat = cageSystem:FindFirstChild("CagePlatform" .. tostring(idx + 1)) :: Model?
+		if nextPlat then
+			local nextBtn = nextPlat:FindFirstChild("Button" .. tostring(idx + 1)) :: BasePart?
+			if nextBtn and not unlockedMap[idx + 1] then
+				setButtonActive(nextBtn, true)
+			end
+		end
+	end
+
+	local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
+	if notify then
+		notify:FireClient(player, ("Unlocked Cage %d!"):format(idx), "Success")
+	end
+end
+
+------------------------------------------------ Setup per-plot
+
+local function setupButtonsForPlot(plot: Model)
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for i = 1, MAX_CAGES do
+		local plat = cageSystem:FindFirstChild("CagePlatform" .. tostring(i)) :: Model?
+		if plat then
+			local button = plat:FindFirstChild("Button" .. tostring(i)) :: BasePart?
+			if button and button:IsA("BasePart") then
+				if not _buttonDebounce[button] then
+					_buttonDebounce[button] = {}
+				end
+
+				if not button:GetAttribute("UnlockHooked") then
+					button.Touched:Connect(function(hit: BasePart)
+						local character = hit:FindFirstAncestorOfClass("Model")
+						if not character then return end
+						local humanoid = character:FindFirstChildOfClass("Humanoid")
+						if not humanoid then return end
+
+						local player = Players:GetPlayerFromCharacter(character)
+						if not player then return end
+
+						local now = os.clock()
+						local deb = _buttonDebounce[button]
+						local last = deb[player] or 0
+						if now - last < 0.75 then return end
+						deb[player] = now
+
+						CageUnlockController:_HandleUnlock(player, button)
+					end)
+
+					button:SetAttribute("UnlockHooked", true)
+				end
+			end
+		end
+	end
+end
+
+local function applyStateForPlayer(player: Player)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	profile.Data.UnlockedCages = profile.Data.UnlockedCages or {}
+	local unlockedMap = profile.Data.UnlockedCages
+
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for i = 1, MAX_CAGES do
+		local cage = cageSystem:FindFirstChild("Cage" .. tostring(i)) :: Model?
+		if cage and cage:IsA("Model") then
+			local unlocked = unlockedMap[i] == true
+			applyCageVisual(cage, unlocked)
+		end
+
+		local plat = cageSystem:FindFirstChild("CagePlatform" .. tostring(i)) :: Model?
+		if plat then
+			local button = plat:FindFirstChild("Button" .. tostring(i)) :: BasePart?
+			if button and button:IsA("BasePart") then
+				local prevUnlocked = (i == 1) or (unlockedMap[i - 1] == true)
+				local active = (not unlockedMap[i]) and prevUnlocked
+				setButtonActive(button, active)
+			end
+		end
+	end
+end
+
+------------------------------------------------ Public
+
+function CageUnlockController:OnPlayerProfileLoaded(player: Player)
+	applyStateForPlayer(player)
+end
+
+function CageUnlockController:Init(controllers: {[string]: any})
+	PlayerController = controllers.PlayerController
+	PlotController   = controllers.PlotController
+
+	local plotsFolder = getPlotsFolder()
+	if plotsFolder then
+		for _, plot in ipairs(plotsFolder:GetChildren()) do
+			if plot:IsA("Model") then
+				setupButtonsForPlot(plot)
+			end
+		end
+	end
+end
+
+function CageUnlockController:Start()
+	-- nothing extra for now
+end
+
+return CageUnlockController
 
 ---
 
@@ -11065,134 +12034,231 @@ local EnemyConfigurations = {
 		CashReward = 5,
 		MaxHealth = 85,
 		Damage = 10,
+		Rarity = "Common",
+		ValuePerSecond = 1,
+		SellValue = 5,
 	},
+
 	["Ghost Zombie"] = {
-		CashReward = 10,
+		CashReward = 7,
 		MaxHealth = 100,
 		Damage = 15,
+		Rarity = "Rare",
+		ValuePerSecond = 2,
+		SellValue = 10,
 	},
+
 	["Ice Zombie"] = {
-		CashReward = 15,
+		CashReward = 8,
 		MaxHealth = 150,
 		Damage = 20,
+		Rarity = "Rare",
+		ValuePerSecond = 2,
+		SellValue = 12,
 	},
+
 	["Fire Zombie"] = {
-		CashReward = 20,
+		CashReward = 9,
 		MaxHealth = 190,
 		Damage = 25,
+		Rarity = "Rare",
+		ValuePerSecond = 3,
+		SellValue = 15,
 	},
+
 	["Toxic Zombie"] = {
-		CashReward = 25,
+		CashReward = 10,
 		MaxHealth = 240,
 		Damage = 30,
+		Rarity = "Rare",
+		ValuePerSecond = 3,
+		SellValue = 18,
 	},
+
 	["Skeleton"] = {
-		CashReward = 10,
+		CashReward = 6,
 		MaxHealth = 90,
 		Damage = 15,
+		Rarity = "Common",
+		ValuePerSecond = 1,
+		SellValue = 6,
 	},
+
 	["Angry Miner"] = {
-		CashReward = 13,
+		CashReward = 8,
 		MaxHealth = 135,
 		Damage = 15,
+		Rarity = "Rare",
+		ValuePerSecond = 2,
+		SellValue = 12,
 	},
+
 	["Half Skeletal"] = {
-		CashReward = 20,
+		CashReward = 9,
 		MaxHealth = 105,
 		Damage = 20,
+		Rarity = "Rare",
+		ValuePerSecond = 2,
+		SellValue = 14,
 	},
+
 	["Explosive Boy"] = {
-		CashReward = 40,
+		CashReward = 10,
 		MaxHealth = 245,
 		Damage = 35,
+		Rarity = "Epic",
+		ValuePerSecond = 4,
+		SellValue = 20,
 	},
+
 	["RogueCowboy"] = {
-		CashReward = 25,
+		CashReward = 10,
 		MaxHealth = 130,
 		Damage = 25,
+		Rarity = "Epic",
+		ValuePerSecond = 4,
+		SellValue = 22,
 	},
+
 	["SkullHead"] = {
-		CashReward = 20,
+		CashReward = 10,
 		MaxHealth = 135,
 		Damage = 25,
+		Rarity = "Epic",
+		ValuePerSecond = 4,
+		SellValue = 22,
 	},
+
 	["Looter Caravan"] = {
-		CashReward = 30,
+		CashReward = 12,
 		MaxHealth = 300,
 		Damage = 40,
+		Rarity = "Epic",
+		ValuePerSecond = 5,
+		SellValue = 25,
 	},
+
 	["Alien Bandit"] = {
-		CashReward = 30,
+		CashReward = 12,
 		MaxHealth = 250,
 		Damage = 65,
+		Rarity = "Legendary",
+		ValuePerSecond = 7,
+		SellValue = 35,
 	},
+
 	["Rider Villain"] = {
-		CashReward = 30,
+		CashReward = 12,
 		MaxHealth = 250,
 		Damage = 65,
+		Rarity = "Legendary",
+		ValuePerSecond = 7,
+		SellValue = 35,
 	},
+
 	["Ghost Cowboy"] = {
-		CashReward = 33,
+		CashReward = 12,
 		MaxHealth = 160,
 		Damage = 70,
+		Rarity = "Legendary",
+		ValuePerSecond = 8,
+		SellValue = 40,
 	},
-	
-	
-	
+
 	-- BOSS
 	["Ghost Rider"] = {
-		CashReward = 1100,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 60,
+		Rarity = "Boss",
+		ValuePerSecond = 15,
+		SellValue = 100,
 	},
+
 	["Noob Boss"] = {
-		CashReward = 950,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 55,
+		Rarity = "Boss",
+		ValuePerSecond = 15,
+		SellValue = 100,
 	},
+
 	["Jandel Boss"] = {
-		CashReward = 1300,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 65,
+		Rarity = "Boss",
+		ValuePerSecond = 16,
+		SellValue = 110,
 	},
+
 	["Shedletsky Boss"] = {
-		CashReward = 1000,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 60,
+		Rarity = "Boss",
+		ValuePerSecond = 15,
+		SellValue = 100,
 	},
+
 	["Drooling Zombie"] = {
-		CashReward = 1050,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 64,
+		Rarity = "Boss",
+		ValuePerSecond = 16,
+		SellValue = 110,
 	},
+
 	["Zombie Boss"] = {
-		CashReward = 950,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 60,
+		Rarity = "Boss",
+		ValuePerSecond = 15,
+		SellValue = 100,
 	},
+
 	["Void Boss"] = {
-		CashReward = 1500,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 63,
+		Rarity = "Boss",
+		ValuePerSecond = 18,
+		SellValue = 120,
 	},
+
 	["Bacon Boss"] = {
-		CashReward = 950,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 56,
+		Rarity = "Boss",
+		ValuePerSecond = 15,
+		SellValue = 100,
 	},
+
 	["Pumpkin Alien"] = {
-		CashReward = 1050,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 65,
+		Rarity = "Boss",
+		ValuePerSecond = 17,
+		SellValue = 115,
 	},
+
 	["Pumpkin Reaper"] = {
-		CashReward = 1050,
+		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 65,
+		Rarity = "Boss",
+		ValuePerSecond = 18,
+		SellValue = 120,
 	},
 }
 
 return EnemyConfigurations
+
 ---
 
 --- ReplicatedStorage.Modules.ModelProgression (ModuleScript) ---
@@ -12184,5 +13250,34 @@ function DailyRewardsHandler.Init()
 end
 
 return DailyRewardsHandler
+
+---
+
+--- ReplicatedStorage.Modules.MutationConfigurations (ModuleScript) ---
+--!strict
+-- MutationConfigurations
+-- Multiplier applies to:
+--  • ValuePerSecond (cage income)
+--  • SellValue (when you add auto-sell later)
+
+local MutationConfigurations = {
+	Gold = {
+		Multiplier = 2,
+	},
+	Diamond = {
+		Multiplier = 3,
+	},
+	Rainbow = {
+		Multiplier = 4,
+	},
+	Christmas = {
+		Multiplier = 10,
+	},
+	Glitch = {
+		Multiplier = 10,
+	},
+}
+
+return MutationConfigurations
 
 ---

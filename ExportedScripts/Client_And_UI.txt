@@ -2699,6 +2699,157 @@ game:GetService("TweenService"):Create(
 
 ---
 
+--- StarterPlayer.StarterPlayerScripts.CageBillboardHandler (LocalScript) ---
+--!strict
+-- CageBillboardHandler
+-- Shows:
+--  Name
+--  Rarity
+--  Mutation
+--  Total banked money (with offline in parentheses)
+--  Value/s
+
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+local RARITY_COLORS: {[string]: Color3} = {
+	Common    = Color3.fromRGB(200, 200, 200),
+	Rare      = Color3.fromRGB(80, 170, 255),
+	Epic      = Color3.fromRGB(190, 90, 255),
+	Legendary = Color3.fromRGB(255, 200, 80),
+	Boss      = Color3.fromRGB(255, 80, 80),
+	Secret    = Color3.fromRGB(80, 255, 200),
+}
+
+local function getPlotForPlayer(): Model?
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if not plotsFolder then return nil end
+
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function ensureBillboard(cage: Model): BillboardGui
+	local existing = cage:FindFirstChild("CageLabel") :: BillboardGui?
+	if existing then return existing end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "CageLabel"
+	billboard.Size = UDim2.new(0, 220, 0, 90)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, 5, 0)
+	billboard.AlwaysOnTop = true
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 14
+	label.TextWrapped = true
+	label.Parent = billboard
+
+	local attachPart = cage:FindFirstChild("Platform") or cage:FindFirstChildWhichIsA("BasePart")
+	if attachPart and attachPart:IsA("BasePart") then
+		billboard.Adornee = attachPart
+	end
+
+	billboard.Parent = cage
+	return billboard
+end
+
+local function updateBillboard(cage: Model)
+	local billboard = ensureBillboard(cage)
+	local textLabel = billboard:FindFirstChild("Text") :: TextLabel?
+	if not textLabel then return end
+
+	local enemyId   = cage:GetAttribute("EnemyId") :: string?
+	local display   = cage:GetAttribute("DisplayName") :: string?
+	local rarity    = cage:GetAttribute("Rarity") :: string?
+	local mutation  = cage:GetAttribute("Mutation") :: string?
+	local banked    = cage:GetAttribute("Banked") :: number? or 0
+	local lastOff   = cage:GetAttribute("LastOffline") :: number? or 0
+	local vps       = cage:GetAttribute("ValuePerSecond") :: number? or 0
+
+	if not enemyId or enemyId == "" then
+		textLabel.Text = "Empty Cage"
+		textLabel.TextColor3 = Color3.new(1, 1, 1)
+		return
+	end
+
+	local nameText     = display or enemyId
+	local rarityText   = rarity or "Common"
+	local mutationText = (mutation and mutation ~= "") and mutation or "None"
+
+	local bankedText = string.format("Banked: %d", math.floor(banked + 0.5))
+
+	local offlineText = ""
+	if lastOff and lastOff > 0 then
+		offlineText = string.format("(+%d offline)", math.floor(lastOff + 0.5))
+	end
+
+	local vpsText = string.format("Value/s: %.0f", vps or 0)
+
+	textLabel.Text = string.format(
+		"%s\nRarity: %s\nMutation: %s\n%s\n%s\n%s",
+		nameText,
+		rarityText,
+		mutationText,
+		bankedText,
+		offlineText,
+		vpsText
+	)
+
+	local rarityColor = RARITY_COLORS[rarityText]
+	if rarityColor then
+		textLabel.TextColor3 = rarityColor
+	else
+		textLabel.TextColor3 = Color3.new(1, 1, 1)
+	end
+end
+
+local function hookCage(cage: Model)
+	ensureBillboard(cage)
+	updateBillboard(cage)
+
+	local watched = { "EnemyId", "DisplayName", "Rarity", "Mutation", "Banked", "LastOffline", "ValuePerSecond" }
+	for _, attr in ipairs(watched) do
+		cage:GetAttributeChangedSignal(attr):Connect(function()
+			updateBillboard(cage)
+		end)
+	end
+end
+
+local function initForPlot()
+	local plot = getPlotForPlayer()
+	if not plot then return end
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for _, cage in ipairs(cageSystem:GetChildren()) do
+		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
+			hookCage(cage)
+		end
+	end
+end
+
+task.delay(1, initForPlot)
+
+---
+
 --- StarterGui.GUI.HUD.Cash.Amount.CashDisplayHandler (LocalScript) ---
 --!strict
 -- This script animates the cash display on the HUD.
@@ -3197,6 +3348,63 @@ GunUI.OnClientEvent:Connect(function(kind, data)
 		else
 			render()
 		end
+	end
+end)
+
+---
+
+--- StarterGui.GUI.HUD.Bottom3.EnemyInventory.EnemyInvBtnHandler (LocalScript) ---
+--!strict
+-- EnemyInventoryBtnHandler
+-- Parent: TextButton "EnemyInventory" in HUD.Bottom3
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Modules           = ReplicatedStorage:WaitForChild("Modules")
+local FrameManager      = require(Modules:WaitForChild("FrameManager"))
+local PlacementHandler  = require(Modules:WaitForChild("PlacementHandler"))
+
+local eventsFolder            = ReplicatedStorage:WaitForChild("Events")
+local unequipWeaponRequest    = eventsFolder:WaitForChild("UnequipWeaponRequest") :: RemoteEvent
+local equipLastWeaponRequest  = eventsFolder:WaitForChild("EquipLastWeaponRequest") :: RemoteEvent
+
+local player  = Players.LocalPlayer
+local button  = script.Parent :: TextButton
+
+local playerGui = player:WaitForChild("PlayerGui")
+local guiRoot   = playerGui:WaitForChild("GUI")
+local hudRoot   = guiRoot:WaitForChild("HUD")
+local bottomHud = hudRoot:WaitForChild("Bottom")
+
+local function hudActive(): boolean
+	return bottomHud.Visible == true
+end
+
+local function toggleEnemyInventory()
+	if not hudActive() then return end
+
+	unequipWeaponRequest:FireServer()
+	PlacementHandler:ExitAllModes()
+
+	-- Don't stack panels
+	FrameManager.close("Inventory")
+	FrameManager.close("InventoryTwo")
+
+	if FrameManager.getOpenFrameName() == "EnemyInventory" then
+		FrameManager.close("EnemyInventory")
+		equipLastWeaponRequest:FireServer()
+	else
+		FrameManager.open("EnemyInventory")
+	end
+end
+
+button.Activated:Connect(toggleEnemyInventory)
+
+-- If someone closes it via ESC or another panel, give the weapon back
+FrameManager.onFrameClosed(function(frameName: string)
+	if frameName == "EnemyInventory" then
+		equipLastWeaponRequest:FireServer()
 	end
 end)
 
@@ -4109,7 +4317,7 @@ frame.Visible = false
 
 --- StarterGui.GUI.Frames.EnemyInventory.EnemyInventoryHandler (LocalScript) ---
 --!strict
--- StarterGui.GUI.Frames.EnemyInventory.EnemiesInventoryHandler
+-- EnemyInventoryHandler
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -4119,13 +4327,30 @@ local EnemyConfigurations = require(Modules:WaitForChild("EnemyConfigurations"))
 
 local player = Players.LocalPlayer
 
-local inventoryFrame = script.Parent :: Frame
-local scrollingFrame = inventoryFrame:WaitForChild("ScrollingFrame") :: ScrollingFrame
+local inventoryFrame  = script.Parent :: Frame
+local scrollingFrame  = inventoryFrame:WaitForChild("ScrollingFrame") :: ScrollingFrame
+local autoSellSelector = inventoryFrame:WaitForChild("AutoSellSelector") :: Frame
+local autoSellButton  = inventoryFrame:WaitForChild("AutoSell") :: TextButton
 
 local templatesFolder = ReplicatedStorage:WaitForChild("Templates")
-local enemyTemplate = templatesFolder:WaitForChild("EnemyInventoryTemplate") :: Frame
+local enemyTemplate   = templatesFolder:WaitForChild("EnemyInventoryTemplate") :: TextButton
 
 local myEnemies: {[string]: number} = {}
+local autoSellState: {[string]: boolean} = {}
+
+local RARITY_COLORS: {[string]: Color3} = {
+	Common    = Color3.fromRGB(200, 200, 200),
+	Rare      = Color3.fromRGB(80, 170, 255),
+	Epic      = Color3.fromRGB(190, 90, 255),
+	Legendary = Color3.fromRGB(255, 200, 80),
+	Boss      = Color3.fromRGB(255, 80, 80),
+	Secret    = Color3.fromRGB(80, 255, 200),
+}
+
+local function getRarityColor(rarity: string?): Color3
+	if not rarity then return Color3.new(1, 1, 1) end
+	return RARITY_COLORS[rarity] or Color3.new(1, 1, 1)
+end
 
 local function clearList()
 	for _, child in ipairs(scrollingFrame:GetChildren()) do
@@ -4135,6 +4360,7 @@ local function clearList()
 	end
 end
 
+-- sort by ValuePerSecond (desc), then by name
 local function getSortedEnemyIds(): {string}
 	local list = {}
 	for enemyId, count in pairs(myEnemies) do
@@ -4143,16 +4369,32 @@ local function getSortedEnemyIds(): {string}
 		end
 	end
 
+	local function getVps(id: string): number
+		local cfg = EnemyConfigurations[id]
+		return (cfg and (cfg :: any).ValuePerSecond) or 0
+	end
+
 	table.sort(list, function(a, b)
-		local cfgA = EnemyConfigurations[a]
-		local cfgB = EnemyConfigurations[b]
-		local nameA = (cfgA and cfgA.DisplayName) or a
-		local nameB = (cfgB and cfgB.DisplayName) or b
-		return nameA < nameB
+		local vA = getVps(a)
+		local vB = getVps(b)
+		if vA == vB then
+			local cfgA = EnemyConfigurations[a]
+			local cfgB = EnemyConfigurations[b]
+			local nameA = (cfgA and cfgA.DisplayName) or a
+			local nameB = (cfgB and cfgB.DisplayName) or b
+			return nameA < nameB
+		end
+		return vA > vB
 	end)
 
 	return list
 end
+
+local eventsFolder               = ReplicatedStorage:WaitForChild("Events")
+local enemyInvUpdatedEvent       = eventsFolder:WaitForChild("EnemyInventoryUpdated") :: RemoteEvent
+local enemyAutoSellUpdated       = eventsFolder:WaitForChild("EnemyAutoSellUpdated") :: RemoteEvent
+local setEnemyAutoSellEvent      = eventsFolder:WaitForChild("SetEnemyAutoSell") :: RemoteEvent
+local requestPlacementToolEvent  = eventsFolder:WaitForChild("RequestEnemyPlacementTool") :: RemoteEvent
 
 local function redraw()
 	clearList()
@@ -4161,38 +4403,61 @@ local function redraw()
 	for _, enemyId in ipairs(sortedIds) do
 		local count = myEnemies[enemyId]
 		if count and count > 0 then
+			local cfg  = EnemyConfigurations[enemyId]
+			local rarity = cfg and cfg.Rarity
+			local vps   = (cfg and cfg.ValuePerSecond) or 0
+
 			local item = enemyTemplate:Clone()
 			item.Name = enemyId
 			item.Visible = true
 
-			local nameLabel = item:FindFirstChild("Name")
-			local countLabel = item:FindFirstChild("Count")
+			local nameLabel   = item:FindFirstChild("Name")
+			local countLabel  = item:FindFirstChild("Count")
 			local rarityLabel = item:FindFirstChild("Rarity")
-
-			local cfg = EnemyConfigurations[enemyId]
+			local vpsLabel    = item:FindFirstChild("Vps")
 
 			if nameLabel and nameLabel:IsA("TextLabel") then
 				nameLabel.Text = (cfg and cfg.DisplayName) or enemyId
+				nameLabel.TextColor3 = getRarityColor(rarity)
 			end
 
 			if countLabel and countLabel:IsA("TextLabel") then
 				countLabel.Text = "x" .. tostring(count)
 			end
 
-			-- Optional: only shows something if you later add cfg.Rarity
 			if rarityLabel and rarityLabel:IsA("TextLabel") then
-				local rarity = cfg and cfg.Rarity
-				rarityLabel.Text = typeof(rarity) == "string" and rarity or ""
+				local rarityText = typeof(rarity) == "string" and rarity or ""
+				rarityLabel.Text = rarityText
+				rarityLabel.TextColor3 = getRarityColor(rarity)
 			end
+
+			if vpsLabel and vpsLabel:IsA("TextLabel") then
+				vpsLabel.Text = string.format("%d/s", vps)
+			end
+
+			-- click = ask server to give placement tool for that enemy
+			item.Activated:Connect(function()
+				requestPlacementToolEvent:FireServer(enemyId)
+			end)
 
 			item.Parent = scrollingFrame
 		end
 	end
 end
 
--- Remote hooks
-local eventsFolder = ReplicatedStorage:WaitForChild("Events")
-local enemyInvUpdatedEvent = eventsFolder:WaitForChild("EnemyInventoryUpdated") :: RemoteEvent
+local function setAutoSellButtonVisual(btn: TextButton, enabled: boolean)
+	btn.BackgroundTransparency = enabled and 0 or 0.5
+end
+
+local function syncAutoSellButtons()
+	for _, child in ipairs(autoSellSelector:GetChildren()) do
+		if child:IsA("TextButton") then
+			local rarityName = child.Name
+			local enabled = autoSellState[rarityName] == true
+			setAutoSellButtonVisual(child, enabled)
+		end
+	end
+end
 
 enemyInvUpdatedEvent.OnClientEvent:Connect(function(data: {[string]: number}?)
 	myEnemies = data or {}
@@ -4201,14 +4466,18 @@ enemyInvUpdatedEvent.OnClientEvent:Connect(function(data: {[string]: number}?)
 	end
 end)
 
--- Refresh when frame is opened (FrameManager will toggle visibility)
+enemyAutoSellUpdated.OnClientEvent:Connect(function(data: {[string]: boolean}?)
+	autoSellState = data or {}
+	syncAutoSellButtons()
+end)
+
 inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
 	if inventoryFrame.Visible then
 		redraw()
+		syncAutoSellButtons()
 	end
 end)
 
--- Initial pull (in case we opened before first event)
 task.spawn(function()
 	local functionsFolder = ReplicatedStorage:WaitForChild("Functions")
 	local fn = functionsFolder:FindFirstChild("GetEnemyInventory") :: RemoteFunction?
@@ -4225,6 +4494,69 @@ task.spawn(function()
 		end
 	end
 end)
+
+autoSellButton.Activated:Connect(function()
+	autoSellSelector.Visible = not autoSellSelector.Visible
+end)
+
+for _, child in ipairs(autoSellSelector:GetChildren()) do
+	if child:IsA("TextButton") then
+		local rarityName = child.Name
+		child.Activated:Connect(function()
+			local newState = not (autoSellState[rarityName] == true)
+			autoSellState[rarityName] = newState
+			setAutoSellButtonVisual(child, newState)
+			setEnemyAutoSellEvent:FireServer(rarityName, newState)
+		end)
+	end
+end
+
+---
+
+--- StarterGui.GUI.Frames.ConfirmPopup.ConfirmHandler (LocalScript) ---
+--!strict
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+local frame        = script.Parent :: Frame
+local messageLabel = frame:WaitForChild("Message") :: TextLabel
+local acceptBtn    = frame:WaitForChild("AcceptBtn") :: TextButton
+local denyBtn      = frame:WaitForChild("DenyBtn") :: TextButton
+
+local events            = ReplicatedStorage:WaitForChild("Events")
+local promptCageUnlock  = events:WaitForChild("PromptCageUnlock") :: RemoteEvent
+local confirmCageUnlock = events:WaitForChild("ConfirmCageUnlock") :: RemoteEvent
+
+local pendingIndex: number? = nil
+
+local function close()
+	frame.Visible = false
+	pendingIndex = nil
+end
+
+promptCageUnlock.OnClientEvent:Connect(function(index: number, cost: number)
+	pendingIndex = index
+	messageLabel.Text = string.format(
+		"Are you sure you want to unlock cage #%d for $%d?",
+		index,
+		cost
+	)
+	frame.Visible = true
+end)
+
+acceptBtn.Activated:Connect(function()
+	if pendingIndex then
+		confirmCageUnlock:FireServer(pendingIndex)
+	end
+	close()
+end)
+
+denyBtn.Activated:Connect(close)
+
+-- start hidden
+frame.Visible = false
 
 ---
 
