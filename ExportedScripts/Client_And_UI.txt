@@ -2701,13 +2701,6 @@ game:GetService("TweenService"):Create(
 
 --- StarterPlayer.StarterPlayerScripts.CageBillboardHandler (LocalScript) ---
 --!strict
--- CageBillboardHandler
--- Shows:
---  Name
---  Rarity
---  Mutation
---  Total banked money (with offline in parentheses)
---  Value/s
 
 local Players   = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -2742,32 +2735,47 @@ local function getPlotForPlayer(): Model?
 end
 
 local function ensureBillboard(cage: Model): BillboardGui
-	local existing = cage:FindFirstChild("CageLabel") :: BillboardGui?
-	if existing then return existing end
-
-	local billboard = Instance.new("BillboardGui")
-	billboard.Name = "CageLabel"
-	billboard.Size = UDim2.new(0, 220, 0, 90)
-	billboard.StudsOffsetWorldSpace = Vector3.new(0, 5, 0)
-	billboard.AlwaysOnTop = true
-
-	local label = Instance.new("TextLabel")
-	label.Name = "Text"
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.BackgroundTransparency = 1
-	label.TextColor3 = Color3.new(1, 1, 1)
-	label.TextStrokeTransparency = 0
-	label.Font = Enum.Font.GothamBold
-	label.TextSize = 14
-	label.TextWrapped = true
-	label.Parent = billboard
-
-	local attachPart = cage:FindFirstChild("Platform") or cage:FindFirstChildWhichIsA("BasePart")
-	if attachPart and attachPart:IsA("BasePart") then
-		billboard.Adornee = attachPart
+	-- find the part we want to stick the label to
+	local attach = cage:FindFirstChild("EnemyPlacementBillboard", true)
+	if attach and not attach:IsA("BasePart") then
+		attach = nil
 	end
 
-	billboard.Parent = cage
+	-- find any existing CageLabel anywhere under this cage
+	local billboard = cage:FindFirstChild("CageLabel", true) :: BillboardGui?
+	if not billboard then
+		billboard = Instance.new("BillboardGui")
+		billboard.Name = "CageLabel"
+		billboard.Size = UDim2.new(0, 520, 0, 260)
+		billboard.MaxDistance = 50
+		billboard.LightInfluence = 0
+		billboard.AlwaysOnTop = true
+		billboard.Enabled = false
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Text"
+		label.Size = UDim2.new(1, 0, 1, 0)
+		label.BackgroundTransparency = 1
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextStrokeTransparency = 0
+		label.Font = Enum.Font.GothamBlack
+		label.TextSize = 32
+		label.TextWrapped = true
+		label.RichText = true
+		label.Parent = billboard
+	end
+
+	-- if we have the EnemyPlacementBillboard part, parent + adorn to it
+	if attach and attach:IsA("BasePart") then
+		billboard.Parent = attach
+		billboard.Adornee = attach
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 0, 0)
+	else
+		-- fallback: keep it on the cage root (old behaviour)
+		billboard.Parent = cage
+		billboard.Adornee = nil
+	end
+
 	return billboard
 end
 
@@ -2775,6 +2783,14 @@ local function updateBillboard(cage: Model)
 	local billboard = ensureBillboard(cage)
 	local textLabel = billboard:FindFirstChild("Text") :: TextLabel?
 	if not textLabel then return end
+
+	local unlocked = cage:GetAttribute("Unlocked") == true
+	if not unlocked then
+		billboard.Enabled = false
+		return
+	end
+
+	billboard.Enabled = true
 
 	local enemyId   = cage:GetAttribute("EnemyId") :: string?
 	local display   = cage:GetAttribute("DisplayName") :: string?
@@ -2785,7 +2801,7 @@ local function updateBillboard(cage: Model)
 	local vps       = cage:GetAttribute("ValuePerSecond") :: number? or 0
 
 	if not enemyId or enemyId == "" then
-		textLabel.Text = "Empty Cage"
+		textLabel.Text = "<b><font size='32'>Empty Cage</font></b>"
 		textLabel.TextColor3 = Color3.new(1, 1, 1)
 		return
 	end
@@ -2795,22 +2811,20 @@ local function updateBillboard(cage: Model)
 	local mutationText = (mutation and mutation ~= "") and mutation or "None"
 
 	local bankedText = string.format("Banked: %d", math.floor(banked + 0.5))
-
 	local offlineText = ""
 	if lastOff and lastOff > 0 then
 		offlineText = string.format("(+%d offline)", math.floor(lastOff + 0.5))
 	end
-
 	local vpsText = string.format("Value/s: %.0f", vps or 0)
 
 	textLabel.Text = string.format(
-		"%s\nRarity: %s\nMutation: %s\n%s\n%s\n%s",
-		nameText,
-		rarityText,
-		mutationText,
-		bankedText,
-		offlineText,
-		vpsText
+		"<b><font size='40'>%s</font></b>\n" ..
+			"<font size='30'>Rarity: %s</font>\n" ..
+			"<font size='30'>Mutation: %s</font>\n" ..
+			"<font size='30'>%s</font>\n" ..
+			"<font size='28'>%s</font>\n" ..
+			"<font size='30'>%s</font>",
+		nameText, rarityText, mutationText, bankedText, offlineText, vpsText
 	)
 
 	local rarityColor = RARITY_COLORS[rarityText]
@@ -2825,7 +2839,7 @@ local function hookCage(cage: Model)
 	ensureBillboard(cage)
 	updateBillboard(cage)
 
-	local watched = { "EnemyId", "DisplayName", "Rarity", "Mutation", "Banked", "LastOffline", "ValuePerSecond" }
+	local watched = { "Unlocked", "EnemyId", "DisplayName", "Rarity", "Mutation", "Banked", "LastOffline", "ValuePerSecond" }
 	for _, attr in ipairs(watched) do
 		cage:GetAttributeChangedSignal(attr):Connect(function()
 			updateBillboard(cage)
@@ -2833,9 +2847,13 @@ local function hookCage(cage: Model)
 	end
 end
 
-local function initForPlot()
+local initialized = false
+
+local function tryInit()
+	if initialized then return end
 	local plot = getPlotForPlayer()
 	if not plot then return end
+
 	local cageSystem = plot:FindFirstChild("CageSystem")
 	if not cageSystem then return end
 
@@ -2844,9 +2862,183 @@ local function initForPlot()
 			hookCage(cage)
 		end
 	end
+
+	initialized = true
 end
 
-task.delay(1, initForPlot)
+task.spawn(function()
+	while not initialized do
+		tryInit()
+		task.wait(0.5)
+	end
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.CagePromptHandler (LocalScript) ---
+--!strict
+
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+local function getPlotForPlayer(): Model?
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if not plotsFolder then return nil end
+
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
+
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function updatePromptForCage(cage: Model, prompt: ProximityPrompt)
+	local unlocked = cage:GetAttribute("Unlocked") == true
+	if not unlocked then
+		prompt.Enabled = false
+		return
+	end
+
+	local enemyId  = cage:GetAttribute("EnemyId") :: string?
+	local display  = cage:GetAttribute("DisplayName") :: string?
+	local hasEnemy = enemyId ~= nil and enemyId ~= ""
+
+	local selectedName = player:GetAttribute("SelectedEnemyDisplayName") :: string?
+	local selectedId   = player:GetAttribute("SelectedEnemyId") :: string?
+
+	if hasEnemy then
+		local nameText = display or enemyId or "Enemy"
+		prompt.ObjectText = "Cage"
+		prompt.ActionText = "Remove " .. nameText
+		prompt.Enabled = true
+	else
+		if selectedId and selectedId ~= "" then
+			local nameText = selectedName or "Enemy"
+			prompt.ObjectText = "Cage"
+			prompt.ActionText = "Place " .. nameText
+			prompt.Enabled = true
+		else
+			prompt.ObjectText = "Empty Cage"
+			prompt.ActionText = "Place Enemy"
+			prompt.Enabled = false
+		end
+	end
+end
+
+local function hookCage(cage: Model)
+	local prompt = cage:FindFirstChild("CagePrompt", true) :: ProximityPrompt?
+	if not prompt then return end
+
+	local function refresh()
+		updatePromptForCage(cage, prompt)
+	end
+
+	cage:GetAttributeChangedSignal("Unlocked"):Connect(refresh)
+	cage:GetAttributeChangedSignal("EnemyId"):Connect(refresh)
+	cage:GetAttributeChangedSignal("DisplayName"):Connect(refresh)
+	player:GetAttributeChangedSignal("SelectedEnemyId"):Connect(refresh)
+	player:GetAttributeChangedSignal("SelectedEnemyDisplayName"):Connect(refresh)
+
+	refresh()
+end
+
+local initialized = false
+
+local function tryInit()
+	if initialized then return end
+
+	local plot = getPlotForPlayer()
+	if not plot then return end
+
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for _, cage in ipairs(cageSystem:GetChildren()) do
+		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
+			hookCage(cage)
+		end
+	end
+
+	initialized = true
+end
+
+task.spawn(function()
+	while not initialized do
+		tryInit()
+		task.wait(0.5)
+	end
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.ClientMessageHandler (LocalScript) ---
+--!strict
+-- StarterPlayerScripts/ChatMessageHandler
+
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local StarterGui         = game:GetService("StarterGui")
+local TextChatService    = game:GetService("TextChatService")
+
+local eventsFolder       = ReplicatedStorage:WaitForChild("Events")
+local ChatHint           = eventsFolder:WaitForChild("ChatHint") :: RemoteEvent
+local ChatAnnouncement   = eventsFolder:WaitForChild("ChatAnnouncement") :: RemoteEvent
+
+local function systemMessage(text: string, color: Color3)
+	-- Convert Color3 -> "#RRGGBB"
+	local hex = string.format(
+		"#%02X%02X%02X",
+		math.floor(color.R * 255),
+		math.floor(color.G * 255),
+		math.floor(color.B * 255)
+	)
+
+	-- Wrap the whole message in a colored font tag
+	local richText = string.format('<font color="%s">%s</font>', hex, text)
+
+	-- New chat system (TextChatService)
+	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+		local channelsFolder = TextChatService:WaitForChild("TextChannels")
+		local generalChannel = channelsFolder:FindFirstChild("RBXGeneral") :: TextChannel?
+			or channelsFolder:FindFirstChild("RBXSystem") :: TextChannel?
+
+		if generalChannel then
+			generalChannel:DisplaySystemMessage(richText)
+		else
+			warn("ChatMessageHandler: no RBXGeneral/RBXSystem channel, message was:", text)
+		end
+		return
+	end
+
+	-- Legacy chat (ChatService) fallback
+	local ok, err = pcall(function()
+		StarterGui:SetCore("ChatMakeSystemMessage", {
+			Text = text,
+			Color = color,
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 18,
+		})
+	end)
+	if not ok then
+		warn("ChatMakeSystemMessage failed:", err)
+	end
+end
+
+ChatHint.OnClientEvent:Connect(function(msg: string)
+	systemMessage("[TIP] " .. msg, Color3.fromRGB(130, 200, 255)) -- light blue
+end)
+
+ChatAnnouncement.OnClientEvent:Connect(function(msg: string)
+	systemMessage(msg, Color3.fromRGB(255, 230, 100)) -- gold/yellow
+end)
 
 ---
 
@@ -4555,7 +4747,6 @@ end)
 
 denyBtn.Activated:Connect(close)
 
--- start hidden
 frame.Visible = false
 
 ---
@@ -5454,5 +5645,164 @@ task.spawn(function()
 		warn("[Settings] GetPlayerSettings failed/timed out; using defaults")
 	end
 end)
+
+---
+
+--- StarterGui.ScreenGui.Rebirth.RebirthHandler (LocalScript) ---
+--!strict
+
+local Players          = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+local rebirthFrame = script.Parent :: Frame
+local container    = rebirthFrame:WaitForChild("Container") :: Frame
+
+local unlockHolder = container:WaitForChild("Frame"):WaitForChild("Unlock") :: Frame
+local unlockTemplate = unlockHolder:WaitForChild("Template") :: Frame
+
+local requirementsFrame = container:WaitForChild("Requirements") :: Frame
+local bar               = requirementsFrame:WaitForChild("Bar") :: Frame
+local canvasGroup       = bar:WaitForChild("CanvasGroup") :: CanvasGroup
+local barFill           = canvasGroup:WaitForChild("Frame") :: Frame
+local barText           = bar:WaitForChild("TextLabel") :: TextLabel
+
+local rebirthButton     = container:WaitForChild("Rebirth") :: TextButton
+
+local Modules           = ReplicatedStorage:WaitForChild("Modules")
+local NumberFormatter   = require(Modules:WaitForChild("NumberFormatter"))
+
+local Functions         = ReplicatedStorage:WaitForChild("Functions")
+local GetRebirthState   = Functions:WaitForChild("GetRebirthState") :: RemoteFunction
+
+local Events            = ReplicatedStorage:WaitForChild("Events")
+local RebirthRequested  = Events:WaitForChild("RebirthRequested") :: RemoteEvent
+
+type RebirthState = {
+	CurrentRebirth: number,
+	MaxRebirth: number,
+	Cash: number,
+	RequiredCash: number,
+	MoneyMultiplier: number,
+	LuckMultiplier: number,
+	CanRebirth: boolean,
+	NextIndex: number,
+	NextConfig: {
+		RequiredCash: number,
+		MoneyBonusPercent: number,
+		LuckBonusPercent: number,
+		UnlockCages: {number}?,
+	}?,
+}
+
+local currentState: RebirthState? = nil
+
+local function clearUnlockList()
+	for _, child in ipairs(unlockHolder:GetChildren()) do
+		if child:IsA("Frame") and child ~= unlockTemplate then
+			child:Destroy()
+		end
+	end
+end
+
+local function populateUnlocks(nextCfg: any, nextIndex: number)
+	clearUnlockList()
+	unlockTemplate.Visible = false
+	if not nextCfg then return end
+
+	local rewards = {}
+
+	if (nextCfg.MoneyBonusPercent or 0) > 0 then
+		table.insert(rewards, {
+			Title  = "Money Boost",
+			Amount = ("+%d%% Money"):format(nextCfg.MoneyBonusPercent),
+		})
+	end
+
+	if (nextCfg.LuckBonusPercent or 0) > 0 then
+		table.insert(rewards, {
+			Title  = "Luck Boost",
+			Amount = ("+%d%% Luck"):format(nextCfg.LuckBonusPercent),
+		})
+	end
+
+	if nextCfg.UnlockCages then
+		for _, cageIdx in ipairs(nextCfg.UnlockCages) do
+			table.insert(rewards, {
+				Title  = ("Cage %d"):format(cageIdx),
+				Amount = "Unlocked",
+			})
+		end
+	end
+
+	for _, r in ipairs(rewards) do
+		local clone = unlockTemplate:Clone()
+		clone.Visible = true
+		clone.Name = "Reward"
+
+		local itemTitle   = clone:FindFirstChild("ItemTitle") :: TextLabel?
+			or clone:FindFirstChild("ItemLabel") :: TextLabel?
+		local amountLabel = clone:FindFirstChild("AmountLabel") :: TextLabel?
+
+		if itemTitle then
+			itemTitle.Text = r.Title
+		end
+		if amountLabel then
+			amountLabel.Text = r.Amount
+		end
+
+		clone.Parent = unlockHolder
+	end
+end
+
+local function refreshUI()
+	local state = GetRebirthState:InvokeServer() :: RebirthState?
+	currentState = state
+
+	if not state then
+		barFill.Size = UDim2.new(0, 0, 1, 0)
+		barText.Text = "$0/0"
+		clearUnlockList()
+		rebirthButton.AutoButtonColor = false
+		rebirthButton.Active = false
+		return
+	end
+
+	local cash       = state.Cash or 0
+	local required   = state.RequiredCash or 0
+	local frac       = 0
+	if required > 0 then
+		frac = math.clamp(cash / required, 0, 1)
+	end
+
+	barFill.Size = UDim2.new(frac, 0, 1, 0)
+	barText.Text = ("$%s/%s")
+		:format(NumberFormatter.formatNumber(cash), NumberFormatter.formatNumber(required))
+
+	populateUnlocks(state.NextConfig, state.NextIndex)
+
+	if state.CanRebirth then
+		rebirthButton.AutoButtonColor = true
+		rebirthButton.Active = true
+	else
+		rebirthButton.AutoButtonColor = false
+		rebirthButton.Active = false
+	end
+end
+
+rebirthButton.MouseButton1Click:Connect(function()
+	if not currentState or not currentState.CanRebirth then return end
+	RebirthRequested:FireServer()
+	task.delay(0.1, refreshUI)
+end)
+
+rebirthFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if rebirthFrame.Visible then
+		refreshUI()
+	end
+end)
+
+task.delay(1, refreshUI)
 
 ---
