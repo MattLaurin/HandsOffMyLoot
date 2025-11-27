@@ -2799,6 +2799,7 @@ local function updateBillboard(cage: Model)
 	local banked    = cage:GetAttribute("Banked") :: number? or 0
 	local lastOff   = cage:GetAttribute("LastOffline") :: number? or 0
 	local vps       = cage:GetAttribute("ValuePerSecond") :: number? or 0
+	local mult      = cage:GetAttribute("VpsMultiplier") :: number? or 1
 
 	if not enemyId or enemyId == "" then
 		textLabel.Text = "<b><font size='32'>Empty Cage</font></b>"
@@ -2815,7 +2816,12 @@ local function updateBillboard(cage: Model)
 	if lastOff and lastOff > 0 then
 		offlineText = string.format("(+%d offline)", math.floor(lastOff + 0.5))
 	end
-	local vpsText = string.format("Value/s: %.0f", vps or 0)
+
+	local multText = ""
+	if mult and mult > 1.001 then
+		multText = string.format(" (x%.2f)", mult)
+	end
+	local vpsText = string.format("Value/s: %.0f%s", vps or 0, multText)
 
 	textLabel.Text = string.format(
 		"<b><font size='40'>%s</font></b>\n" ..
@@ -2839,7 +2845,17 @@ local function hookCage(cage: Model)
 	ensureBillboard(cage)
 	updateBillboard(cage)
 
-	local watched = { "Unlocked", "EnemyId", "DisplayName", "Rarity", "Mutation", "Banked", "LastOffline", "ValuePerSecond" }
+	local watched = {
+		"Unlocked",
+		"EnemyId",
+		"DisplayName",
+		"Rarity",
+		"Mutation",
+		"Banked",
+		"LastOffline",
+		"ValuePerSecond",
+		"VpsMultiplier",
+	}
 	for _, attr in ipairs(watched) do
 		cage:GetAttributeChangedSignal(attr):Connect(function()
 			updateBillboard(cage)
@@ -3040,98 +3056,6 @@ ChatAnnouncement.OnClientEvent:Connect(function(msg: string)
 	systemMessage(msg, Color3.fromRGB(255, 230, 100)) -- gold/yellow
 end)
 
----
-
---- StarterGui.GUI.HUD.Cash.Amount.CashDisplayHandler (LocalScript) ---
---!strict
--- This script animates the cash display on the HUD.
--- Services
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
-
--- Modules & Player
-local player = Players.LocalPlayer
-local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
--- << ADDED >>
-local Events = ReplicatedStorage:WaitForChild("Events")
-local Functions = ReplicatedStorage:WaitForChild("Functions")
-local CashUpdated = Events:WaitForChild("CashUpdated")
-local GetPlayerCash = Functions:WaitForChild("GetPlayerCash")
-
--- UI Elements
-local playerGui = player:WaitForChild("PlayerGui")
-local amountLabel = playerGui:WaitForChild("GUI"):WaitForChild("HUD"):WaitForChild("Cash"):WaitForChild("Amount")
-
--- State
-local oldCashValue = 0
-local connection: RBXScriptConnection?
--- Smoothly animates the cash value counting up
-local function animateCashIncrease(startValue: number, endValue: number)
-	local duration = 0.5
-	local startTime = os.clock()
-	local delta = endValue - startValue
-
-	if connection then
-		connection:Disconnect()
-	end
-
-	-- Use Heartbeat for UI updates that are not tied to the camera
-	connection = RunService.Heartbeat:Connect(function()
-		local elapsed = os.clock() - startTime
-		local progress = math.min(elapsed / duration, 1)
-
-		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-		local current = math.floor(startValue + delta * alpha)
-
-		amountLabel.Text = NumberFormatter.formatNumber(current, "$")
-
-		if progress >= 1 then
-			amountLabel.Text = NumberFormatter.formatNumber(endValue, "$")
-			if connection then
-				connection:Disconnect()
-				connection = nil
-			end
-		end
-	end)
-end
-
--- ## MODIFIED ## This function now only updates the text, without the red color flash.
-local function animateCashDecrease(newValue: number)
-	amountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
-end
-
-
-local function onCashChanged(newValue: number)
-	if newValue > oldCashValue then
-		animateCashIncrease(oldCashValue, newValue)
-	elseif newValue < oldCashValue then
-		animateCashDecrease(newValue)
-	else
-		-- This case is for the initial setup
-		amountLabel.Text = NumberFormatter.formatNumber(newValue, "$")
-	end
-
-	oldCashValue = newValue
-end
-
--- Initialization: Connect to the server-driven CashUpdated event
-task.spawn(function()
-
-	CashUpdated.OnClientEvent:Connect(function(newValue: number)
-		onCashChanged(newValue)
-	end)
-
-	-- Request initial cash value from server
-	local success, initialCash = pcall(GetPlayerCash.InvokeServer, GetPlayerCash)
-	if success and typeof(initialCash) == "number" then
-		onCashChanged(initialCash)
-	else
-		warn("[CashDisplayHandler] Failed to get initial cash from server.")
-		onCashChanged(0)
-	end
-end)
 ---
 
 --- StarterGui.GUI.HUD.Top.Buttons.WaveButton.WaveButtonHandler (LocalScript) ---
@@ -3545,6 +3469,44 @@ end)
 
 ---
 
+--- StarterGui.GUI.HUD.Right.Buttons.Rebirth.RebirthBtnHandler (LocalScript) ---
+--!strict
+-- LocalScript inside the Rebirth button
+
+local Players = game:GetService("Players")
+
+local button = script.Parent :: TextButton
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Try to find the Rebirth frame anywhere under PlayerGui
+local rebirthFrame = playerGui:WaitForChild("ScreenGui"):WaitForChild("Rebirth")
+
+if not rebirthFrame then
+	warn("Rebirth frame not found under PlayerGui")
+	return
+end
+
+-- Optional: find the close (x) button inside the Rebirth frame
+local closeButton = rebirthFrame:FindFirstChild("xbutton", true) :: TextButton?
+
+-- Start closed
+rebirthFrame.Visible = false
+
+-- Open on click
+button.MouseButton1Click:Connect(function()
+	rebirthFrame.Visible = true
+end)
+
+-- Close on X click
+if closeButton then
+	closeButton.MouseButton1Click:Connect(function()
+		rebirthFrame.Visible = false
+	end)
+end
+
+---
+
 --- StarterGui.GUI.HUD.Bottom3.EnemyInventory.EnemyInvBtnHandler (LocalScript) ---
 --!strict
 -- EnemyInventoryBtnHandler
@@ -3597,6 +3559,224 @@ button.Activated:Connect(toggleEnemyInventory)
 FrameManager.onFrameClosed(function(frameName: string)
 	if frameName == "EnemyInventory" then
 		equipLastWeaponRequest:FireServer()
+	end
+end)
+
+---
+
+--- StarterGui.GUI.HUD.Counters.CashDisplayHandler (LocalScript) ---
+--!strict
+-- CashDisplayHandler (NEW)
+-- Handles:
+--  - Cash display animation
+--  - "+amount" popup when earning money
+--  - Counters.Money + Counters.FriendBoost
+--  - Friend invite button
+
+--// Services
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local SocialService     = game:GetService("SocialService")
+
+--// Player & Modules
+local player = Players.LocalPlayer
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+
+local Events    = ReplicatedStorage:WaitForChild("Events")
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local CashUpdated   = Events:WaitForChild("CashUpdated") :: RemoteEvent
+local GetPlayerCash = Functions:WaitForChild("GetPlayerCash") :: RemoteFunction
+
+--// UI references
+local playerGui   = player:WaitForChild("PlayerGui")
+local gui         = playerGui:WaitForChild("GUI")
+local hud         = gui:WaitForChild("HUD")
+
+local cashFrame   = hud:WaitForChild("Cash") :: Frame
+local amountLabel = cashFrame:WaitForChild("Amount") :: TextLabel
+local designFrame = cashFrame:WaitForChild("Design") :: Frame
+local plusButton  = designFrame:WaitForChild("PlusButton") :: ImageButton
+
+local countersFrame      = hud:WaitForChild("Counters") :: Frame
+local moneyCounterLabel  = countersFrame:WaitForChild("Money") :: TextLabel
+local friendBoostLabel   = countersFrame:WaitForChild("FriendBoost") :: TextLabel
+
+--// State
+local oldCashValue = 0
+local connection: RBXScriptConnection? = nil
+local currentFriendBoostPercent = 0
+
+--------------------------------------------------
+-- UI helpers
+--------------------------------------------------
+
+local function setCashText(value: number)
+	local formatted = NumberFormatter.formatNumber(value, "$")
+	amountLabel.Text = formatted
+	moneyCounterLabel.Text = formatted
+end
+
+local function updateFriendBoostLabel()
+	if currentFriendBoostPercent > 0 then
+		friendBoostLabel.Text = string.format("Friend boost: +%d%%", currentFriendBoostPercent)
+	else
+		friendBoostLabel.Text = "Invite friends: up to +30% cash"
+	end
+end
+
+--------------------------------------------------
+-- Friend boost calculation (client-side visual)
+--------------------------------------------------
+
+local function recalcFriendBoost()
+	local friendsInServer = 0
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local ok, isFriend = pcall(function()
+				return player:IsFriendsWith(plr.UserId)
+			end)
+
+			if ok and isFriend then
+				friendsInServer += 1
+			end
+		end
+	end
+
+	currentFriendBoostPercent = math.clamp(friendsInServer * 10, 0, 30)
+	updateFriendBoostLabel()
+end
+
+-- Initial calc + react to players joining/leaving
+recalcFriendBoost()
+Players.PlayerAdded:Connect(recalcFriendBoost)
+Players.PlayerRemoving:Connect(recalcFriendBoost)
+
+--------------------------------------------------
+-- Cash animations
+--------------------------------------------------
+
+-- Floating "+amount" popup when gaining money
+local function showGainPopup(delta: number)
+	if delta <= 0 then return end
+
+	-- Create a temporary label
+	local popup = Instance.new("TextLabel")
+	popup.BackgroundTransparency = 1
+	popup.BorderSizePixel = 0
+	popup.Font = amountLabel.Font
+	popup.TextScaled = true
+	popup.Text = "+" .. NumberFormatter.formatNumber(delta, "$")
+	popup.TextColor3 = Color3.fromRGB(80, 255, 80)
+	popup.TextStrokeTransparency = 0.3
+	popup.TextStrokeColor3 = Color3.new(0, 0, 0)
+
+	popup.Size = amountLabel.Size
+	popup.AnchorPoint = amountLabel.AnchorPoint
+	popup.Position = amountLabel.Position
+	popup.ZIndex = amountLabel.ZIndex + 1
+	popup.Parent = cashFrame
+
+	local tweenInfo = TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+	local goal = {
+		Position = popup.Position - UDim2.new(0, 0, 0.07, 0),
+		TextTransparency = 1,
+		TextStrokeTransparency = 1
+	}
+
+	local tween = TweenService:Create(popup, tweenInfo, goal)
+	tween:Play()
+	tween.Completed:Connect(function()
+		popup:Destroy()
+	end)
+end
+
+-- Smoothly animates the cash value counting up
+local function animateCashIncrease(startValue: number, endValue: number)
+	local duration = 0.5
+	local startTime = os.clock()
+	local delta = endValue - startValue
+
+	if connection then
+		connection:Disconnect()
+	end
+
+	connection = RunService.Heartbeat:Connect(function()
+		local elapsed = os.clock() - startTime
+		local progress = math.min(elapsed / duration, 1)
+		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		local current = math.floor(startValue + delta * alpha)
+
+		setCashText(current)
+
+		if progress >= 1 then
+			setCashText(endValue)
+			if connection then
+				connection:Disconnect()
+				connection = nil
+			end
+		end
+	end)
+end
+
+-- Just snap to the new value (for decreases or initial)
+local function animateCashDecrease(newValue: number)
+	setCashText(newValue)
+end
+
+local function onCashChanged(newValue: number)
+	if newValue > oldCashValue then
+		local diff = newValue - oldCashValue
+		showGainPopup(diff)
+		animateCashIncrease(oldCashValue, newValue)
+	elseif newValue < oldCashValue then
+		animateCashDecrease(newValue)
+	else
+		-- initial setup or no change
+		setCashText(newValue)
+	end
+
+	oldCashValue = newValue
+end
+
+--------------------------------------------------
+-- Friend invite button
+--------------------------------------------------
+
+plusButton.MouseButton1Click:Connect(function()
+	-- Try to open Roblox's native invite prompt
+	local ok, err = pcall(function()
+		SocialService:PromptGameInvite(player)
+	end)
+
+	if not ok then
+		warn("[CashDisplayHandler] Failed to prompt game invite:", err)
+	end
+end)
+
+--------------------------------------------------
+-- Init: hook CashUpdated + initial value
+--------------------------------------------------
+
+task.spawn(function()
+	-- Listen to server cash updates
+	CashUpdated.OnClientEvent:Connect(function(newValue: number)
+		onCashChanged(newValue)
+	end)
+
+	-- Request initial cash
+	local success, initialCash = pcall(function()
+		return GetPlayerCash:InvokeServer()
+	end)
+
+	if success and typeof(initialCash) == "number" then
+		onCashChanged(initialCash)
+	else
+		warn("[CashDisplayHandler] Failed to get initial cash from server.")
+		onCashChanged(0)
 	end
 end)
 
@@ -4519,13 +4699,19 @@ local EnemyConfigurations = require(Modules:WaitForChild("EnemyConfigurations"))
 
 local player = Players.LocalPlayer
 
-local inventoryFrame  = script.Parent :: Frame
-local scrollingFrame  = inventoryFrame:WaitForChild("ScrollingFrame") :: ScrollingFrame
+local inventoryFrame   = script.Parent :: Frame
+local scrollingFrame   = inventoryFrame:WaitForChild("ScrollingFrame") :: ScrollingFrame
 local autoSellSelector = inventoryFrame:WaitForChild("AutoSellSelector") :: Frame
-local autoSellButton  = inventoryFrame:WaitForChild("AutoSell") :: TextButton
+local autoSellButton   = inventoryFrame:WaitForChild("AutoSell") :: TextButton
 
 local templatesFolder = ReplicatedStorage:WaitForChild("Templates")
 local enemyTemplate   = templatesFolder:WaitForChild("EnemyInventoryTemplate") :: TextButton
+
+local eventsFolder              = ReplicatedStorage:WaitForChild("Events")
+local enemyInvUpdatedEvent      = eventsFolder:WaitForChild("EnemyInventoryUpdated") :: RemoteEvent
+local enemyAutoSellUpdatedEvent = eventsFolder:WaitForChild("EnemyAutoSellUpdated") :: RemoteEvent
+local setEnemyAutoSellEvent     = eventsFolder:WaitForChild("SetEnemyAutoSell") :: RemoteEvent
+local requestPlacementToolEvent = eventsFolder:WaitForChild("RequestEnemyPlacementTool") :: RemoteEvent
 
 local myEnemies: {[string]: number} = {}
 local autoSellState: {[string]: boolean} = {}
@@ -4546,7 +4732,7 @@ end
 
 local function clearList()
 	for _, child in ipairs(scrollingFrame:GetChildren()) do
-		if child:IsA("GuiObject") and child ~= enemyTemplate then
+		if child:IsA("GuiObject") then
 			child:Destroy()
 		end
 	end
@@ -4582,31 +4768,33 @@ local function getSortedEnemyIds(): {string}
 	return list
 end
 
-local eventsFolder               = ReplicatedStorage:WaitForChild("Events")
-local enemyInvUpdatedEvent       = eventsFolder:WaitForChild("EnemyInventoryUpdated") :: RemoteEvent
-local enemyAutoSellUpdated       = eventsFolder:WaitForChild("EnemyAutoSellUpdated") :: RemoteEvent
-local setEnemyAutoSellEvent      = eventsFolder:WaitForChild("SetEnemyAutoSell") :: RemoteEvent
-local requestPlacementToolEvent  = eventsFolder:WaitForChild("RequestEnemyPlacementTool") :: RemoteEvent
-
 local function redraw()
 	clearList()
 
 	local sortedIds = getSortedEnemyIds()
+
 	for _, enemyId in ipairs(sortedIds) do
 		local count = myEnemies[enemyId]
 		if count and count > 0 then
-			local cfg  = EnemyConfigurations[enemyId]
+			local cfg    = EnemyConfigurations[enemyId]
 			local rarity = cfg and cfg.Rarity
-			local vps   = (cfg and cfg.ValuePerSecond) or 0
+			local vps    = (cfg and cfg.ValuePerSecond) or 0
 
 			local item = enemyTemplate:Clone()
 			item.Name = enemyId
 			item.Visible = true
 
-			local nameLabel   = item:FindFirstChild("Name")
-			local countLabel  = item:FindFirstChild("Count")
-			local rarityLabel = item:FindFirstChild("Rarity")
-			local vpsLabel    = item:FindFirstChild("Vps")
+			-- template tree:
+			-- EnemyInventoryTemplate [TextButton]
+			--   Design [Frame]
+			--   Count [TextLabel]
+			--   Image [ImageLabel]
+			--   Ratio [UIAspectRatioConstraint]
+			--   Name [TextLabel]
+
+			local nameLabel  = item:FindFirstChild("Name")
+			local countLabel = item:FindFirstChild("Count")
+			local imageLabel = item:FindFirstChild("Image")
 
 			if nameLabel and nameLabel:IsA("TextLabel") then
 				nameLabel.Text = (cfg and cfg.DisplayName) or enemyId
@@ -4617,15 +4805,12 @@ local function redraw()
 				countLabel.Text = "x" .. tostring(count)
 			end
 
-			if rarityLabel and rarityLabel:IsA("TextLabel") then
-				local rarityText = typeof(rarity) == "string" and rarity or ""
-				rarityLabel.Text = rarityText
-				rarityLabel.TextColor3 = getRarityColor(rarity)
+			if imageLabel and imageLabel:IsA("ImageLabel") and cfg and cfg.ImageId then
+				imageLabel.Image = cfg.ImageId
 			end
 
-			if vpsLabel and vpsLabel:IsA("TextLabel") then
-				vpsLabel.Text = string.format("%d/s", vps)
-			end
+			-- If you later add Rarity / Vps labels to the template, you can find
+			-- them here and set text, but for now we only have Name / Count / Image.
 
 			-- click = ask server to give placement tool for that enemy
 			item.Activated:Connect(function()
@@ -4651,29 +4836,44 @@ local function syncAutoSellButtons()
 	end
 end
 
+--------------------------------------------------
+-- REMOTE LISTENERS
+--------------------------------------------------
+
 enemyInvUpdatedEvent.OnClientEvent:Connect(function(data: {[string]: number}?)
+	-- update local data and ALWAYS redraw
 	myEnemies = data or {}
-	if inventoryFrame.Visible then
-		redraw()
-	end
+	redraw()
 end)
 
-enemyAutoSellUpdated.OnClientEvent:Connect(function(data: {[string]: boolean}?)
+enemyAutoSellUpdatedEvent.OnClientEvent:Connect(function(data: {[string]: boolean}?)
 	autoSellState = data or {}
 	syncAutoSellButtons()
 end)
 
+--------------------------------------------------
+-- VISIBILITY CHANGE
+--------------------------------------------------
+
 inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
 	if inventoryFrame.Visible then
+		-- frame just opened -> redraw with latest myEnemies + auto-sell visuals
 		redraw()
 		syncAutoSellButtons()
 	end
 end)
 
+--------------------------------------------------
+-- INITIAL FETCH FROM SERVER
+--------------------------------------------------
+
 task.spawn(function()
 	local functionsFolder = ReplicatedStorage:WaitForChild("Functions")
 	local fn = functionsFolder:FindFirstChild("GetEnemyInventory") :: RemoteFunction?
-	if not fn then return end
+	if not fn then
+		warn("[EnemyInventoryHandler] GetEnemyInventory not found")
+		return
+	end
 
 	local ok, result = pcall(function()
 		return fn:InvokeServer()
@@ -4681,11 +4881,15 @@ task.spawn(function()
 
 	if ok and typeof(result) == "table" then
 		myEnemies = result :: {[string]: number}
-		if inventoryFrame.Visible then
-			redraw()
-		end
+		redraw()
+	else
+		warn("[EnemyInventoryHandler] GetEnemyInventory failed:", result)
 	end
 end)
+
+--------------------------------------------------
+-- UI INTERACTIONS
+--------------------------------------------------
 
 autoSellButton.Activated:Connect(function()
 	autoSellSelector.Visible = not autoSellSelector.Visible
@@ -5651,7 +5855,7 @@ end)
 --- StarterGui.ScreenGui.Rebirth.RebirthHandler (LocalScript) ---
 --!strict
 
-local Players          = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
@@ -5659,27 +5863,37 @@ local player = Players.LocalPlayer
 local rebirthFrame = script.Parent :: Frame
 local container    = rebirthFrame:WaitForChild("Container") :: Frame
 
-local unlockHolder = container:WaitForChild("Frame"):WaitForChild("Unlock") :: Frame
+-- TOP "You Will Unlock"
+local unlockHolder   = container:WaitForChild("Frame"):WaitForChild("Unlock") :: Frame
 local unlockTemplate = unlockHolder:WaitForChild("Template") :: Frame
 
-local requirementsFrame = container:WaitForChild("Requirements") :: Frame
-local bar               = requirementsFrame:WaitForChild("Bar") :: Frame
-local canvasGroup       = bar:WaitForChild("CanvasGroup") :: CanvasGroup
-local barFill           = canvasGroup:WaitForChild("Frame") :: Frame
-local barText           = bar:WaitForChild("TextLabel") :: TextLabel
+-- BOTTOM "Requirements"
+local requirementsFrame   = container:WaitForChild("Requirements") :: Frame
+local reqUnlockHolder     = requirementsFrame:WaitForChild("Unlock") :: Frame
+local reqTemplate         = reqUnlockHolder:WaitForChild("Template") :: Frame
 
-local rebirthButton     = container:WaitForChild("Rebirth") :: TextButton
+-- Progress bar inside Requirements
+local bar         = requirementsFrame:WaitForChild("Bar") :: Frame
+local canvasGroup = bar:WaitForChild("CanvasGroup") :: CanvasGroup
+local barFill     = canvasGroup:WaitForChild("Frame") :: Frame
+local barText     = canvasGroup:WaitForChild("TextLabel") :: TextLabel
 
-local Modules           = ReplicatedStorage:WaitForChild("Modules")
-local NumberFormatter   = require(Modules:WaitForChild("NumberFormatter"))
+local rebirthButton = container:WaitForChild("Rebirth") :: TextButton
 
-local Functions         = ReplicatedStorage:WaitForChild("Functions")
-local GetRebirthState   = Functions:WaitForChild("GetRebirthState") :: RemoteFunction
+local Modules         = ReplicatedStorage:WaitForChild("Modules")
+local NumberFormatter = require(Modules:WaitForChild("NumberFormatter"))
 
-local Events            = ReplicatedStorage:WaitForChild("Events")
-local RebirthRequested  = Events:WaitForChild("RebirthRequested") :: RemoteEvent
+local Functions       = ReplicatedStorage:WaitForChild("Functions")
+local GetRebirthState = Functions:WaitForChild("GetRebirthState") :: RemoteFunction
 
-type RebirthState = {
+local Events          = ReplicatedStorage:WaitForChild("Events")
+local RebirthRequested = Events:WaitForChild("RebirthRequested") :: RemoteEvent
+
+-- Icons
+local CASH_ICON = "rbxassetid://80550982841733"
+local LUCK_ICON = "rbxassetid://74485910606028"
+
+export type RebirthState = {
 	CurrentRebirth: number,
 	MaxRebirth: number,
 	Cash: number,
@@ -5698,25 +5912,52 @@ type RebirthState = {
 
 local currentState: RebirthState? = nil
 
-local function clearUnlockList()
-	for _, child in ipairs(unlockHolder:GetChildren()) do
-		if child:IsA("Frame") and child ~= unlockTemplate then
+-- utils --------------------------------------------------------------------
+
+local function clearList(holder: Frame, template: Frame)
+	for _, child in ipairs(holder:GetChildren()) do
+		if child:IsA("Frame") and child ~= template then
 			child:Destroy()
 		end
 	end
 end
 
+local function setTemplateCommon(
+	clone: Frame,
+	titleText: string,
+	amountText: string,
+	iconImage: string?
+)
+	local itemTitle   = clone:FindFirstChild("ItemTitle") :: TextLabel?
+	local amountLabel = clone:FindFirstChild("AmountLabel") :: TextLabel?
+	local itemImage   = (clone:FindFirstChild("ItemLabel") or clone:FindFirstChild("Item")) :: ImageLabel?
+
+	if itemTitle then
+		itemTitle.Text = titleText
+	end
+	if amountLabel then
+		amountLabel.Text = amountText
+	end
+	if itemImage and iconImage then
+		itemImage.Image = iconImage
+	end
+end
+
+-- top “You Will Unlock” cards ----------------------------------------------
+
 local function populateUnlocks(nextCfg: any, nextIndex: number)
-	clearUnlockList()
+	clearList(unlockHolder, unlockTemplate)
 	unlockTemplate.Visible = false
 	if not nextCfg then return end
 
-	local rewards = {}
+	type Reward = { Title: string, Amount: string, Icon: string? }
+	local rewards: {Reward} = {}
 
 	if (nextCfg.MoneyBonusPercent or 0) > 0 then
 		table.insert(rewards, {
 			Title  = "Money Boost",
 			Amount = ("+%d%% Money"):format(nextCfg.MoneyBonusPercent),
+			Icon   = CASH_ICON,
 		})
 	end
 
@@ -5724,6 +5965,7 @@ local function populateUnlocks(nextCfg: any, nextIndex: number)
 		table.insert(rewards, {
 			Title  = "Luck Boost",
 			Amount = ("+%d%% Luck"):format(nextCfg.LuckBonusPercent),
+			Icon   = LUCK_ICON,
 		})
 	end
 
@@ -5732,6 +5974,7 @@ local function populateUnlocks(nextCfg: any, nextIndex: number)
 			table.insert(rewards, {
 				Title  = ("Cage %d"):format(cageIdx),
 				Amount = "Unlocked",
+				Icon   = CASH_ICON, -- or some “cage” icon if you make one later
 			})
 		end
 	end
@@ -5741,20 +5984,38 @@ local function populateUnlocks(nextCfg: any, nextIndex: number)
 		clone.Visible = true
 		clone.Name = "Reward"
 
-		local itemTitle   = clone:FindFirstChild("ItemTitle") :: TextLabel?
-			or clone:FindFirstChild("ItemLabel") :: TextLabel?
-		local amountLabel = clone:FindFirstChild("AmountLabel") :: TextLabel?
-
-		if itemTitle then
-			itemTitle.Text = r.Title
-		end
-		if amountLabel then
-			amountLabel.Text = r.Amount
-		end
+		setTemplateCommon(clone, r.Title, r.Amount, r.Icon)
 
 		clone.Parent = unlockHolder
 	end
 end
+
+-- bottom “Requirements” cards ---------------------------------------------
+
+local function populateRequirements(state: RebirthState?)
+	clearList(reqUnlockHolder, reqTemplate)
+	reqTemplate.Visible = false
+
+	if not state then return end
+
+	local requiredCash = state.RequiredCash or 0
+	if requiredCash <= 0 then
+		return
+	end
+
+	local clone = reqTemplate:Clone()
+	clone.Visible = true
+	clone.Name = "Requirement"
+
+	local amountText = ("$%s")
+		:format(NumberFormatter.formatNumber(requiredCash))
+
+	setTemplateCommon(clone, "Cash", amountText, CASH_ICON)
+
+	clone.Parent = reqUnlockHolder
+end
+
+-- main refresh -------------------------------------------------------------
 
 local function refreshUI()
 	local state = GetRebirthState:InvokeServer() :: RebirthState?
@@ -5763,24 +6024,26 @@ local function refreshUI()
 	if not state then
 		barFill.Size = UDim2.new(0, 0, 1, 0)
 		barText.Text = "$0/0"
-		clearUnlockList()
+		clearList(unlockHolder, unlockTemplate)
+		clearList(reqUnlockHolder, reqTemplate)
 		rebirthButton.AutoButtonColor = false
 		rebirthButton.Active = false
 		return
 	end
 
-	local cash       = state.Cash or 0
-	local required   = state.RequiredCash or 0
-	local frac       = 0
+	local cash     = state.Cash or 0
+	local required = state.RequiredCash or 0
+	local frac     = 0
 	if required > 0 then
 		frac = math.clamp(cash / required, 0, 1)
 	end
 
 	barFill.Size = UDim2.new(frac, 0, 1, 0)
-	barText.Text = ("$%s/%s")
+	barText.Text = ("$%s / %s")
 		:format(NumberFormatter.formatNumber(cash), NumberFormatter.formatNumber(required))
 
 	populateUnlocks(state.NextConfig, state.NextIndex)
+	populateRequirements(state)
 
 	if state.CanRebirth then
 		rebirthButton.AutoButtonColor = true
@@ -5790,6 +6053,8 @@ local function refreshUI()
 		rebirthButton.Active = false
 	end
 end
+
+-- events -------------------------------------------------------------------
 
 rebirthButton.MouseButton1Click:Connect(function()
 	if not currentState or not currentState.CanRebirth then return end

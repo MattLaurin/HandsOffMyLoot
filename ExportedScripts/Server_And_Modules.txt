@@ -2729,6 +2729,7 @@ local MarketplaceService = game:GetService("MarketplaceService")
 
 local ProfileService = require(ServerScriptService.Modules:WaitForChild("ProfileService"))
 local BadgeController = require(game.ServerScriptService.Controllers:WaitForChild("BadgeController"))
+local EnemyConfigurations = require(ReplicatedStorage.Modules:WaitForChild("EnemyConfigurations"))
 
 local PlayerController = {}
 
@@ -2809,6 +2810,11 @@ local ProfileTemplate = {
 		streak = 0,
 		lastClaimAt = 0,
 	},
+
+	-- Rebirth system
+	Rebirths = 0,
+	RebirthMoneyMultiplier = 1,
+	RebirthLuckMultiplier = 1,
 }
 
 local GameProfileStore = ProfileService.New("LiveData", ProfileTemplate)
@@ -2887,7 +2893,7 @@ local function ensureEvents()
 
 	ensureRemoteEvent("GuardsInventoryUpdated", events)
 
-	-- Enemy inventory + lasso (lasso events can stay even if unused)
+	-- Enemy inventory + lasso
 	ensureRemoteEvent("EnemyInventoryUpdated", events)
 	ensureRemoteEvent("LassoCaptureRequest", events)
 	ensureRemoteEvent("LassoSceneStarted", events)
@@ -2948,10 +2954,10 @@ local function onPlayerAdded(player: Player)
 	leaderstats.Name = "leaderstats"
 	leaderstats.Parent = player
 
-	local cash = Instance.new("IntValue")
-	cash.Name = "Cash"
-	cash.Value = profile.Data.Cash
-	cash.Parent = leaderstats
+	local cashVal = Instance.new("IntValue")
+	cashVal.Name = "Cash"
+	cashVal.Value = profile.Data.Cash
+	cashVal.Parent = leaderstats
 
 	local highestWave = Instance.new("IntValue")
 	highestWave.Name = "Highest Wave"
@@ -2973,6 +2979,7 @@ local function onPlayerAdded(player: Player)
 		player:SetAttribute("LastEquippedWeapon", profile.Data.LastEquippedWeapon)
 	end
 
+	-- settings
 	do
 		local s = profile.Data.Settings or {}
 		local ws = (typeof(s.WeaponSounds) == "boolean") and s.WeaponSounds or true
@@ -2985,7 +2992,7 @@ local function onPlayerAdded(player: Player)
 		BadgeController.SyncFor(player, profile.Data)
 	end
 
-	-- initial syncs
+	-- inventory sync
 	local wEv = _remotes["WeaponInventoryUpdated"]
 	if wEv and wEv:IsA("RemoteEvent") then
 		(wEv :: RemoteEvent):FireClient(player, profile.Data.WeaponInventory)
@@ -3082,7 +3089,11 @@ function PlayerController.AddCash(player: Player, amount: number)
 	amount = tonumber(amount) or 0
 	if not profile or amount <= 0 then return end
 
-	local newCash = (profile.Data.Cash or 0) + amount
+	-- Apply rebirth money multiplier globally
+	local mult = profile.Data.RebirthMoneyMultiplier or 1
+	local final = amount * mult
+
+	local newCash = (profile.Data.Cash or 0) + final
 	profile.Data.Cash = newCash
 	profile:Save()
 
@@ -3139,6 +3150,7 @@ function PlayerController.AddCapturedEnemy(player: Player, enemyId: string)
 	local inv = profile.Data.EnemyInventory or {}
 	inv[enemyId] = (inv[enemyId] or 0) + 1
 	profile.Data.EnemyInventory = inv
+	profile:Save()
 
 	local ev = _remotes["EnemyInventoryUpdated"]
 	if ev and ev:IsA("RemoteEvent") then
@@ -3158,6 +3170,7 @@ function PlayerController.TryConsumeEnemy(player: Player, enemyId: string): bool
 
 	inv[enemyId] = current - 1
 	profile.Data.EnemyInventory = inv
+	profile:Save()
 
 	local ev = _remotes["EnemyInventoryUpdated"]
 	if ev and ev:IsA("RemoteEvent") then
@@ -3168,7 +3181,33 @@ function PlayerController.TryConsumeEnemy(player: Player, enemyId: string): bool
 end
 
 --------------------------
--- GEMSTONE FUNCTIONS (unchanged for now)
+-- KILL HANDLING – ALWAYS CAPTURE
+--------------------------
+
+function PlayerController.HandleEnemyKill(player: Player, enemyId: string, killMult: number?)
+	if not enemyId or enemyId == "" then return end
+
+	local profile = PlayerController:GetProfile(player)
+	if not profile then return end
+
+	killMult = killMult or 1
+
+	local conf = EnemyConfigurations[enemyId]
+
+	-- Cash for kill if configured
+	if conf then
+		local baseReward = conf.KillCash or 0
+		if baseReward > 0 then
+			PlayerController.AddCash(player, baseReward * killMult)
+		end
+	end
+
+	-- 🔥 Always capture enemy
+	PlayerController.AddCapturedEnemy(player, enemyId)
+end
+
+--------------------------
+-- GEMSTONE FUNCTIONS
 --------------------------
 
 function PlayerController.AddGems(player: Player, amount: number)
@@ -3839,9 +3878,10 @@ return PlacementController
 
 --- ServerScriptService.Controllers.WaveController (ModuleScript) ---
 --!strict
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
-local Players = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local Workspace           = game:GetService("Workspace")
+local Players             = game:GetService("Players")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local PlayerController
 local TurretController
@@ -3849,10 +3889,13 @@ local PlacementController
 local WeaponController
 local PlotController
 
-local WaveConfigurations = require(ReplicatedStorage.Modules.WaveConfigurations)
-local ItemConfigurations = require(ReplicatedStorage.Modules.ItemConfigurations)
-local EnemyConfigurations = require(ReplicatedStorage.Modules.EnemyConfigurations)
-local ModelProgression = require(ReplicatedStorage.Modules.ModelProgression)
+local WaveConfigurations     = require(ReplicatedStorage.Modules.WaveConfigurations)
+local ItemConfigurations     = require(ReplicatedStorage.Modules.ItemConfigurations)
+local EnemyConfigurations    = require(ReplicatedStorage.Modules.EnemyConfigurations)
+local ModelProgression       = require(ReplicatedStorage.Modules.ModelProgression)
+local MutationConfigurations = require(ReplicatedStorage.Modules.MutationConfigurations)
+
+local LuckHelper = require(ReplicatedStorage.Modules:WaitForChild("LuckHelper"))
 
 local INTERMISSION_TIME = 1
 local NO_ACTIVITY_TIMEOUT = 40
@@ -3878,14 +3921,30 @@ local activeEnemiesFolder = Workspace:FindFirstChild("ActiveEnemies") or Instanc
 activeEnemiesFolder.Name = "ActiveEnemies"
 activeEnemiesFolder.Parent = Workspace
 
-local function isMilestoneWave(n: number): boolean
-	return n % 15 == 0
+-- all mutation ids except "None"
+local ENEMY_MUTATIONS: {string} = {}
+for id, _ in pairs(MutationConfigurations) do
+	if id ~= "None" then
+		table.insert(ENEMY_MUTATIONS, id)
+	end
+end
+
+local function rollEnemyMutationId(player: Player): string?
+	if #ENEMY_MUTATIONS == 0 then return nil end
+
+	local BASE_CHANCE = 0.02
+	if not LuckHelper.Roll(player, BASE_CHANCE) then
+		return nil
+	end
+
+	local idx = RNG:NextInteger(1, #ENEMY_MUTATIONS)
+	return ENEMY_MUTATIONS[idx]
 end
 
 local function getPlotForPlayer(player: Player): Model?
 	local plotNum = player:GetAttribute("PlotNumber")
 	if plotNum then
-		local plot = Workspace.Plots:FindFirstChild("Plot"..tostring(plotNum))
+		local plot = Workspace.Plots:FindFirstChild("Plot" .. tostring(plotNum))
 		if plot and plot:IsA("Model") then return plot end
 	end
 	for _, plot in ipairs(Workspace.Plots:GetChildren()) do
@@ -3898,7 +3957,7 @@ end
 
 local function getRandomSpawnCFrame(spawnPart: BasePart): CFrame
 	local s = spawnPart.Size
-	return spawnPart.CFrame * CFrame.new((RNG:NextNumber()-0.5)*s.X, s.Y/2+3, (RNG:NextNumber()-0.5)*s.Z)
+	return spawnPart.CFrame * CFrame.new((RNG:NextNumber() - 0.5) * s.X, s.Y / 2 + 3, (RNG:NextNumber() - 0.5) * s.Z)
 end
 
 local function getWaveSpeed(state): number
@@ -3916,6 +3975,40 @@ function WaveController:IsPlayerFighting(player: Player): boolean
 	return _plotStates[plot].IsActive
 end
 
+-- 500 kills => 90%, +1% per 25 kills (600=94%, 700=98%, 750=100%)
+local function computeBossWaveChance(killsSinceLastBoss: number): number
+	if killsSinceLastBoss < 500 then
+		return 0
+	end
+	local extra = killsSinceLastBoss - 500
+	local steps = math.floor(extra / 25)
+	local chance = 0.90 + steps * 0.01
+	if chance > 1 then chance = 1 end
+	return chance
+end
+
+-- weighted pick for rarity map { [rarity] = weight }
+local function pickRarity(weights: {[string]: number}): string
+	local total = 0
+	for _, w in pairs(weights) do
+		total += w
+	end
+	if total <= 0 then
+		return "Common"
+	end
+
+	local r = RNG:NextNumber() * total
+	local acc = 0
+	for rarity, w in pairs(weights) do
+		acc += w
+		if r <= acc then
+			return rarity
+		end
+	end
+
+	return "Common"
+end
+
 local startNextWave
 local stopFight
 local startFight
@@ -3926,14 +4019,39 @@ startNextWave = function(player: Player, plot: Model)
 	state.IsStartingNextWave = false
 
 	local profile = PlayerController:GetProfile(player)
-	if not profile then stopFight(plot, "manual") return end
+	if not profile then
+		stopFight(plot, "manual")
+		return
+	end
+
 	state.CurrentWave += 1
 
-	local waveConfig = WaveConfigurations.ResolveWave(state.CurrentWave)
-	if not waveConfig then stopFight(plot, "win") return end
+	-- boss wave based on kills since last boss
+	profile.Data.KillsSinceLastBoss = profile.Data.KillsSinceLastBoss or 0
+	local killsSince = profile.Data.KillsSinceLastBoss
+	local isBossWave = false
 
+	local chance = computeBossWaveChance(killsSince)
+	if chance > 0 and math.random() < chance then
+		isBossWave = true
+		profile.Data.KillsSinceLastBoss = 0
+	end
+
+	local waveConfig
+	if isBossWave then
+		waveConfig = WaveConfigurations.ResolveBossWave(state.CurrentWave)
+	else
+		waveConfig = WaveConfigurations.ResolveWave(state.CurrentWave)
+	end
+	if not waveConfig then
+		stopFight(plot, "win")
+		return
+	end
+
+	-- highest wave / model progression
 	if state.CurrentWave > profile.Data.HighestWave then
 		profile.Data.HighestWave = state.CurrentWave
+
 		local ls = player:FindFirstChild("leaderstats")
 		local hw = ls and ls:FindFirstChild("Highest Wave")
 		if hw then hw.Value = state.CurrentWave end
@@ -3947,31 +4065,60 @@ startNextWave = function(player: Player, plot: Model)
 		end
 	end
 
+	-- totals / UI
 	local total = 0
-	for _, g in ipairs(waveConfig.Enemies) do total += g.Count end
+	for _, g in ipairs(waveConfig.Enemies) do
+		total += g.Count
+	end
+
 	state.EnemiesKilledInWave = 0
 	state.TotalEnemiesInWave = total
-	ReplicatedStorage.Events.WaveUIStateChanged:FireClient(player, true, state.CurrentWave, total, waveConfig.IsBossWave)
+
+	ReplicatedStorage.Events.WaveUIStateChanged:FireClient(
+		player,
+		true,
+		state.CurrentWave,
+		total,
+		waveConfig.IsBossWave
+	)
 
 	local spawnPart = plot:FindFirstChild("EnemySpawn")
 	if not spawnPart then return end
 
-	local BASE_TARGET_CONCURRENT = waveConfig.TargetConcurrent or (waveConfig.IsBossWave and 1 or 6)
-	local MIN_TICK = 0.08
+	-- 🔥 MUCH HIGHER CONCURRENCY, scales with wave
+	local BASE_TARGET_CONCURRENT = waveConfig.TargetConcurrent
+	if not BASE_TARGET_CONCURRENT then
+		if waveConfig.IsBossWave then
+			BASE_TARGET_CONCURRENT = 1
+		else
+			-- start at 12, +4 every 40 waves, capped at 40
+			local base = 12
+			local extra = math.floor(state.CurrentWave / 40)
+			BASE_TARGET_CONCURRENT = math.clamp(base + extra * 4, 12, 40)
+		end
+	end
 
+	-- smaller tick so we can fill waves quickly
+	local MIN_TICK = 0.03
+
+	-- build spawn groups – IGNORE big DelayBetweenSpawns, use a tiny fixed gap
 	local groups = {}
+	local FIXED_GAP = 0.12 -- seconds between spawns for a given group (before wave speed)
+
 	for _, g in ipairs(waveConfig.Enemies) do
 		table.insert(groups, {
 			Enemy = g.Enemy,
 			Remaining = g.Count or 0,
-			MinGap = (g.DelayBetweenSpawns or 0),
+			MinGap = FIXED_GAP,
 			_LastSpawnT = 0,
 		})
 	end
 
 	local function totalRemaining(): number
 		local t = 0
-		for _, gg in ipairs(groups) do t += gg.Remaining end
+		for _, gg in ipairs(groups) do
+			t += gg.Remaining
+		end
 		return t
 	end
 
@@ -3982,7 +4129,7 @@ startNextWave = function(player: Player, plot: Model)
 			local idx = ((rrIndex + i - 2) % n) + 1
 			local g = groups[idx]
 			if g.Remaining > 0 then
-				local gap = (g.MinGap or 0)
+				local gap = g.MinGap or 0
 				local okByGap = (gap == 0) or (now - g._LastSpawnT) >= (gap / speed)
 				if okByGap then
 					rrIndex = idx + 1
@@ -3998,24 +4145,82 @@ startNextWave = function(player: Player, plot: Model)
 		lastActivityT = os.clock()
 	end
 
-	local function spawnOne(fromGroup)
-		local template = ReplicatedStorage.Enemies:FindFirstChild(fromGroup.Enemy)
-		if not template then return end
+	-- rarity weights for this wave + player rebirths
+	local rebirths = profile.Data.Rebirths or 0
+	local rarityWeightsForWave = WaveConfigurations.GetRarityWeights(state.CurrentWave, rebirths)
 
-		local enemy = template:Clone()
+	local enemiesFolder = ReplicatedStorage:WaitForChild("Enemies")
+	local mutationsFolder = enemiesFolder:FindFirstChild("Mutations")
+
+	local function spawnOne(fromGroup)
+		local baseTemplate = enemiesFolder:FindFirstChild(fromGroup.Enemy) :: Model?
+		if not baseTemplate then return end
+
+		-- mutation roll
+		local mutationId: string? = nil
+		local mutationMult = 1
+		if not waveConfig.IsBossWave then
+			mutationId = rollEnemyMutationId(player)
+			if mutationId then
+				local mCfg = MutationConfigurations[mutationId]
+				mutationMult = (mCfg and mCfg.Multiplier) or 1.5
+			end
+		end
+
+		-- choose mutated visual if present
+		local templateToUse: Model? = baseTemplate
+		if mutationId and mutationsFolder then
+			local byMutation = mutationsFolder:FindFirstChild(mutationId)
+			if byMutation then
+				local mutated = byMutation:FindFirstChild(fromGroup.Enemy)
+				if mutated and mutated:IsA("Model") then
+					templateToUse = mutated
+				end
+			end
+		end
+		if not templateToUse then return end
+
+		local enemy = templateToUse:Clone()
 		local hum = enemy:WaitForChild("Humanoid")
 
+		-- rarity
+		local spawnRarity = pickRarity(rarityWeightsForWave)
+		enemy:SetAttribute("Rarity", spawnRarity)
+
+		-- mutation attrs
+		if waveConfig.IsBossWave then
+			enemy:SetAttribute("Mutation", "")
+			enemy:SetAttribute("KillCashMultiplier", 1)
+		else
+			if mutationId then
+				enemy:SetAttribute("Mutation", mutationId)
+				enemy:SetAttribute("KillCashMultiplier", mutationMult)
+			else
+				enemy:SetAttribute("Mutation", "")
+				enemy:SetAttribute("KillCashMultiplier", 1)
+			end
+		end
+
+		-- health
 		local conf = EnemyConfigurations[enemy.Name]
-		local base = (conf and conf.MaxHealth) or hum.MaxHealth
-		local mult = waveConfig.HealthMultiplier or 1
-		local maxHp = math.max(1, math.floor(base * mult))
+		local baseHealth = (conf and conf.MaxHealth) or hum.MaxHealth
+		local waveHealthMult = waveConfig.HealthMultiplier or 1
+		local maxHp = math.max(1, math.floor(baseHealth * waveHealthMult * mutationMult))
 		hum.MaxHealth, hum.Health = maxHp, maxHp
 
+		-- 🔵 SLOW THEM DOWN so we can have many at once
+		local baseSpeed = hum.WalkSpeed
+		hum.WalkSpeed = math.max(6, baseSpeed * 0.65)
+
 		if waveConfig.IsBossWave then
-			hum.MaxSlopeAngle, hum.AutoJumpEnabled, hum.JumpPower = 0, false, 0
+			hum.MaxSlopeAngle = 0
+			hum.AutoJumpEnabled = false
+			hum.JumpPower = 0
 		end
-		if waveConfig.DamageMultiplier then
-			enemy:SetAttribute("DamageMultiplier", waveConfig.DamageMultiplier)
+
+		local damageMult = (waveConfig.DamageMultiplier or 1) * mutationMult
+		if damageMult ~= 1 then
+			enemy:SetAttribute("DamageMultiplier", damageMult)
 		end
 
 		local goal = Instance.new("ObjectValue")
@@ -4029,13 +4234,17 @@ startNextWave = function(player: Player, plot: Model)
 		owner.Parent = enemy
 
 		for _, d in ipairs(enemy:GetDescendants()) do
-			if d:IsA("BasePart") then d.CollisionGroup = "Zombies" end
+			if d:IsA("BasePart") then
+				d.CollisionGroup = "Zombies"
+			end
 		end
 
 		enemy:SetPrimaryPartCFrame(getRandomSpawnCFrame(spawnPart))
 		enemy.Parent = activeEnemiesFolder
 		local root = enemy:FindFirstChild("HumanoidRootPart")
-		if root then root:SetNetworkOwner(nil) end
+		if root then
+			root:SetNetworkOwner(nil)
+		end
 
 		if waveConfig.IsBossWave then
 			ReplicatedStorage.Events.BossWaveStarted:FireClient(player, hum, waveConfig.BossImageId)
@@ -4051,14 +4260,32 @@ startNextWave = function(player: Player, plot: Model)
 			state.EnemiesKilledInWave += 1
 			markActivity()
 
-			if conf then
-				PlayerController.HandleEnemyKill(player, enemy.Name, waveConfig.KillCashMultiplier)
+			local profileNow = PlayerController:GetProfile(player)
+			if profileNow then
+				profileNow.Data.KillsSinceLastBoss = (profileNow.Data.KillsSinceLastBoss or 0) + 1
 			end
 
-			ReplicatedStorage.Events.ZombieKilled:FireClient(player, state.EnemiesKilledInWave, state.CurrentWave)
+			local confNow = EnemyConfigurations[enemy.Name]
+			if confNow then
+				local killMult = waveConfig.KillCashMultiplier
+				local extraMult = enemy:GetAttribute("KillCashMultiplier") :: number?
+				if extraMult and extraMult ~= 1 then
+					killMult = (killMult or 1) * extraMult
+				end
+				PlayerController.HandleEnemyKill(player, enemy.Name, killMult)
+			end
+
+			ReplicatedStorage.Events.ZombieKilled:FireClient(
+				player,
+				state.EnemiesKilledInWave,
+				state.CurrentWave
+			)
 			enemy:Destroy()
 
-			if state.EnemiesKilledInWave >= state.TotalEnemiesInWave and state.IsActive and not state.IsStartingNextWave then
+			if state.EnemiesKilledInWave >= state.TotalEnemiesInWave
+				and state.IsActive
+				and not state.IsStartingNextWave
+			then
 				state.IsStartingNextWave = true
 				task.spawn(function()
 					if waveConfig.IsBossWave then
@@ -4070,40 +4297,35 @@ startNextWave = function(player: Player, plot: Model)
 						local cash = ls and ls:FindFirstChild("Cash")
 						if cash then
 							cash.Value += waveConfig.CashReward
-							ReplicatedStorage.Events.ShowNotification:FireClient(player, ("+%d Cash"):format(waveConfig.CashReward), "Success")
-						end
-					end
-
-					if waveConfig.IsBossWave and isMilestoneWave(state.CurrentWave) then
-						local currentSaved = tonumber(profile.Data.StartingWave) or 1
-						local nextStart = state.CurrentWave + 1
-						if nextStart > currentSaved then
-							profile.Data.StartingWave = nextStart
-
-							local upd = ReplicatedStorage.Events:FindFirstChild("StartingWaveUpdated") :: RemoteEvent?
-							if upd then upd:FireClient(player, nextStart) end
-
-							local notify = ReplicatedStorage.Events:FindFirstChild("ShowNotification") :: RemoteEvent?
-							if notify then
-								notify:FireClient(player, ("Checkpoint unlocked! Start at Wave %d."):format(nextStart), "Success")
-							end
+							ReplicatedStorage.Events.ShowNotification:FireClient(
+								player,
+								("+" .. tostring(waveConfig.CashReward) .. " Cash"),
+								"Success"
+							)
 						end
 					end
 
 					local speedNow = getWaveSpeed(state)
 					local pause = (speedNow >= 2) and 0 or (INTERMISSION_TIME / speedNow)
-					if pause > 0 then task.wait(pause) end
-					if state.IsActive then startNextWave(player, plot) end
+					if pause > 0 then
+						task.wait(pause)
+					end
+					if state.IsActive then
+						startNextWave(player, plot)
+					end
 				end)
 			end
 		end)
 	end
 
+	-- spawn loop – fills up to desired concurrently, but with small gaps
 	task.spawn(function()
 		while state.IsActive and totalRemaining() > 0 do
 			local speed = getWaveSpeed(state)
 			local desired = math.max(1, math.floor(BASE_TARGET_CONCURRENT * speed))
-			if waveConfig.IsBossWave then desired = 1 end
+			if waveConfig.IsBossWave then
+				desired = 1
+			end
 
 			if state.AliveEnemies < desired then
 				local deficit = math.min(desired - state.AliveEnemies, totalRemaining())
@@ -4122,6 +4344,7 @@ startNextWave = function(player: Player, plot: Model)
 		end
 	end)
 
+	-- AFK timeout (unchanged)
 	task.spawn(function()
 		while state.IsActive and totalRemaining() > 0 do
 			if not waveConfig.IsBossWave then
@@ -4150,14 +4373,22 @@ startNextWave = function(player: Player, plot: Model)
 							local cash = ls and ls:FindFirstChild("Cash")
 							if cash then
 								cash.Value += waveConfig.CashReward
-								ReplicatedStorage.Events.ShowNotification:FireClient(player, ("+%d Cash"):format(waveConfig.CashReward), "Success")
+								ReplicatedStorage.Events.ShowNotification:FireClient(
+									player,
+									("+" .. tostring(waveConfig.CashReward) .. " Cash"),
+									"Success"
+								)
 							end
 						end
 
 						local speedNow = getWaveSpeed(state)
 						local pause = (speedNow >= 2) and 0 or (INTERMISSION_TIME / speedNow)
-						if pause > 0 then task.wait(pause) end
-						if state.IsActive then startNextWave(player, plot) end
+						if pause > 0 then
+							task.wait(pause)
+						end
+						if state.IsActive then
+							startNextWave(player, plot)
+						end
 					end)
 
 					return
@@ -4169,13 +4400,17 @@ startNextWave = function(player: Player, plot: Model)
 	end)
 end
 
+
 stopFight = function(plot: Model, reason: string)
 	local state = _plotStates[plot]
 	if not state then return end
 	local player = Players:GetPlayerByUserId(plot:GetAttribute("OwnerId"))
 	state.IsActive = false
 
-	if state.HealthConnection then state.HealthConnection:Disconnect() state.HealthConnection = nil end
+	if state.HealthConnection then
+		state.HealthConnection:Disconnect()
+		state.HealthConnection = nil
+	end
 
 	for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
 		local owner = enemy:FindFirstChild("OwnerPlot")
@@ -4192,7 +4427,9 @@ stopFight = function(plot: Model, reason: string)
 		for _, itemModel in ipairs(plot:GetChildren()) do
 			if itemModel:GetAttribute("IsPlacedItem") then
 				local config = ItemConfigurations[itemModel.Name]
-				if config and config.Type == "Turrets" then TurretController:RemoveTurret(itemModel) end
+				if config and config.Type == "Turrets" then
+					TurretController:RemoveTurret(itemModel)
+				end
 				itemModel:Destroy()
 			end
 		end
@@ -4205,7 +4442,9 @@ stopFight = function(plot: Model, reason: string)
 			local md = ModelProgression[profile.Data.UnlockedModelIndex]
 			local maxHealth = (md and md.PlotHealth) or 10
 			local plotHealthPart = plot:FindFirstChild("PlotHealth")
-			if plotHealthPart then plotHealthPart:SetAttribute("Health", maxHealth) end
+			if plotHealthPart then
+				plotHealthPart:SetAttribute("Health", maxHealth)
+			end
 		end
 
 		ReplicatedStorage.Events.WaveStateChanged:FireClient(player, false)
@@ -4232,6 +4471,13 @@ startFight = function(player: Player)
 	if not plotHealth then return end
 	plotHealth:SetAttribute("Health", maxHealth)
 
+	-- 🔥 Starting wave logic:
+	-- if they've beaten wave 15, start runs from wave 16.
+	local startWave = 1
+	if profile.Data.HighestWave >= 15 then
+		startWave = 16
+	end
+
 	local startMultiplier = 1
 	if hasFastForwardUnlocked(player) then
 		startMultiplier = math.clamp(_preferredMultiplier[player] or 1, 1, 4)
@@ -4239,7 +4485,7 @@ startFight = function(player: Player)
 
 	_plotStates[plot] = {
 		IsActive = true,
-		CurrentWave = (profile.Data.StartingWave or 1) - 1,
+		CurrentWave = startWave - 1, -- so first startNextWave jumps to startWave
 		EnemiesKilledInWave = 0,
 		TotalEnemiesInWave = 0,
 		IsStartingNextWave = false,
@@ -4250,32 +4496,45 @@ startFight = function(player: Player)
 				ReplicatedStorage.Events.ShowNotification:FireClient(player, "Your plot was destroyed!", "Error")
 				stopFight(plot, "loss")
 			end
-		end)
+		end),
 	}
 
 	local waveSpeedChanged = ReplicatedStorage.Events:FindFirstChild("WaveSpeedChanged")
-	if waveSpeedChanged then (waveSpeedChanged :: RemoteEvent):FireClient(player, startMultiplier) end
+	if waveSpeedChanged then
+		(waveSpeedChanged :: RemoteEvent):FireClient(player, startMultiplier)
+	end
+
+	local startingWaveUpdated = ReplicatedStorage.Events:FindFirstChild("StartingWaveUpdated")
+	if startingWaveUpdated then
+		(startingWaveUpdated :: RemoteEvent):FireClient(player, startWave)
+	end
 
 	ReplicatedStorage.Events.WaveStateChanged:FireClient(player, true, maxHealth, maxHealth)
 	startNextWave(player, plot)
 end
 
 function WaveController:Init(controllers: {[string]: any})
-	PlayerController = controllers.PlayerController
-	TurretController = controllers.TurretController
+	PlayerController   = controllers.PlayerController
+	TurretController   = controllers.TurretController
 	PlacementController = controllers.PlacementController
-	WeaponController = controllers.WeaponController
-	PlotController = controllers.PlotController
+	WeaponController   = controllers.WeaponController
+	PlotController     = controllers.PlotController
 end
 
 function WaveController:Start()
 	local function ensureRemote(name: string): RemoteEvent
 		local events = ReplicatedStorage:FindFirstChild("Events") or Instance.new("Folder")
-		events.Name = "Events"; events.Parent = ReplicatedStorage
+		events.Name = "Events"
+		events.Parent = ReplicatedStorage
 		local r = events:FindFirstChild(name) :: RemoteEvent?
-		if not r then r = Instance.new("RemoteEvent"); r.Name = name; r.Parent = events end
+		if not r then
+			r = Instance.new("RemoteEvent")
+			r.Name = name
+			r.Parent = events
+		end
 		return r
 	end
+
 	ensureRemote("ToggleFastForward")
 	ensureRemote("SetWaveSpeedMultiplier")
 	ensureRemote("WaveSpeedChanged")
@@ -4296,7 +4555,10 @@ function WaveController:Start()
 		end
 
 		local plot = getPlotForPlayer(player)
-		if not plot then _fightToggleDebounce[player] = nil return end
+		if not plot then
+			_fightToggleDebounce[player] = nil
+			return
+		end
 
 		if _plotStates[plot] and _plotStates[plot].IsActive then
 			if _autoWaveStates[player] then
@@ -4308,7 +4570,9 @@ function WaveController:Start()
 			startFight(player)
 		end
 
-		task.delay(1, function() _fightToggleDebounce[player] = nil end)
+		task.delay(1, function()
+			_fightToggleDebounce[player] = nil
+		end)
 	end)
 
 	ReplicatedStorage.Events.ToggleFastForward.OnServerEvent:Connect(function(player)
@@ -4363,7 +4627,9 @@ function WaveController:Start()
 		if not state then return end
 
 		state.IsActive = false
-		if state.HealthConnection then state.HealthConnection:Disconnect() end
+		if state.HealthConnection then
+			state.HealthConnection:Disconnect()
+		end
 
 		for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
 			local owner = enemy:FindFirstChild("OwnerPlot")
@@ -4802,9 +5068,9 @@ function TurretController:Start()
 						if hum and hitModel:FindFirstChild("Goal") then
 							DamageHandler.dealDamage(turretModel, hitModel, damage)
 						end
-						if owner then TurretFiredFX:FireClient(owner, turretModel, origin, result.Position) end
+						--if owner then TurretFiredFX:FireClient(owner, turretModel, origin, result.Position) end
 					else
-						if owner then TurretFiredFX:FireClient(owner, turretModel, origin, origin + direction * range) end
+						--if owner then TurretFiredFX:FireClient(owner, turretModel, origin, origin + direction * range) end
 					end
 				end
 			end
@@ -7650,15 +7916,94 @@ local function getMutationMultiplier(mutation: string?): number
 	return cfg.Multiplier or 1
 end
 
-local function updateCageAttributes(cage: Model, slotData: any?)
+local function getRebirthMoneyMultiplierFromProfile(profile: any?): number
+	if not profile then return 1 end
+	local data = profile.Data
+	if not data then return 1 end
+	local mult = data.RebirthMoneyMultiplier
+	if typeof(mult) == "number" and mult > 0 then
+		return mult
+	end
+	return 1
+end
+
+----------------------------------------------------------------
+-- ProximityPrompt helpers (text + enabled state)
+----------------------------------------------------------------
+
+local function getPlatformMainPart(cage: Model): BasePart?
+	local base = cage:FindFirstChild("EnemyPlacementBase", true)
+	if base and base:IsA("BasePart") then
+		return base
+	end
+
+	local platform = cage:FindFirstChild("Platform")
+	if platform and platform:IsA("BasePart") then
+		return platform
+	end
+
+	if platform and platform:IsA("Model") then
+		if platform.PrimaryPart then
+			return platform.PrimaryPart
+		end
+		for _, d in ipairs(platform:GetChildren()) do
+			if d:IsA("BasePart") then
+				return d
+			end
+		end
+	end
+
+	return cage:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getCagePrompt(cage: Model): ProximityPrompt?
+	local platformPart = getPlatformMainPart(cage)
+	if not platformPart then return nil end
+	local prompt = platformPart:FindFirstChild("CagePrompt")
+	if prompt and prompt:IsA("ProximityPrompt") then
+		return prompt
+	end
+	return nil
+end
+
+local function updatePromptTextForCage(cage: Model)
+	local prompt = getCagePrompt(cage)
+	if not prompt then return end
+
+	local enemyId = cage:GetAttribute("EnemyId") :: string?
+	local display = cage:GetAttribute("DisplayName") :: string?
+
+	if enemyId and enemyId ~= "" then
+		local nameText = (typeof(display) == "string" and display ~= "" and display) or enemyId
+		prompt.ActionText = ("Remove %s"):format(nameText)
+	else
+		prompt.ActionText = "Place Enemy"
+	end
+
+	prompt.ObjectText = ""
+end
+
+local function updatePromptEnabledForCage(cage: Model, unlocked: boolean)
+	local prompt = getCagePrompt(cage)
+	if not prompt then return end
+	prompt.Enabled = unlocked
+end
+
+----------------------------------------------------------------
+
+local function updateCageAttributes(cage: Model, slotData: any?, profile: any?)
 	if not slotData or not slotData.EnemyId then
 		cage:SetAttribute("EnemyId", nil)
 		cage:SetAttribute("DisplayName", nil)
 		cage:SetAttribute("Rarity", nil)
 		cage:SetAttribute("Mutation", nil)
+		cage:SetAttribute("BaseValuePerSecond", 0)
+		cage:SetAttribute("VpsMultiplier", 1)
 		cage:SetAttribute("ValuePerSecond", 0)
 		cage:SetAttribute("Banked", 0)
 		cage:SetAttribute("LastOffline", 0)
+
+		updatePromptTextForCage(cage)
 		return
 	end
 
@@ -7669,18 +8014,28 @@ local function updateCageAttributes(cage: Model, slotData: any?)
 	local displayName = (cfg and cfg.DisplayName) or enemyId
 	local rarity      = (cfg and cfg.Rarity) or "Common"
 	local baseVps     = (cfg and tonumber(cfg.ValuePerSecond)) or 0
-	local mult        = getMutationMultiplier(mutation)
-	local vps         = baseVps * mult
-	local banked      = math.floor(slotData.Banked or 0)
-	local lastOff     = math.floor(slotData.LastOfflineEarned or 0)
+
+	local mutationMult = getMutationMultiplier(mutation)
+	local rebirthMult  = getRebirthMoneyMultiplierFromProfile(profile)
+	local vpsMult      = mutationMult * rebirthMult
+	local vps          = baseVps * vpsMult
+
+	local banked  = math.floor(slotData.Banked or 0)
+	local lastOff = math.floor(slotData.LastOfflineEarned or 0)
 
 	cage:SetAttribute("EnemyId", enemyId)
 	cage:SetAttribute("DisplayName", displayName)
 	cage:SetAttribute("Rarity", rarity)
 	cage:SetAttribute("Mutation", mutation or "")
+
+	cage:SetAttribute("BaseValuePerSecond", baseVps)
+	cage:SetAttribute("VpsMultiplier", vpsMult)
 	cage:SetAttribute("ValuePerSecond", vps)
+
 	cage:SetAttribute("Banked", banked)
 	cage:SetAttribute("LastOffline", lastOff)
+
+	updatePromptTextForCage(cage)
 end
 
 local function setCageVisual(cage: Model, unlocked: boolean)
@@ -7714,8 +8069,8 @@ local function setCageVisual(cage: Model, unlocked: boolean)
 	end
 
 	cage:SetAttribute("Unlocked", unlocked)
+	updatePromptEnabledForCage(cage, unlocked)
 end
-
 
 local function setButtonVisual(buttonPart: BasePart, unlocked: boolean)
 	local container = buttonPart.Parent
@@ -7768,31 +8123,6 @@ local function getButtonPart(cp: Model, index: number): BasePart?
 	end
 
 	return nil
-end
-
-local function getPlatformMainPart(cage: Model): BasePart?
-	local base = cage:FindFirstChild("EnemyPlacementBase", true)
-	if base and base:IsA("BasePart") then
-		return base
-	end
-
-	local platform = cage:FindFirstChild("Platform")
-	if platform and platform:IsA("BasePart") then
-		return platform
-	end
-
-	if platform and platform:IsA("Model") then
-		if platform.PrimaryPart then
-			return platform.PrimaryPart
-		end
-		for _, d in ipairs(platform:GetChildren()) do
-			if d:IsA("BasePart") then
-				return d
-			end
-		end
-	end
-
-	return cage:FindFirstChildWhichIsA("BasePart")
 end
 
 local function clearPlacerTools(player: Player)
@@ -7877,7 +8207,7 @@ function CageController:_OnCagePrompt(player: Player, cage: Model)
 		local enemyId = slot.EnemyId
 		slots[idx] = nil
 		clearDisplayModel(cage)
-		updateCageAttributes(cage, nil)
+		updateCageAttributes(cage, nil, profile)
 		PlayerController.AddCapturedEnemy(player, enemyId)
 		return
 	end
@@ -7900,7 +8230,7 @@ function CageController:_OnCagePrompt(player: Player, cage: Model)
 		}
 
 		createDisplayModel(cage, selectedEnemy)
-		updateCageAttributes(cage, slots[idx])
+		updateCageAttributes(cage, slots[idx], profile)
 
 		player:SetAttribute("SelectedEnemyId", nil)
 		player:SetAttribute("SelectedEnemyDisplayName", nil)
@@ -7934,7 +8264,7 @@ function CageController:_OnCollect(player: Player, cage: Model)
 	slot.LastOfflineEarned = 0
 
 	PlayerController.AddCash(player, amount)
-	updateCageAttributes(cage, slot)
+	updateCageAttributes(cage, slot, profile)
 end
 
 local function setupCageInteractions(cage: Model)
@@ -7951,8 +8281,6 @@ local function setupCageInteractions(cage: Model)
 	if not prompt then
 		prompt = Instance.new("ProximityPrompt")
 		prompt.Name = "CagePrompt"
-		prompt.ActionText = ""
-		prompt.ObjectText = ""
 		prompt.HoldDuration = 0
 		prompt.RequiresLineOfSight = false
 		prompt.Parent = platformPart
@@ -7968,7 +8296,8 @@ local function setupCageInteractions(cage: Model)
 		prompt:SetAttribute("ClampDistHooked", true)
 	end
 
-	prompt.Enabled = true
+	-- text will be set based on current attributes
+	updatePromptTextForCage(cage)
 
 	if not prompt:GetAttribute("Hooked") then
 		prompt.Triggered:Connect(function(p: Player)
@@ -8092,6 +8421,7 @@ function CageController:OnPlayerProfileLoaded(player: Player)
 	local slots = profile.Data.CageSlots
 
 	local now = os.time()
+	local rebirthMult = getRebirthMoneyMultiplierFromProfile(profile)
 
 	for idx, slot in pairs(slots) do
 		if typeof(idx) == "number" and type(slot) == "table" and slot.EnemyId then
@@ -8101,8 +8431,8 @@ function CageController:OnPlayerProfileLoaded(player: Player)
 
 				local cfg  = EnemyConfigurations[slot.EnemyId]
 				local base = (cfg and tonumber(cfg.ValuePerSecond)) or 0
-				local mult = getMutationMultiplier(slot.Mutation)
-				local vps  = base * mult
+				local mut  = getMutationMultiplier(slot.Mutation)
+				local vps  = base * mut * rebirthMult
 
 				local lastTick = slot.LastTick or now
 				local dtOffline = math.max(0, now - lastTick)
@@ -8112,7 +8442,7 @@ function CageController:OnPlayerProfileLoaded(player: Player)
 				slot.LastOfflineEarned = offlineEarned
 				slot.LastTick = now
 
-				updateCageAttributes(cage, slot)
+				updateCageAttributes(cage, slot, profile)
 			end
 		end
 	end
@@ -8131,12 +8461,14 @@ local function heartbeatTick()
 		local plot = getPlotForPlayer(player)
 		if not plot then continue end
 
+		local rebirthMult = getRebirthMoneyMultiplierFromProfile(profile)
+
 		for idx, slot in pairs(slots) do
 			if type(slot) == "table" and slot.EnemyId then
 				local cfg  = EnemyConfigurations[slot.EnemyId]
 				local base = (cfg and tonumber(cfg.ValuePerSecond)) or 0
-				local mult = getMutationMultiplier(slot.Mutation)
-				local vps  = base * mult
+				local mut  = getMutationMultiplier(slot.Mutation)
+				local vps  = base * mut * rebirthMult
 
 				local lastTick = slot.LastTick or now
 				local dt = math.max(0, now - lastTick)
@@ -8150,7 +8482,7 @@ local function heartbeatTick()
 				if plotModel then
 					local cage = getCageByIndex(plotModel, idx)
 					if cage then
-						updateCageAttributes(cage, slot)
+						updateCageAttributes(cage, slot, profile)
 					end
 				end
 			end
@@ -8245,6 +8577,12 @@ function CageController:GivePlacementTool(player: Player, enemyId: string)
 	if humanoid then
 		humanoid:EquipTool(tool)
 	end
+end
+
+function CageController:ApplyUnlockStateForPlayer(player: Player)
+	local plot = getPlotForPlayer(player)
+	if not plot then return end
+	applyUnlockStateForPlayer(player, plot)
 end
 
 function CageController:Init(controllers: {[string]: any})
@@ -8366,14 +8704,16 @@ end)
 --- ServerScriptService.Controllers.RebirthController (ModuleScript) ---
 --!strict
 
-local Players            = game:GetService("Players")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 
-local Modules           = ReplicatedStorage:WaitForChild("Modules")
-local NumberFormatter   = require(Modules:WaitForChild("NumberFormatter"))
+local Modules         = ReplicatedStorage:WaitForChild("Modules")
+local NumberFormatter = require(Modules:WaitForChild("NumberFormatter"))
+local RebirthConfig   = require(Modules:WaitForChild("RebirthConfig"))
 
 local PlayerController  = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+local CageController    = require(ServerScriptService.Controllers:WaitForChild("CageController"))
 
 local EventsFolder = ReplicatedStorage:FindFirstChild("Events")
 if not EventsFolder then
@@ -8405,7 +8745,6 @@ if not GetRebirthStateFn then
 	GetRebirthStateFn.Parent = FunctionsFolder
 end
 
--- Rebirth config (tweak RequiredCash later if you want)
 export type RebirthCfg = {
 	RequiredCash: number,
 	MoneyBonusPercent: number,
@@ -8413,14 +8752,7 @@ export type RebirthCfg = {
 	UnlockCages: {number}?,
 }
 
-local REBIRTH_CONFIG: {[number]: RebirthCfg} = {
-	[1] = { RequiredCash = 1_000_000, MoneyBonusPercent = 25, LuckBonusPercent = 25, UnlockCages = {} },
-	[2] = { RequiredCash = 5_000_000, MoneyBonusPercent = 25, LuckBonusPercent = 25, UnlockCages = {} },
-	[3] = { RequiredCash = 25_000_000, MoneyBonusPercent = 0,  LuckBonusPercent = 50, UnlockCages = {8} },
-	[4] = { RequiredCash = 100_000_000, MoneyBonusPercent = 0,  LuckBonusPercent = 50, UnlockCages = {9} },
-}
-
-local MAX_REBIRTH = #REBIRTH_CONFIG
+local MAX_REBIRTH = RebirthConfig.MaxRebirth
 
 local RebirthController = {}
 
@@ -8428,7 +8760,7 @@ local function computeRebirthMultipliers(rebirths: number): (number, number)
 	local money = 1
 	local luck  = 1
 	for i = 1, rebirths do
-		local cfg = REBIRTH_CONFIG[i]
+		local cfg = RebirthConfig[i]
 		if cfg then
 			money += (cfg.MoneyBonusPercent or 0) / 100
 			luck  += (cfg.LuckBonusPercent or 0) / 100
@@ -8466,7 +8798,7 @@ function RebirthController:GetRebirthState(player: Player)
 	local cash     = data.Cash or 0
 
 	local nextIndex = rebirths + 1
-	local cfg       = REBIRTH_CONFIG[nextIndex]
+	local cfg       = RebirthConfig[nextIndex]
 
 	local moneyMult, luckMult = computeRebirthMultipliers(rebirths)
 
@@ -8474,16 +8806,16 @@ function RebirthController:GetRebirthState(player: Player)
 	local canRebirth = cfg ~= nil and rebirths < MAX_REBIRTH and cash >= requiredCash
 
 	return {
-		CurrentRebirth = rebirths,
-		MaxRebirth     = MAX_REBIRTH,
-		Cash           = cash,
-		RequiredCash   = requiredCash,
+		CurrentRebirth  = rebirths,
+		MaxRebirth      = MAX_REBIRTH,
+		Cash            = cash,
+		RequiredCash    = requiredCash,
 		MoneyMultiplier = moneyMult,
 		LuckMultiplier  = luckMult,
 
-		CanRebirth     = canRebirth,
-		NextIndex      = nextIndex,
-		NextConfig     = cfg,
+		CanRebirth = canRebirth,
+		NextIndex  = nextIndex,
+		NextConfig = cfg,
 	}
 end
 
@@ -8493,10 +8825,10 @@ function RebirthController:TryRebirth(player: Player): (boolean, string?)
 		return false, "Profile not loaded."
 	end
 
-	local data     = profile.Data
-	local rebirths = data.Rebirths or 0
+	local data      = profile.Data
+	local rebirths  = data.Rebirths or 0
 	local nextIndex = rebirths + 1
-	local cfg      = REBIRTH_CONFIG[nextIndex]
+	local cfg       = RebirthConfig[nextIndex]
 
 	if not cfg then
 		return false, "You reached the max Rebirth."
@@ -8508,13 +8840,15 @@ function RebirthController:TryRebirth(player: Player): (boolean, string?)
 			:format(NumberFormatter.formatNumber(cfg.RequiredCash))
 	end
 
-	-- wipe cash
+	-- wipe cash (set to 0)
 	if cash > 0 then
 		PlayerController.RemoveCash(player, cash)
 	end
 
+	-- increase rebirth count
 	data.Rebirths = rebirths + 1
 
+	-- recompute multipliers
 	local moneyMult, luckMult = computeRebirthMultipliers(data.Rebirths)
 	data.RebirthMoneyMultiplier = moneyMult
 	data.RebirthLuckMultiplier  = luckMult
@@ -8522,6 +8856,19 @@ function RebirthController:TryRebirth(player: Player): (boolean, string?)
 	player:SetAttribute("Rebirths", data.Rebirths)
 	player:SetAttribute("RebirthMoneyMultiplier", moneyMult)
 	player:SetAttribute("RebirthLuckMultiplier", luckMult)
+
+	-- auto-unlock cages from this rebirth config, if any
+	data.CageUnlocks = data.CageUnlocks or {}
+	if cfg.UnlockCages then
+		for _, cageIdx in ipairs(cfg.UnlockCages) do
+			data.CageUnlocks[cageIdx] = true
+		end
+	end
+
+	-- refresh cage visuals & buttons
+	if CageController and CageController.ApplyUnlockStateForPlayer then
+		CageController:ApplyUnlockStateForPlayer(player)
+	end
 
 	return true, nil
 end
@@ -11758,13 +12105,12 @@ export type WaveConfig = {
 	KillCashMultiplier: number?,
 	DamageMultiplier: number?,
 	SpawnDelayMultiplier: number?,
+	TargetConcurrent: number?,
 }
 
 -- ========= BASICS =========
 local MAX_WAVES = 1000
 local STEP = 15
-local GUARANTEED_BOSS_EVERY = 15
-local EXTRA_BOSS_CHANCE = 0.08
 
 local EXTENSION = {
 	baseCountMultPerSegment = 1.06,
@@ -11793,7 +12139,7 @@ local Bosses: { BossDef } = {
 		KillCashMultiplier = 2.0,
 		DamageMultiplier = 1.3,
 	},
-	
+
 	{
 		Name = "Ghost Rider",
 		DefaultOdds = 0.60,
@@ -11903,12 +12249,12 @@ local Segments: { Segment } = {
 			["Ghost Zombie"]  = 0.30,
 			["Ice Zombie"]    = 0.25,
 			["Fire Zombie"]   = 0.10,
-			["Skeleton"]   = 0.30,
+			["Skeleton"]      = 0.30,
 			["Angry Miner"]   = 0.24,
-			["Half Skeletal"]   = 0.10,
-			["Explosive Boy"]   = 0.10,
+			["Half Skeletal"] = 0.10,
+			["Explosive Boy"] = 0.10,
 			["RogueCowboy"]   = 0.15,
-			["SkullHead"]   = 0.10,
+			["SkullHead"]     = 0.10,
 		},
 		baseCount = 24,
 		perWaveCountMult = 1.03,
@@ -11923,16 +12269,16 @@ local Segments: { Segment } = {
 			["Ghost Zombie"]  = 0.20,
 			["Ice Zombie"]    = 0.20,
 			["Fire Zombie"]   = 0.30,
-			["Skeleton"]   = 0.30,
+			["Skeleton"]      = 0.30,
 			["Angry Miner"]   = 0.30,
-			["Half Skeletal"]   = 0.20,
-			["Explosive Boy"]   = 0.15,
+			["Half Skeletal"] = 0.20,
+			["Explosive Boy"] = 0.15,
 			["RogueCowboy"]   = 0.20,
-			["SkullHead"]   = 0.20,
+			["SkullHead"]     = 0.20,
 			["Looter Caravan"] = 0.15,
-			["Alien Bandit"] = 0.10,
-			["Rider Villain"] = 0.15,
-			["Ghost Cowboy"] = 0.15,
+			["Alien Bandit"]   = 0.10,
+			["Rider Villain"]  = 0.15,
+			["Ghost Cowboy"]   = 0.15,
 		},
 		baseCount = 26,
 		perWaveCountMult = 1.035,
@@ -11947,16 +12293,16 @@ local Segments: { Segment } = {
 			["Ghost Zombie"]  = 0.25,
 			["Ice Zombie"]    = 0.25,
 			["Fire Zombie"]   = 0.20,
-			["Skeleton"]   = 0.30,
+			["Skeleton"]      = 0.30,
 			["Angry Miner"]   = 0.30,
-			["Half Skeletal"]   = 0.25,
-			["Explosive Boy"]   = 0.25,
+			["Half Skeletal"] = 0.25,
+			["Explosive Boy"] = 0.25,
 			["RogueCowboy"]   = 0.30,
-			["SkullHead"]   = 0.30,
+			["SkullHead"]     = 0.30,
 			["Looter Caravan"] = 0.25,
-			["Alien Bandit"] = 0.20,
-			["Rider Villain"] = 0.20,
-			["Ghost Cowboy"] = 0.20,
+			["Alien Bandit"]   = 0.20,
+			["Rider Villain"]  = 0.20,
+			["Ghost Cowboy"]   = 0.20,
 		},
 		baseCount = 28,
 		perWaveCountMult = 1.04,
@@ -11966,7 +12312,7 @@ local Segments: { Segment } = {
 	},
 }
 
--- ========= HARDCODED 1–15 =========
+-- ========= HARDCODED 1–15 (ALL NON-BOSS) =========
 local WaveConfigurations: { [number]: WaveConfig } = {
 	[1]  = { CashReward=25,  IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=3, DelayBetweenSpawns=1.4}} },
 	[2]  = { CashReward=40,  IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=5, DelayBetweenSpawns=1.4}} },
@@ -11982,7 +12328,7 @@ local WaveConfigurations: { [number]: WaveConfig } = {
 	[12] = { CashReward=230, IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=20,DelayBetweenSpawns=1.0},{Enemy="Ghost Zombie", Count=8, DelayBetweenSpawns=1.0},{Enemy="Ice Zombie", Count=5, DelayBetweenSpawns=1.0}} },
 	[13] = { CashReward=260, IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=22,DelayBetweenSpawns=1.0},{Enemy="Ghost Zombie", Count=9, DelayBetweenSpawns=1.0},{Enemy="Ice Zombie", Count=5, DelayBetweenSpawns=1.0},{Enemy="Fire Zombie", Count=1, DelayBetweenSpawns=1.0}} },
 	[14] = { CashReward=280, IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=24,DelayBetweenSpawns=1.0},{Enemy="Ghost Zombie", Count=10,DelayBetweenSpawns=1.0},{Enemy="Ice Zombie", Count=6, DelayBetweenSpawns=1.0},{Enemy="Fire Zombie", Count=2, DelayBetweenSpawns=1.0}} },
-	[15] = { CashReward=300, IsBossWave=true,  BossImageId="rbxassetid://121107085551812", Enemies={{Enemy="Drooling Zombie", Count=1, DelayBetweenSpawns=0}} },
+	[15] = { CashReward=300, IsBossWave=false, Enemies={{Enemy="Normal Zombie", Count=26,DelayBetweenSpawns=1.0},{Enemy="Ghost Zombie", Count=11,DelayBetweenSpawns=1.0},{Enemy="Ice Zombie", Count=6, DelayBetweenSpawns=1.0},{Enemy="Fire Zombie", Count=3, DelayBetweenSpawns=1.0}} },
 }
 
 -- ========= HELPERS =========
@@ -12062,6 +12408,7 @@ local function makeBossWave(w: number, seg: Segment): WaveConfig
 		KillCashMultiplier = b.KillCashMultiplier or 2.0,
 		DamageMultiplier = b.DamageMultiplier or 1.25,
 		Enemies = b.EnemiesOverride or { { Enemy = b.Name, Count = 1, DelayBetweenSpawns = 0 } },
+		TargetConcurrent = 1,
 	}
 end
 
@@ -12092,37 +12439,139 @@ local function makeNormalWave(w: number, seg: Segment): WaveConfig
 		Enemies = enemies,
 		HealthMultiplier = hpMult ^ step,
 		SpawnDelayMultiplier = 1 / math.max(0.25, rateMult ^ step),
+		TargetConcurrent = nil,
 	}
 end
 
--- ========= BUILD ALL WAVES (NUMERIC KEYS ONLY) =========
+-- ========= BUILD ALL WAVES (NUMERIC KEYS ONLY, NO BOSSES) =========
 for w = 16, MAX_WAVES do
 	local seg = getSegmentForWave(w)
-	if (w % GUARANTEED_BOSS_EVERY) == 0 then
-		WaveConfigurations[w] = makeBossWave(w, seg)
-	elseif math.random() < EXTRA_BOSS_CHANCE then
-		WaveConfigurations[w] = makeBossWave(w, seg)
-	else
-		WaveConfigurations[w] = makeNormalWave(w, seg)
-	end
+	WaveConfigurations[w] = makeNormalWave(w, seg)
 end
 
--- expose ResolveWave without polluting pairs()
+-- ========= RARITY WEIGHTS (WAVE + REBIRTH) =========
+
+-- base curve at wave 1 (no rebirth)
+local BASE_RARITY_WEIGHTS = {
+	Common    = 0.80,
+	Rare      = 0.18,
+	Epic      = 0.02,
+	Legendary = 0.00,
+	Boss      = 0.00,
+	Secret    = 0.00,
+}
+
+-- target curve at wave 1000 (no rebirth)
+local MAX_RARITY_WEIGHTS = {
+	Common    = 0.05,
+	Rare      = 0.10,
+	Epic      = 0.35,
+	Legendary = 0.30,
+	Boss      = 0.15,
+	Secret    = 0.05,
+}
+
+local MIN_WEIGHT = 0.0025 -- never fully 0 so low tiers still possible
+
+local function lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+local function getBaseRarityWeightsForWave(w: number): {[string]: number}
+	local t = 0
+	if MAX_WAVES > 1 then
+		t = math.clamp((w - 1) / (MAX_WAVES - 1), 0, 1)
+	end
+
+	local weights: {[string]: number} = {}
+	local sum = 0
+
+	for rarity, baseW in pairs(BASE_RARITY_WEIGHTS) do
+		local maxW = MAX_RARITY_WEIGHTS[rarity] or baseW
+		local wgt = lerp(baseW, maxW, t)
+		if wgt < MIN_WEIGHT then
+			wgt = MIN_WEIGHT
+		end
+		weights[rarity] = wgt
+		sum += wgt
+	end
+
+	for rarity, wgt in pairs(weights) do
+		weights[rarity] = wgt / sum
+	end
+
+	return weights
+end
+
+-- per-rebirth bias: >1 boosts, <1 nerfs
+local REBIRTH_RARITY_BIAS = {
+	Common    = 0.92,
+	Rare      = 0.96,
+	Epic      = 1.04,
+	Legendary = 1.08,
+	Boss      = 1.10,
+	Secret    = 1.12,
+}
+
+local function applyRebirthToWeights(baseWeights: {[string]: number}, rebirths: number): {[string]: number}
+	if rebirths <= 0 then
+		return baseWeights
+	end
+
+	local clampedRebirths = math.min(rebirths, 15) -- hard-cap so it doesn't go insane
+	local adjusted: {[string]: number} = {}
+	local sum = 0
+
+	for rarity, wgt in pairs(baseWeights) do
+		local bias = REBIRTH_RARITY_BIAS[rarity] or 1
+		local mult = bias ^ clampedRebirths
+		local newW = wgt * mult
+		if newW < MIN_WEIGHT then
+			newW = MIN_WEIGHT
+		end
+		adjusted[rarity] = newW
+		sum += newW
+	end
+
+	for rarity, wgt in pairs(adjusted) do
+		adjusted[rarity] = wgt / sum
+	end
+
+	return adjusted
+end
+
+local function GetRarityWeights(waveNumber: number, rebirths: number?): {[string]: number}
+	local base = getBaseRarityWeightsForWave(waveNumber)
+	if not rebirths or rebirths <= 0 then
+		return base
+	end
+	return applyRebirthToWeights(base, rebirths)
+end
+
+-- ========= EXPOSE HELPERS =========
 local function ResolveWave(w: number): WaveConfig
 	return WaveConfigurations[w]
+end
+
+local function ResolveBossWave(w: number): WaveConfig
+	local seg = getSegmentForWave(math.max(w, 16))
+	return makeBossWave(w, seg)
 end
 
 setmetatable(WaveConfigurations, {
 	__index = function(_, k)
 		if k == "ResolveWave" then
 			return ResolveWave
+		elseif k == "ResolveBossWave" then
+			return ResolveBossWave
+		elseif k == "GetRarityWeights" then
+			return GetRarityWeights
 		end
 		return nil
 	end
 })
 
 return WaveConfigurations
-
 
 ---
 
@@ -12443,9 +12892,9 @@ function DamageHandler.dealDamage(source: Instance, target: Instance, damageAmou
 		humanoid:TakeDamage(damageAmount)
 
 		-- Only highlight if the target is still alive
-		if humanoid.Health > 0 then
-			HighlightZombie:FireAllClients(target)
-		end
+		--if humanoid.Health > 0 then
+		--	HighlightZombie:FireAllClients(target)
+		--end
 
 		return humanoid.Health <= 0
 
@@ -13380,5 +13829,105 @@ local MutationConfigurations = {
 }
 
 return MutationConfigurations
+
+---
+
+--- ReplicatedStorage.Modules.RebirthConfig (ModuleScript) ---
+--!strict
+-- ReplicatedStorage/Modules/RebirthConfig.lua
+
+export type RebirthCfg = {
+	RequiredCash: number,
+	MoneyBonusPercent: number,
+	LuckBonusPercent: number,
+	UnlockCages: {number}?,
+}
+
+local RebirthConfig: {
+	[number]: RebirthCfg,
+	MaxRebirth: number,
+} = {
+	[1] = {
+		RequiredCash      = 5_000_000,
+		MoneyBonusPercent = 25,   -- +25% money
+		LuckBonusPercent  = 25,   -- +25% luck
+		UnlockCages       = nil,  -- none
+	},
+
+	[2] = {
+		RequiredCash      = 25_000_000,
+		MoneyBonusPercent = 25,   -- +25% money
+		LuckBonusPercent  = 25,   -- +25% luck
+		UnlockCages       = nil,  -- (keep empty for now or add {6} later)
+	},
+
+	[3] = {
+		RequiredCash      = 100_000_000,
+		MoneyBonusPercent = 0,
+		LuckBonusPercent  = 25,   -- +50% luck
+		UnlockCages       = { 6 }, -- ⬅ Rebirth 3 unlocks Cage 6
+	},
+
+	[4] = {
+		RequiredCash      = 250_000_000,
+		MoneyBonusPercent = 0,
+		LuckBonusPercent  = 50,   -- +50% luck
+		UnlockCages       = { 7 }, --unlocks Cage 7
+	},
+}
+
+RebirthConfig.MaxRebirth = 4
+
+return RebirthConfig
+
+---
+
+--- ReplicatedStorage.Modules.LuckHelper (ModuleScript) ---
+--!strict
+-- ServerScriptService/Modules/LuckHelper.lua
+
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Players             = game:GetService("Players")
+
+local PlayerController = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+
+local LuckHelper = {}
+
+local function getProfile(player: Player)
+	return PlayerController:GetProfile(player)
+end
+
+function LuckHelper.GetTotalLuckMultiplier(player: Player): number
+	local profile = getProfile(player)
+	if not profile then return 1 end
+
+	local data = profile.Data
+
+	-- From rebirths (already set by RebirthController)
+	local rebirthLuck = data.RebirthLuckMultiplier or 1
+
+	-- Gamepass luck (you wire this later, default 1)
+	local passLuck = data.LuckGamepassMultiplier or 1
+
+	-- Potion luck (you wire this later, default 1)
+	local potionLuck = data.LuckPotionMultiplier or 1
+
+	-- Server-wide luck (set as an attribute on ReplicatedStorage if you want)
+	local serverLuck = (ReplicatedStorage:GetAttribute("ServerLuckMultiplier") :: number?) or 1
+
+	return rebirthLuck * passLuck * potionLuck * serverLuck
+end
+
+function LuckHelper.Roll(player: Player, baseChance: number): boolean
+	local mult = LuckHelper.GetTotalLuckMultiplier(player)
+	local finalChance = baseChance * mult
+	if finalChance >= 1 then
+		return true
+	end
+	return math.random() < finalChance
+end
+
+return LuckHelper
 
 ---
