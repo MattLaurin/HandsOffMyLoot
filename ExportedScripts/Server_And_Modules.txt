@@ -3084,14 +3084,40 @@ local function syncLeaderstats(player: Player, cashValue: number)
 	end
 end
 
+local function getFriendBoostMultiplier(player: Player): number
+	local multiplier = 1
+	local friendsCount = 0
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player then
+			local ok, isFriend = pcall(function()
+				return player:IsFriendsWith(other.UserId)
+			end)
+			if ok and isFriend then
+				friendsCount += 1
+			end
+		end
+	end
+
+	local bonusPercent = math.clamp(friendsCount * 10, 0, 30) -- 0–30%
+	multiplier += bonusPercent / 100
+	return multiplier
+end
+
+
 function PlayerController.AddCash(player: Player, amount: number)
 	local profile = PlayerController:GetProfile(player)
 	amount = tonumber(amount) or 0
 	if not profile or amount <= 0 then return end
 
-	-- Apply rebirth money multiplier globally
-	local mult = profile.Data.RebirthMoneyMultiplier or 1
-	local final = amount * mult
+	-- Base rebirth multiplier
+	local rebirthMult = profile.Data.RebirthMoneyMultiplier or 1
+
+	-- Friend boost multiplier (10% per friend, max 30%)
+	local friendMult = getFriendBoostMultiplier(player)
+
+	-- Final reward
+	local final = amount * rebirthMult * friendMult
 
 	local newCash = (profile.Data.Cash or 0) + final
 	profile.Data.Cash = newCash
@@ -3104,6 +3130,7 @@ function PlayerController.AddCash(player: Player, amount: number)
 		(ev :: RemoteEvent):FireClient(player, newCash)
 	end
 end
+
 
 function PlayerController.RemoveCash(player: Player, amount: number): boolean
 	local profile = PlayerController:GetProfile(player)
@@ -5110,13 +5137,20 @@ local ShopController = {}
 local pendingSkips: {[Player]: Model} = {}
 
 -- ===== Product ids =====
+-- Server luck
 local PRODUCT_SERVERLUCK_X2       = 3446300267 -- 2x (299R$)
 local PRODUCT_SERVERLUCK_X4       = 3446300425 -- 4x (799R$)
-local PRODUCT_SERVERLUCK_ADD15M   = 3446300596 -- +15m (699R$)
+local PRODUCT_SERVERLUCK_X10      = 3446300596 -- 10x (999R$)
 
+-- Level-up & repair
 local PRODUCT_LEVELUP_SKIP        = 3445097534 -- level-up skip timer
-local PRODUCT_REPAIR_ALL          = 3444162940 -- revive/repair all
+local PRODUCT_REPAIR_ALL          = 3444162940 -- revive/repair all (if you still use it)
 
+-- Cash dev products
+local PRODUCT_CASH_5K             = 3433108028
+local PRODUCT_CASH_25K            = 3433108213
+local PRODUCT_CASH_100K           = 3433108417
+local PRODUCT_CASH_300K           = 3433108573
 
 -- Remotes
 local Events = ReplicatedStorage:WaitForChild("Events")
@@ -5130,6 +5164,14 @@ if not chatAnnouncementEvent then
 	chatAnnouncementEvent = Instance.new("RemoteEvent")
 	chatAnnouncementEvent.Name = "ChatAnnouncement"
 	chatAnnouncementEvent.Parent = Events
+end
+
+-- Broadcast server luck state to clients (for Shop UI)
+local serverLuckStateEvent = Events:FindFirstChild("ServerLuckState") :: RemoteEvent?
+if not serverLuckStateEvent then
+	serverLuckStateEvent = Instance.new("RemoteEvent")
+	serverLuckStateEvent.Name = "ServerLuckState"
+	serverLuckStateEvent.Parent = Events
 end
 
 local Functions               = ReplicatedStorage:WaitForChild("Functions")
@@ -5190,6 +5232,54 @@ local function getGamePassPriceR(gamePassId: number): number
 	return price
 end
 
+-- === Server luck state helpers ===
+
+local function getServerLuckState(): (number, number)
+	local multAttr = ReplicatedStorage:GetAttribute("ServerLuckMultiplier")
+	local expAttr  = ReplicatedStorage:GetAttribute("ServerLuckExpiresAt")
+
+	local mult = (typeof(multAttr) == "number" and multAttr or 1) :: number
+	local expiresAt = (typeof(expAttr) == "number" and expAttr or 0) :: number
+
+	local now = os.time()
+	if expiresAt <= now then
+		mult = 1
+		expiresAt = 0
+	end
+
+	return mult, expiresAt
+end
+
+-- mode:
+--   addIfSame = true  -> if same mult & active, add time, else reset
+--   addIfSame = false -> always reset timer
+local function setServerLuck(mult: number, durationSeconds: number, addIfSame: boolean)
+	if mult < 1 then
+		mult = 1
+	end
+
+	local now = os.time()
+	local currentMult, currentExpires = getServerLuckState()
+
+	local newMult = mult
+	local newExpires: number
+
+	if addIfSame and currentMult == mult and currentExpires > now then
+		-- extend existing buff
+		newExpires = currentExpires + durationSeconds
+	else
+		-- reset timer & set new mult
+		newMult = mult
+		newExpires = now + durationSeconds
+	end
+
+	ReplicatedStorage:SetAttribute("ServerLuckMultiplier", newMult)
+	ReplicatedStorage:SetAttribute("ServerLuckExpiresAt", newExpires)
+
+	local remaining = math.max(0, newExpires - now)
+	serverLuckStateEvent:FireAllClients(newMult, remaining)
+end
+
 -- === Product mapping ===
 local function getProductConfig(productId: number)
 	for id, config in pairs(WeaponConfigurations.ShopProducts) do
@@ -5234,21 +5324,54 @@ local function processReceipt(receiptInfo: {[string]: any})
 		return decision
 	end
 
-	-- ===== Server luck products =====
+	-- ===== Server luck products (2x, 4x, 10x) =====
 	if productId == PRODUCT_SERVERLUCK_X2 then
-		pcall(function() TotalLuckController:StartServerLuck(nil, 2) end)
-		showNotificationEvent:FireClient(player, "Server Luck set to 2x!", "Success")
+		-- Always reset to 15 minutes at 2x
+		setServerLuck(2, 15 * 60, false)
+		showNotificationEvent:FireClient(player, "Server Luck set to 2x for 15 minutes!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "2x Server Luck")
 
 	elseif productId == PRODUCT_SERVERLUCK_X4 then
-		pcall(function() TotalLuckController:StartServerLuck(nil, 4) end)
-		showNotificationEvent:FireClient(player, "Server Luck set to 4x!", "Success")
+		-- Always reset to 15 minutes at 4x
+		setServerLuck(4, 15 * 60, false)
+		showNotificationEvent:FireClient(player, "Server Luck set to 4x for 15 minutes!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "4x Server Luck")
 
-	elseif productId == PRODUCT_SERVERLUCK_ADD15M then
-		pcall(function() TotalLuckController:StartServerLuck(15 * 60, nil) end)
-		showNotificationEvent:FireClient(player, "+15 minutes added to Server Luck!", "Success")
-		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "+15m Server Luck")
+	elseif productId == PRODUCT_SERVERLUCK_X10 then
+		-- If already 10x and active, add 15 minutes; otherwise set 10x and reset to 15
+		setServerLuck(10, 15 * 60, true)
+		showNotificationEvent:FireClient(player, "MAX Server Luck (10x) extended by 15 minutes!", "Success")
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "MAX Server Luck")
+	end
+
+	-- ===== Explicit Cash devproducts (5k / 25k / 100k / 300k) =====
+	if
+		productId == PRODUCT_CASH_5K
+		or productId == PRODUCT_CASH_25K
+		or productId == PRODUCT_CASH_100K
+		or productId == PRODUCT_CASH_300K
+	then
+		local amount = 0
+		if productId == PRODUCT_CASH_5K then
+			amount = 5_000
+		elseif productId == PRODUCT_CASH_25K then
+			amount = 25_000
+		elseif productId == PRODUCT_CASH_100K then
+			amount = 100_000
+		elseif productId == PRODUCT_CASH_300K then
+			amount = 300_000
+		end
+
+		if amount > 0 then
+			PlayerController.AddCash(player, amount)
+			showNotificationEvent:FireClient(
+				player,
+				`You received ${NumberFormatter.formatNumber(amount)} cash!`,
+				"Success"
+			)
+			local label = NumberFormatter.formatNumber(amount) .. " Cash"
+			return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, label)
+		end
 	end
 
 	-- ===== Level-up skip product =====
@@ -5288,6 +5411,7 @@ local function processReceipt(receiptInfo: {[string]: any})
 		end
 
 	elseif productType == "Cash" then
+		-- Old config-based cash path (still works if you keep WeaponConfigurations.CashProducts)
 		PlayerController.AddCash(player, config.CashAmount)
 		showNotificationEvent:FireClient(
 			player,
@@ -5422,10 +5546,32 @@ function ShopController:Init(controllers: {[string]: any})
 	BlocksShopController  = controllers.BlocksShopController
 	GlobalShopController  = controllers.GlobalShopController
 	RepairSignController  = controllers.RepairSignController
-	LevelUpController     = controllers.LevelUpController -- <- make sure you pass this in
+	LevelUpController     = controllers.LevelUpController
 end
 
 function ShopController:Start()
+	-- Initialize server-luck attributes
+	if ReplicatedStorage:GetAttribute("ServerLuckMultiplier") == nil then
+		ReplicatedStorage:SetAttribute("ServerLuckMultiplier", 1)
+	end
+	if ReplicatedStorage:GetAttribute("ServerLuckExpiresAt") == nil then
+		ReplicatedStorage:SetAttribute("ServerLuckExpiresAt", 0)
+	end
+
+	-- Small loop to clear expired server luck and notify clients
+	task.spawn(function()
+		while true do
+			local mult, expiresAt = getServerLuckState()
+			local now = os.time()
+			if mult > 1 and expiresAt > 0 and expiresAt <= now then
+				ReplicatedStorage:SetAttribute("ServerLuckMultiplier", 1)
+				ReplicatedStorage:SetAttribute("ServerLuckExpiresAt", 0)
+				serverLuckStateEvent:FireAllClients(1, 0)
+			end
+			task.wait(1)
+		end
+	end)
+
 	MarketplaceService.ProcessReceipt = processReceipt
 
 	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, id: number, purchased: boolean)

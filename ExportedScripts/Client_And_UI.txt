@@ -829,143 +829,196 @@ local function applyModelHoverEffect(model)
 end 
 ---
 
---- StarterPlayer.StarterPlayerScripts.CustomPromptHandler (LocalScript) ---
---[[
-	SCRIPT: CustomPromptHandler (LocalScript)
-	LOCATION: StarterPlayerScripts/CustomPromptHandler.lua
-	DESCRIPTION: Overrides the default ProximityPrompt UI with a custom,
-	stylish version from the templates folder.
---]]
+--- StarterPlayer.StarterPlayerScripts.CageBillboardHandler (LocalScript) ---
 --!strict
 
-local ProximityPromptService = game:GetService("ProximityPromptService")
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
-ProximityPromptService.Enabled = false
+local player = Players.LocalPlayer
 
-local player: Player = Players.LocalPlayer
-local playerGui: PlayerGui = player:WaitForChild("PlayerGui")
-local customPromptTemplate: TextButton = ReplicatedStorage.Templates:WaitForChild("CustomPrompt")
+local RARITY_COLORS: {[string]: Color3} = {
+	Common    = Color3.fromRGB(200, 200, 200),
+	Rare      = Color3.fromRGB(80, 170, 255),
+	Epic      = Color3.fromRGB(190, 90, 255),
+	Legendary = Color3.fromRGB(255, 200, 80),
+	Boss      = Color3.fromRGB(255, 80, 80),
+	Secret    = Color3.fromRGB(80, 255, 200),
+}
 
-local promptContainer: ScreenGui = playerGui:FindFirstChild("PromptContainer") or Instance.new("ScreenGui")
-promptContainer.Name = "PromptContainer"
-promptContainer.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-promptContainer.Parent = playerGui
+local function getPlotForPlayer(): Model?
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if not plotsFolder then return nil end
 
-local currentPromptUI: TextButton? = nil
-local currentPromptObject: ProximityPrompt? = nil
-local renderConnection: RBXScriptConnection? = nil
-local propertyChangedConnection: RBXScriptConnection? = nil
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
+	end
 
-local placeStrokeColor = Color3.fromRGB(50, 62, 130)
-local placeGradient = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 120, 255)),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(62, 204, 255))
-})
-
-local pickupStrokeColor = Color3.fromRGB(145, 0, 0)
-local pickupGradient = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 85, 127))
-})
-
-local function updateUIPosition()
-	if currentPromptUI and currentPromptObject and currentPromptObject.Parent then
-		local worldPosition: Vector3 = currentPromptObject.Parent.Position
-		local screenPosition: Vector3, onScreen: boolean = workspace.CurrentCamera:WorldToScreenPoint(worldPosition)
-		if onScreen then
-			currentPromptUI.Visible = true
-			currentPromptUI.Position = UDim2.new(0, screenPosition.X, 0, screenPosition.Y) + UDim2.fromOffset(currentPromptObject.UIOffset.X, currentPromptObject.UIOffset.Y)
-		else
-			currentPromptUI.Visible = false
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
 		end
+	end
+	return nil
+end
+
+local function ensureBillboard(cage: Model): BillboardGui
+	-- find the part we want to stick the label to
+	local attach = cage:FindFirstChild("EnemyPlacementBillboard", true)
+	if attach and not attach:IsA("BasePart") then
+		attach = nil
+	end
+
+	-- find any existing CageLabel anywhere under this cage
+	local billboard = cage:FindFirstChild("CageLabel", true) :: BillboardGui?
+	if not billboard then
+		billboard = Instance.new("BillboardGui")
+		billboard.Name = "CageLabel"
+		billboard.Size = UDim2.new(0, 520, 0, 260)
+		billboard.MaxDistance = 50
+		billboard.LightInfluence = 0
+		billboard.AlwaysOnTop = true
+		billboard.Enabled = false
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Text"
+		label.Size = UDim2.new(1, 0, 1, 0)
+		label.BackgroundTransparency = 1
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextStrokeTransparency = 0
+		label.Font = Enum.Font.GothamBlack
+		label.TextSize = 32
+		label.TextWrapped = true
+		label.RichText = true
+		label.Parent = billboard
+	end
+
+	-- if we have the EnemyPlacementBillboard part, parent + adorn to it
+	if attach and attach:IsA("BasePart") then
+		billboard.Parent = attach
+		billboard.Adornee = attach
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 0, 0)
 	else
-		if currentPromptUI then currentPromptUI.Visible = false end
-		if renderConnection then
-			renderConnection:Disconnect()
-			renderConnection = nil
-		end
+		-- fallback: keep it on the cage root (old behaviour)
+		billboard.Parent = cage
+		billboard.Adornee = nil
 	end
+
+	return billboard
 end
 
-local function updatePromptStyle(prompt: ProximityPrompt)
-	if not currentPromptUI then return end
+local function updateBillboard(cage: Model)
+	local billboard = ensureBillboard(cage)
+	local textLabel = billboard:FindFirstChild("Text") :: TextLabel?
+	if not textLabel then return end
 
-	local gradient: UIGradient? = currentPromptUI:FindFirstChild("Gradient")
-	local stroke: UIStroke? = currentPromptUI:FindFirstChild("Stroke")
-	if not gradient or not stroke then return end
-
-	if prompt.ActionText == "Place Car" then
-		stroke.Color = placeStrokeColor
-		gradient.Color = placeGradient
-	elseif prompt.ActionText == "Pick Up Car" then
-		stroke.Color = pickupStrokeColor
-		gradient.Color = pickupGradient
-	else -- ## FIXED ## The invisible character after 'else' has been replaced with a normal space.
-		stroke.Color = placeStrokeColor
-		gradient.Color = placeGradient
+	local unlocked = cage:GetAttribute("Unlocked") == true
+	if not unlocked then
+		billboard.Enabled = false
+		return
 	end
-end
 
-local function onPromptShown(prompt: ProximityPrompt)
-	currentPromptUI = customPromptTemplate:Clone()
-	currentPromptObject = prompt
+	billboard.Enabled = true
 
-	local keyLabel: TextLabel? = currentPromptUI:FindFirstChild("KeyLabel")
-	local tapImage: ImageLabel? = currentPromptUI:FindFirstChild("TapImage")
+	local enemyId   = cage:GetAttribute("EnemyId") :: string?
+	local display   = cage:GetAttribute("DisplayName") :: string?
+	local rarity    = cage:GetAttribute("Rarity") :: string?
+	local mutation  = cage:GetAttribute("Mutation") :: string?
+	local banked    = cage:GetAttribute("Banked") :: number? or 0
+	local lastOff   = cage:GetAttribute("LastOffline") :: number? or 0
+	local vps       = cage:GetAttribute("ValuePerSecond") :: number? or 0
+	local mult      = cage:GetAttribute("VpsMultiplier") :: number? or 1
 
-	if UserInputService.TouchEnabled then
-		if keyLabel then keyLabel.Visible = false end
-		if tapImage then tapImage.Visible = true end
+	if not enemyId or enemyId == "" then
+		textLabel.Text = "<b><font size='32'>Empty Cage</font></b>"
+		textLabel.TextColor3 = Color3.new(1, 1, 1)
+		return
+	end
+
+	local nameText     = display or enemyId
+	local rarityText   = rarity or "Common"
+	local mutationText = (mutation and mutation ~= "") and mutation or "None"
+
+	local bankedText = string.format("Banked: %d", math.floor(banked + 0.5))
+	local offlineText = ""
+	if lastOff and lastOff > 0 then
+		offlineText = string.format("(+%d offline)", math.floor(lastOff + 0.5))
+	end
+
+	local multText = ""
+	if mult and mult > 1.001 then
+		multText = string.format(" (x%.2f)", mult)
+	end
+	local vpsText = string.format("Value/s: %.0f%s", vps or 0, multText)
+
+	textLabel.Text = string.format(
+		"<b><font size='40'>%s</font></b>\n" ..
+			"<font size='30'>Rarity: %s</font>\n" ..
+			"<font size='30'>Mutation: %s</font>\n" ..
+			"<font size='30'>%s</font>\n" ..
+			"<font size='28'>%s</font>\n" ..
+			"<font size='30'>%s</font>",
+		nameText, rarityText, mutationText, bankedText, offlineText, vpsText
+	)
+
+	local rarityColor = RARITY_COLORS[rarityText]
+	if rarityColor then
+		textLabel.TextColor3 = rarityColor
 	else
-		if keyLabel then
-			keyLabel.Visible = true
-			keyLabel.Text = UserInputService:GetStringForKeyCode(prompt.KeyboardKeyCode)
+		textLabel.TextColor3 = Color3.new(1, 1, 1)
+	end
+end
+
+local function hookCage(cage: Model)
+	ensureBillboard(cage)
+	updateBillboard(cage)
+
+	local watched = {
+		"Unlocked",
+		"EnemyId",
+		"DisplayName",
+		"Rarity",
+		"Mutation",
+		"Banked",
+		"LastOffline",
+		"ValuePerSecond",
+		"VpsMultiplier",
+	}
+	for _, attr in ipairs(watched) do
+		cage:GetAttributeChangedSignal(attr):Connect(function()
+			updateBillboard(cage)
+		end)
+	end
+end
+
+local initialized = false
+
+local function tryInit()
+	if initialized then return end
+	local plot = getPlotForPlayer()
+	if not plot then return end
+
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for _, cage in ipairs(cageSystem:GetChildren()) do
+		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
+			hookCage(cage)
 		end
-		if tapImage then tapImage.Visible = false end
 	end
 
-	updatePromptStyle(prompt)
-
-	currentPromptUI.MouseButton1Click:Connect(function()
-		prompt:InputHoldBegin()
-		prompt:InputHoldEnd()
-	end)
-
-	propertyChangedConnection = prompt:GetPropertyChangedSignal("ActionText"):Connect(function()
-		updatePromptStyle(prompt)
-	end)
-
-	currentPromptUI.Parent = promptContainer
-
-	if not renderConnection then
-		renderConnection = RunService.RenderStepped:Connect(updateUIPosition)
-	end
+	initialized = true
 end
 
-local function onPromptHidden()
-	if currentPromptUI then
-		currentPromptUI:Destroy()
-		currentPromptUI = nil
+task.spawn(function()
+	while not initialized do
+		tryInit()
+		task.wait(0.5)
 	end
-	currentPromptObject = nil
+end)
 
-	if renderConnection then
-		renderConnection:Disconnect()
-		renderConnection = nil
-	end
-
-	if propertyChangedConnection then
-		propertyChangedConnection:Disconnect()
-		propertyChangedConnection = nil
-	end
-end
-
-ProximityPromptService.PromptShown:Connect(onPromptShown)
-ProximityPromptService.PromptHidden:Connect(onPromptHidden)
 ---
 
 --- StarterPlayer.StarterPlayerScripts.DisableResetButton (LocalScript) ---
@@ -977,128 +1030,106 @@ while wait() do
 end
 ---
 
---- StarterPlayer.StarterPlayerScripts.GunDisplayHandler (LocalScript) ---
+--- StarterPlayer.StarterPlayerScripts.CagePromptHandler (LocalScript) ---
 --!strict
--- Client-side display for GoldCrate / PromotionalGoldCrate
--- Put in StarterPlayerScripts (LocalScript)
--- Clones silhouette guns above every crate and rotates/cycles them (no scaling).
 
-local RunService        = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService      = game:GetService("TweenService")
-local Workspace         = game:GetService("Workspace")
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
-local GUN_SRC = ReplicatedStorage:WaitForChild("Weapons"):WaitForChild("GunDisplays")
-local ROT_SPEED   = math.rad(40)
-local CYCLE_TIME  = 2.2
-local FADE_TIME   = 0.18
+local player = Players.LocalPlayer
 
-local function parts(inst: Instance): {BasePart}
-	local t = {}
-	for _, d in ipairs(inst:GetDescendants()) do
-		if d:IsA("BasePart") then table.insert(t, d) end
+local function getPlotForPlayer(): Model?
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if not plotsFolder then return nil end
+
+	local plotNum = player:GetAttribute("PlotNumber")
+	if plotNum then
+		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
+		if plot and plot:IsA("Model") then return plot end
 	end
-	return t
-end
 
-local function makePassive(m: Instance)
-	for _, d in ipairs(m:GetDescendants()) do
-		if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Light") then d.Enabled = false end
-		if d:IsA("Script") or d:IsA("LocalScript") then d.Disabled = true end
-	end
-	for _, p in ipairs(parts(m)) do
-		p.Anchored = true
-		p.CanCollide = false
-		p.CanQuery = false
-		p.Massless = true
-	end
-end
-
-local function setAlpha(m: Instance, a: number)
-	for _, p in ipairs(parts(m)) do p.Transparency = a end
-end
-
--- Find attachment under a crate
-local function getAttachment(crate: Model): Attachment?
-	local gd = crate:FindFirstChild("GunDisplay", true)
-	if not gd then return nil end
-	for _, d in ipairs(gd:GetDescendants()) do
-		if d:IsA("Attachment") then return d end
+	for _, plot in ipairs(plotsFolder:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
+			return plot
+		end
 	end
 	return nil
 end
 
--- Build the display for one crate
-local function buildDisplay(crate: Model)
-	if crate:GetAttribute("HasDisplay") then return end
-	crate:SetAttribute("HasDisplay", true)
+local function updatePromptForCage(cage: Model, prompt: ProximityPrompt)
+	local unlocked = cage:GetAttribute("Unlocked") == true
+	if not unlocked then
+		prompt.Enabled = false
+		return
+	end
 
-	local attach = getAttachment(crate)
-	if not attach then return end
+	local enemyId  = cage:GetAttribute("EnemyId") :: string?
+	local display  = cage:GetAttribute("DisplayName") :: string?
+	local hasEnemy = enemyId ~= nil and enemyId ~= ""
 
-	local pivot = Instance.new("Part")
-	pivot.Name = "GunPivot"
-	pivot.Size = Vector3.new(0.2, 0.2, 0.2)
-	pivot.Transparency = 1
-	pivot.Anchored = true
-	pivot.CanCollide = false
-	pivot.CanQuery = false
-	pivot.Parent = crate
-	pivot.CFrame = attach.WorldCFrame
+	local selectedName = player:GetAttribute("SelectedEnemyDisplayName") :: string?
+	local selectedId   = player:GetAttribute("SelectedEnemyId") :: string?
 
-	local guns: {Model} = {}
-	for _, src in ipairs(GUN_SRC:GetChildren()) do
-		if src:IsA("Model") then
-			local m = src:Clone()
-			makePassive(m)
-			m:PivotTo(pivot.CFrame)
-			setAlpha(m, 1)
-			m.Parent = crate
-			table.insert(guns, m)
+	if hasEnemy then
+		local nameText = display or enemyId or "Enemy"
+		prompt.ObjectText = "Cage"
+		prompt.ActionText = "Remove " .. nameText
+		prompt.Enabled = true
+	else
+		if selectedId and selectedId ~= "" then
+			local nameText = selectedName or "Enemy"
+			prompt.ObjectText = "Cage"
+			prompt.ActionText = "Place " .. nameText
+			prompt.Enabled = true
+		else
+			prompt.ObjectText = "Empty Cage"
+			prompt.ActionText = "Place Enemy"
+			prompt.Enabled = false
 		end
 	end
-	if #guns == 0 then return end
-	setAlpha(guns[1], 0)
-
-	local i, last = 1, time()
-	RunService.RenderStepped:Connect(function()
-		if not crate:IsDescendantOf(Workspace) then return end
-		pivot.CFrame = attach.WorldCFrame
-
-		local rot = CFrame.Angles(0, ROT_SPEED * (tick() % 10000), 0)
-		local target = pivot.CFrame * rot
-		for _, m in ipairs(guns) do
-			m:PivotTo(target)
-		end
-
-		if time() - last >= CYCLE_TIME then
-			last = time()
-			local old = guns[i]
-			i = (i % #guns) + 1
-			local new = guns[i]
-
-			local t0 = time()
-			while time() - t0 < FADE_TIME do
-				local a = (time() - t0) / FADE_TIME
-				setAlpha(old, a)
-				setAlpha(new, 1 - a)
-				RunService.RenderStepped:Wait()
-			end
-			setAlpha(old, 1)
-			setAlpha(new, 0)
-		end
-	end)
 end
 
--- Handle all crates already present + future ones
-for _, c in ipairs(Workspace:GetDescendants()) do
-	if c:IsA("Model") and (c.Name == "GoldCrate" or c.Name == "PromotionalGoldCrate") then
-		buildDisplay(c)
+local function hookCage(cage: Model)
+	local prompt = cage:FindFirstChild("CagePrompt", true) :: ProximityPrompt?
+	if not prompt then return end
+
+	local function refresh()
+		updatePromptForCage(cage, prompt)
 	end
+
+	cage:GetAttributeChangedSignal("Unlocked"):Connect(refresh)
+	cage:GetAttributeChangedSignal("EnemyId"):Connect(refresh)
+	cage:GetAttributeChangedSignal("DisplayName"):Connect(refresh)
+	player:GetAttributeChangedSignal("SelectedEnemyId"):Connect(refresh)
+	player:GetAttributeChangedSignal("SelectedEnemyDisplayName"):Connect(refresh)
+
+	refresh()
 end
-Workspace.DescendantAdded:Connect(function(obj)
-	if obj:IsA("Model") and (obj.Name == "GoldCrate" or obj.Name == "PromotionalGoldCrate") then
-		buildDisplay(obj)
+
+local initialized = false
+
+local function tryInit()
+	if initialized then return end
+
+	local plot = getPlotForPlayer()
+	if not plot then return end
+
+	local cageSystem = plot:FindFirstChild("CageSystem")
+	if not cageSystem then return end
+
+	for _, cage in ipairs(cageSystem:GetChildren()) do
+		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
+			hookCage(cage)
+		end
+	end
+
+	initialized = true
+end
+
+task.spawn(function()
+	while not initialized do
+		tryInit()
+		task.wait(0.5)
 	end
 end)
 
@@ -1131,10 +1162,6 @@ local deleteButton = bottomHud:WaitForChild("Delete")
 local weaponsButton = bottomHud:WaitForChild("Weapons")
 local weaponsButtonImage = weaponsButton:WaitForChild("Image")
 
--- Plus (Follow) button under Cash
-local cash = hudRoot:WaitForChild("Cash")
-local cashDesign = cash:WaitForChild("Design")
-local plusButton = cashDesign:WaitForChild("PlusButton") :: ImageButton -- ADDED
 
 local inventoryDesign = inventoryButton:WaitForChild("Design")
 local inventoryStroke = inventoryDesign:WaitForChild("Stroke")
@@ -1193,42 +1220,11 @@ local function toggleDeleteMode()
 	PlacementHandler:EnterDeleteMode()
 end
 
--- ========== Robux store opener (PlusButton) ==========
-local function openRobuxStore()
-	if not hudActive() then return end
-
-	-- 1) Try direct Dev Product purchase
-	local productId: any = plusButton:GetAttribute("ProductId")
-	if productId == nil then
-		local nv = plusButton:FindFirstChild("ProductId")
-		if nv and nv:IsA("NumberValue") then productId = nv.Value end
-	end
-
-	if typeof(productId) == "number" then
-		MarketplaceService:PromptProductPurchase(player, productId)
-		return
-	end
-
-	-- 2) Otherwise, open a store frame if provided
-	local frameName = plusButton:GetAttribute("OpenFrame")
-	if typeof(frameName) == "string" and #frameName > 0 then
-		PlacementHandler:ExitAllModes()
-		FrameManager.open(frameName)
-		return
-	end
-
-	-- 3) Fallback: try a conventional frame name
-	if FrameManager.open then
-		PlacementHandler:ExitAllModes()
-		FrameManager.open("RobuxStore")
-	end
-end
 
 -- ========== Button wiring ==========
 inventoryButton.MouseButton1Click:Connect(toggleInventoryPlacement)
 weaponsButton.MouseButton1Click:Connect(toggleWeapons)
 deleteButton.MouseButton1Click:Connect(toggleDeleteMode)
-plusButton.MouseButton1Click:Connect(openRobuxStore) -- ADDED
 
 -- If any inventory panel closes, kill placement state so we don't leave a ghost active.
 FrameManager.onFrameClosed(function(frameName)
@@ -2517,14 +2513,34 @@ local function initializeUI()
 	local framesContainer = gui:WaitForChild("Frames")
 	local hud = gui:WaitForChild("HUD")
 
-	-- Left: RobuxStore only (keep)
+	-- Reference the new ScreenGui with Shop / Gift
+	local mainScreenGui = playerGui:WaitForChild("ScreenGui")
+	local shopFrame = mainScreenGui:WaitForChild("Shop") :: Frame
+
+	-- Left HUD
 	local leftHud = hud:WaitForChild("Left")
-	hookButtonToFrame(leftHud:FindFirstChild("RobuxStore"), "RobuxStore")
+	local robuxButton = leftHud:FindFirstChild("RobuxStore")
 
-	-- Removed: Right-side hooks for MiniGunpack & StarterPack.
-	-- Those are owned by AdsUiController to avoid double-binding.F
+	-- OLD (removed):
+	-- hookButtonToFrame(leftHud:FindFirstChild("RobuxStore"), "RobuxStore")
 
-	-- Close buttons inside Frames
+	-- NEW: directly toggle the Shop frame
+	if robuxButton and (robuxButton:IsA("TextButton") or robuxButton:IsA("ImageButton")) then
+		attachIconTweens(robuxButton)
+
+		robuxButton.MouseButton1Click:Connect(function()
+			-- Simple toggle for now
+			shopFrame.Visible = not shopFrame.Visible
+		end)
+	end
+
+	-- You can optionally hide/remove the old RobuxStore frame if you keep it in the hierarchy
+	local oldRobuxStore = framesContainer:FindFirstChild("RobuxStore")
+	if oldRobuxStore and oldRobuxStore:IsA("GuiObject") then
+		oldRobuxStore.Visible = false
+	end
+
+	-- Close buttons inside Frames (still handled via FrameManager)
 	for _, frame in ipairs(framesContainer:GetChildren()) do
 		if frame:IsA("GuiObject") then
 			local closeButton = frame:FindFirstChild("Close")
@@ -2539,460 +2555,6 @@ player.CharacterAdded:Connect(initializeUI)
 if player.Character then
 	initializeUI()
 end
-
----
-
---- StarterPlayer.StarterPlayerScripts.UpgradeBillboardHandler (LocalScript) ---
---!strict
-local Players           = game:GetService("Players")
-local Workspace         = game:GetService("Workspace")
-
-local localPlayer = Players.LocalPlayer
-local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
-
-local billboardMap: {[Model]: BillboardGui} = {}
-
-local function createBillboard(parentPart: BasePart): BillboardGui
-	local bb = Instance.new("BillboardGui")
-	bb.Name = "UpgradePlotBillboard"
-	bb.Adornee = parentPart
-	bb.AlwaysOnTop = true
-	bb.Size = UDim2.fromOffset(380, 120)
-	bb.StudsOffsetWorldSpace = Vector3.new(0, 10, 0)
-	bb.MaxDistance = 200
-
-	local frame = Instance.new("Frame")
-	frame.BackgroundTransparency = 1
-	frame.Size = UDim2.fromScale(1, 1)
-	frame.Parent = bb
-
-	local title = Instance.new("TextLabel")
-	title.BackgroundTransparency = 1
-	title.Size = UDim2.new(1, 0, 0, 72)
-	title.Position = UDim2.new(0, 0, 0, 0)
-	title.Text = "Upgrade your plot"
-	title.TextColor3 = Color3.fromRGB(235, 64, 64)
-	title.TextScaled = true
-	title.Font = Enum.Font.FredokaOne
-	title.Parent = frame
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 2
-	stroke.Color = Color3.new(0, 0, 0)
-	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
-	stroke.Parent = title
-
-	local arrow = Instance.new("TextLabel")
-	arrow.BackgroundTransparency = 1
-	arrow.Size = UDim2.new(1, 0, 0, 40)
-	arrow.Position = UDim2.new(0, 0, 0, 78)
-	arrow.Text = "▼"
-	arrow.TextColor3 = Color3.fromRGB(235, 64, 64)
-	arrow.TextScaled = true
-	arrow.Font = Enum.Font.FredokaOne
-	arrow.Parent = frame
-
-	local arrowStroke = Instance.new("UIStroke")
-	arrowStroke.Thickness = 2
-	arrowStroke.Color = Color3.new(0, 0, 0)
-	arrowStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
-	arrowStroke.Parent = arrow
-
-	bb.Parent = parentPart
-	return bb
-end
-
-local function attachBillboardToPlot(plot: Model)
-	if billboardMap[plot] then return end
-	local upgrade = plot:FindFirstChild("Upgrade")
-	local upgradeTouch = upgrade and upgrade:FindFirstChild("UpgradeTouch")
-	local touch = upgradeTouch and upgradeTouch:FindFirstChild("Touch")
-	if touch and touch:IsA("BasePart") then
-		local bb = createBillboard(touch)
-		billboardMap[plot] = bb
-		touch.AncestryChanged:Connect(function(_, parent)
-			if not parent then
-				if billboardMap[plot] then
-					billboardMap[plot]:Destroy()
-					billboardMap[plot] = nil
-				end
-			end
-		end)
-	end
-end
-
-local function removeBillboard(plot: Model)
-	local bb = billboardMap[plot]
-	if bb then
-		bb:Destroy()
-		billboardMap[plot] = nil
-	end
-end
-
-local function refresh()
-	for _, plot in ipairs(PLOTS_FOLDER:GetChildren()) do
-		if plot:IsA("Model") then
-			if plot:GetAttribute("OwnerId") == localPlayer.UserId then
-				attachBillboardToPlot(plot)
-			else
-				removeBillboard(plot)
-			end
-		end
-	end
-end
-
--- Initial + auto-refresh every 2s
-refresh()
-task.spawn(function()
-	while task.wait(2) do
-		refresh()
-	end
-end)
-
--- Detect new plots
-PLOTS_FOLDER.ChildAdded:Connect(function(child)
-	task.wait(1)
-	refresh()
-end)
-
--- Clean on respawn
-localPlayer.CharacterAdded:Connect(function()
-	for plot, bb in pairs(billboardMap) do
-		if bb then bb:Destroy() end
-	end
-	table.clear(billboardMap)
-	refresh()
-end)
-
----
-
---- StarterPlayer.StarterPlayerScripts.VersionDisplay (LocalScript) ---
---!strict
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-
--- find your already existing GUI
-local rootGui = playerGui:WaitForChild("GUI"):WaitForChild("Frames")
-local versionFrame = rootGui:WaitForChild("GameVersion")
-local versionText = versionFrame:WaitForChild("VersionText") :: TextLabel
-
--- Place version (auto increments every time you publish)
-local placeVersion = game.PlaceVersion
-
--- Fallback for Studio (PlaceVersion = 0 in most cases)
-if placeVersion == 0 and RunService:IsStudio() then
-	versionText.Text = "Version: DEV"
-else
-	versionText.Text = "Version: v" .. tostring(placeVersion)
-end
-
--- Optional: fade-in animation
-versionText.TextTransparency = 1
-game:GetService("TweenService"):Create(
-	versionText,
-	TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
-	{TextTransparency = 0}
-):Play()
-
----
-
---- StarterPlayer.StarterPlayerScripts.CageBillboardHandler (LocalScript) ---
---!strict
-
-local Players   = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-
-local player = Players.LocalPlayer
-
-local RARITY_COLORS: {[string]: Color3} = {
-	Common    = Color3.fromRGB(200, 200, 200),
-	Rare      = Color3.fromRGB(80, 170, 255),
-	Epic      = Color3.fromRGB(190, 90, 255),
-	Legendary = Color3.fromRGB(255, 200, 80),
-	Boss      = Color3.fromRGB(255, 80, 80),
-	Secret    = Color3.fromRGB(80, 255, 200),
-}
-
-local function getPlotForPlayer(): Model?
-	local plotsFolder = Workspace:FindFirstChild("Plots")
-	if not plotsFolder then return nil end
-
-	local plotNum = player:GetAttribute("PlotNumber")
-	if plotNum then
-		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
-		if plot and plot:IsA("Model") then return plot end
-	end
-
-	for _, plot in ipairs(plotsFolder:GetChildren()) do
-		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
-			return plot
-		end
-	end
-	return nil
-end
-
-local function ensureBillboard(cage: Model): BillboardGui
-	-- find the part we want to stick the label to
-	local attach = cage:FindFirstChild("EnemyPlacementBillboard", true)
-	if attach and not attach:IsA("BasePart") then
-		attach = nil
-	end
-
-	-- find any existing CageLabel anywhere under this cage
-	local billboard = cage:FindFirstChild("CageLabel", true) :: BillboardGui?
-	if not billboard then
-		billboard = Instance.new("BillboardGui")
-		billboard.Name = "CageLabel"
-		billboard.Size = UDim2.new(0, 520, 0, 260)
-		billboard.MaxDistance = 50
-		billboard.LightInfluence = 0
-		billboard.AlwaysOnTop = true
-		billboard.Enabled = false
-
-		local label = Instance.new("TextLabel")
-		label.Name = "Text"
-		label.Size = UDim2.new(1, 0, 1, 0)
-		label.BackgroundTransparency = 1
-		label.TextColor3 = Color3.new(1, 1, 1)
-		label.TextStrokeTransparency = 0
-		label.Font = Enum.Font.GothamBlack
-		label.TextSize = 32
-		label.TextWrapped = true
-		label.RichText = true
-		label.Parent = billboard
-	end
-
-	-- if we have the EnemyPlacementBillboard part, parent + adorn to it
-	if attach and attach:IsA("BasePart") then
-		billboard.Parent = attach
-		billboard.Adornee = attach
-		billboard.StudsOffsetWorldSpace = Vector3.new(0, 0, 0)
-	else
-		-- fallback: keep it on the cage root (old behaviour)
-		billboard.Parent = cage
-		billboard.Adornee = nil
-	end
-
-	return billboard
-end
-
-local function updateBillboard(cage: Model)
-	local billboard = ensureBillboard(cage)
-	local textLabel = billboard:FindFirstChild("Text") :: TextLabel?
-	if not textLabel then return end
-
-	local unlocked = cage:GetAttribute("Unlocked") == true
-	if not unlocked then
-		billboard.Enabled = false
-		return
-	end
-
-	billboard.Enabled = true
-
-	local enemyId   = cage:GetAttribute("EnemyId") :: string?
-	local display   = cage:GetAttribute("DisplayName") :: string?
-	local rarity    = cage:GetAttribute("Rarity") :: string?
-	local mutation  = cage:GetAttribute("Mutation") :: string?
-	local banked    = cage:GetAttribute("Banked") :: number? or 0
-	local lastOff   = cage:GetAttribute("LastOffline") :: number? or 0
-	local vps       = cage:GetAttribute("ValuePerSecond") :: number? or 0
-	local mult      = cage:GetAttribute("VpsMultiplier") :: number? or 1
-
-	if not enemyId or enemyId == "" then
-		textLabel.Text = "<b><font size='32'>Empty Cage</font></b>"
-		textLabel.TextColor3 = Color3.new(1, 1, 1)
-		return
-	end
-
-	local nameText     = display or enemyId
-	local rarityText   = rarity or "Common"
-	local mutationText = (mutation and mutation ~= "") and mutation or "None"
-
-	local bankedText = string.format("Banked: %d", math.floor(banked + 0.5))
-	local offlineText = ""
-	if lastOff and lastOff > 0 then
-		offlineText = string.format("(+%d offline)", math.floor(lastOff + 0.5))
-	end
-
-	local multText = ""
-	if mult and mult > 1.001 then
-		multText = string.format(" (x%.2f)", mult)
-	end
-	local vpsText = string.format("Value/s: %.0f%s", vps or 0, multText)
-
-	textLabel.Text = string.format(
-		"<b><font size='40'>%s</font></b>\n" ..
-			"<font size='30'>Rarity: %s</font>\n" ..
-			"<font size='30'>Mutation: %s</font>\n" ..
-			"<font size='30'>%s</font>\n" ..
-			"<font size='28'>%s</font>\n" ..
-			"<font size='30'>%s</font>",
-		nameText, rarityText, mutationText, bankedText, offlineText, vpsText
-	)
-
-	local rarityColor = RARITY_COLORS[rarityText]
-	if rarityColor then
-		textLabel.TextColor3 = rarityColor
-	else
-		textLabel.TextColor3 = Color3.new(1, 1, 1)
-	end
-end
-
-local function hookCage(cage: Model)
-	ensureBillboard(cage)
-	updateBillboard(cage)
-
-	local watched = {
-		"Unlocked",
-		"EnemyId",
-		"DisplayName",
-		"Rarity",
-		"Mutation",
-		"Banked",
-		"LastOffline",
-		"ValuePerSecond",
-		"VpsMultiplier",
-	}
-	for _, attr in ipairs(watched) do
-		cage:GetAttributeChangedSignal(attr):Connect(function()
-			updateBillboard(cage)
-		end)
-	end
-end
-
-local initialized = false
-
-local function tryInit()
-	if initialized then return end
-	local plot = getPlotForPlayer()
-	if not plot then return end
-
-	local cageSystem = plot:FindFirstChild("CageSystem")
-	if not cageSystem then return end
-
-	for _, cage in ipairs(cageSystem:GetChildren()) do
-		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
-			hookCage(cage)
-		end
-	end
-
-	initialized = true
-end
-
-task.spawn(function()
-	while not initialized do
-		tryInit()
-		task.wait(0.5)
-	end
-end)
-
----
-
---- StarterPlayer.StarterPlayerScripts.CagePromptHandler (LocalScript) ---
---!strict
-
-local Players   = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-
-local player = Players.LocalPlayer
-
-local function getPlotForPlayer(): Model?
-	local plotsFolder = Workspace:FindFirstChild("Plots")
-	if not plotsFolder then return nil end
-
-	local plotNum = player:GetAttribute("PlotNumber")
-	if plotNum then
-		local plot = plotsFolder:FindFirstChild("Plot" .. tostring(plotNum))
-		if plot and plot:IsA("Model") then return plot end
-	end
-
-	for _, plot in ipairs(plotsFolder:GetChildren()) do
-		if plot:IsA("Model") and plot:GetAttribute("OwnerId") == player.UserId then
-			return plot
-		end
-	end
-	return nil
-end
-
-local function updatePromptForCage(cage: Model, prompt: ProximityPrompt)
-	local unlocked = cage:GetAttribute("Unlocked") == true
-	if not unlocked then
-		prompt.Enabled = false
-		return
-	end
-
-	local enemyId  = cage:GetAttribute("EnemyId") :: string?
-	local display  = cage:GetAttribute("DisplayName") :: string?
-	local hasEnemy = enemyId ~= nil and enemyId ~= ""
-
-	local selectedName = player:GetAttribute("SelectedEnemyDisplayName") :: string?
-	local selectedId   = player:GetAttribute("SelectedEnemyId") :: string?
-
-	if hasEnemy then
-		local nameText = display or enemyId or "Enemy"
-		prompt.ObjectText = "Cage"
-		prompt.ActionText = "Remove " .. nameText
-		prompt.Enabled = true
-	else
-		if selectedId and selectedId ~= "" then
-			local nameText = selectedName or "Enemy"
-			prompt.ObjectText = "Cage"
-			prompt.ActionText = "Place " .. nameText
-			prompt.Enabled = true
-		else
-			prompt.ObjectText = "Empty Cage"
-			prompt.ActionText = "Place Enemy"
-			prompt.Enabled = false
-		end
-	end
-end
-
-local function hookCage(cage: Model)
-	local prompt = cage:FindFirstChild("CagePrompt", true) :: ProximityPrompt?
-	if not prompt then return end
-
-	local function refresh()
-		updatePromptForCage(cage, prompt)
-	end
-
-	cage:GetAttributeChangedSignal("Unlocked"):Connect(refresh)
-	cage:GetAttributeChangedSignal("EnemyId"):Connect(refresh)
-	cage:GetAttributeChangedSignal("DisplayName"):Connect(refresh)
-	player:GetAttributeChangedSignal("SelectedEnemyId"):Connect(refresh)
-	player:GetAttributeChangedSignal("SelectedEnemyDisplayName"):Connect(refresh)
-
-	refresh()
-end
-
-local initialized = false
-
-local function tryInit()
-	if initialized then return end
-
-	local plot = getPlotForPlayer()
-	if not plot then return end
-
-	local cageSystem = plot:FindFirstChild("CageSystem")
-	if not cageSystem then return end
-
-	for _, cage in ipairs(cageSystem:GetChildren()) do
-		if cage:IsA("Model") and cage.Name:match("^Cage%d+$") then
-			hookCage(cage)
-		end
-	end
-
-	initialized = true
-end
-
-task.spawn(function()
-	while not initialized do
-		tryInit()
-		task.wait(0.5)
-	end
-end)
 
 ---
 
@@ -3055,6 +2617,39 @@ end)
 ChatAnnouncement.OnClientEvent:Connect(function(msg: string)
 	systemMessage(msg, Color3.fromRGB(255, 230, 100)) -- gold/yellow
 end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.VersionDisplay (LocalScript) ---
+--!strict
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- find your already existing GUI
+local rootGui = playerGui:WaitForChild("GUI"):WaitForChild("Frames")
+local versionFrame = rootGui:WaitForChild("GameVersion")
+local versionText = versionFrame:WaitForChild("VersionText") :: TextLabel
+
+-- Place version (auto increments every time you publish)
+local placeVersion = game.PlaceVersion
+
+-- Fallback for Studio (PlaceVersion = 0 in most cases)
+if placeVersion == 0 and RunService:IsStudio() then
+	versionText.Text = "Version: DEV"
+else
+	versionText.Text = "Version: v" .. tostring(placeVersion)
+end
+
+-- Optional: fade-in animation
+versionText.TextTransparency = 1
+game:GetService("TweenService"):Create(
+	versionText,
+	TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+	{TextTransparency = 0}
+):Play()
 
 ---
 
@@ -3566,22 +3161,17 @@ end)
 
 --- StarterGui.GUI.HUD.Counters.CashDisplayHandler (LocalScript) ---
 --!strict
--- CashDisplayHandler (NEW)
--- Handles:
---  - Cash display animation
---  - "+amount" popup when earning money
---  - Counters.Money + Counters.FriendBoost
---  - Friend invite button
+-- CashDisplayHandler (FINAL VERSION)
+-- Parent = GUI.HUD.Counters
 
---// Services
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService      = game:GetService("TweenService")
 local RunService        = game:GetService("RunService")
 local SocialService     = game:GetService("SocialService")
 
---// Player & Modules
 local player = Players.LocalPlayer
+
 local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
 
 local Events    = ReplicatedStorage:WaitForChild("Events")
@@ -3589,45 +3179,31 @@ local Functions = ReplicatedStorage:WaitForChild("Functions")
 local CashUpdated   = Events:WaitForChild("CashUpdated") :: RemoteEvent
 local GetPlayerCash = Functions:WaitForChild("GetPlayerCash") :: RemoteFunction
 
---// UI references
-local playerGui   = player:WaitForChild("PlayerGui")
-local gui         = playerGui:WaitForChild("GUI")
-local hud         = gui:WaitForChild("HUD")
+-- UI ----------------------------------------------------
+local counters         = script.Parent :: Frame
+local moneyLabel       = counters:WaitForChild("Money") :: TextLabel
+local friendBoostLabel = counters:WaitForChild("FriendBoost") :: TextLabel
 
-local cashFrame   = hud:WaitForChild("Cash") :: Frame
-local amountLabel = cashFrame:WaitForChild("Amount") :: TextLabel
-local designFrame = cashFrame:WaitForChild("Design") :: Frame
-local plusButton  = designFrame:WaitForChild("PlusButton") :: ImageButton
-
-local countersFrame      = hud:WaitForChild("Counters") :: Frame
-local moneyCounterLabel  = countersFrame:WaitForChild("Money") :: TextLabel
-local friendBoostLabel   = countersFrame:WaitForChild("FriendBoost") :: TextLabel
-
---// State
+-- State -------------------------------------------------
 local oldCashValue = 0
-local connection: RBXScriptConnection? = nil
+local animConn: RBXScriptConnection? = nil
 local currentFriendBoostPercent = 0
 
 --------------------------------------------------
--- UI helpers
+-- Helpers
 --------------------------------------------------
 
 local function setCashText(value: number)
 	local formatted = NumberFormatter.formatNumber(value, "$")
-	amountLabel.Text = formatted
-	moneyCounterLabel.Text = formatted
+	moneyLabel.Text = formatted
 end
 
 local function updateFriendBoostLabel()
-	if currentFriendBoostPercent > 0 then
-		friendBoostLabel.Text = string.format("Friend boost: +%d%%", currentFriendBoostPercent)
-	else
-		friendBoostLabel.Text = "Invite friends: up to +30% cash"
-	end
+	friendBoostLabel.Text = string.format("Friend boost : %d%%", currentFriendBoostPercent)
 end
 
 --------------------------------------------------
--- Friend boost calculation (client-side visual)
+-- Friend boost (visual only)
 --------------------------------------------------
 
 local function recalcFriendBoost()
@@ -3638,7 +3214,6 @@ local function recalcFriendBoost()
 			local ok, isFriend = pcall(function()
 				return player:IsFriendsWith(plr.UserId)
 			end)
-
 			if ok and isFriend then
 				friendsInServer += 1
 			end
@@ -3649,42 +3224,40 @@ local function recalcFriendBoost()
 	updateFriendBoostLabel()
 end
 
--- Initial calc + react to players joining/leaving
+-- Hook into player list changes
 recalcFriendBoost()
 Players.PlayerAdded:Connect(recalcFriendBoost)
 Players.PlayerRemoving:Connect(recalcFriendBoost)
 
 --------------------------------------------------
--- Cash animations
+-- Floating +cash popup (now inside moneyLabel)
 --------------------------------------------------
 
--- Floating "+amount" popup when gaining money
 local function showGainPopup(delta: number)
 	if delta <= 0 then return end
 
-	-- Create a temporary label
 	local popup = Instance.new("TextLabel")
 	popup.BackgroundTransparency = 1
 	popup.BorderSizePixel = 0
-	popup.Font = amountLabel.Font
+	popup.Font = moneyLabel.Font
 	popup.TextScaled = true
 	popup.Text = "+" .. NumberFormatter.formatNumber(delta, "$")
 	popup.TextColor3 = Color3.fromRGB(80, 255, 80)
 	popup.TextStrokeTransparency = 0.3
 	popup.TextStrokeColor3 = Color3.new(0, 0, 0)
 
-	popup.Size = amountLabel.Size
-	popup.AnchorPoint = amountLabel.AnchorPoint
-	popup.Position = amountLabel.Position
-	popup.ZIndex = amountLabel.ZIndex + 1
-	popup.Parent = cashFrame
+	-- parent INSIDE the Money label
+	popup.Size = UDim2.fromScale(1, 1)
+	popup.AnchorPoint = Vector2.new(0.5, 0.5)
+	popup.Position = UDim2.fromScale(0.5, 0.5)
+	popup.ZIndex = moneyLabel.ZIndex + 1
+	popup.Parent = moneyLabel
 
 	local tweenInfo = TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
 	local goal = {
-		Position = popup.Position - UDim2.new(0, 0, 0.07, 0),
+		Position = UDim2.fromScale(0.5, 0.2), -- float upward
 		TextTransparency = 1,
-		TextStrokeTransparency = 1
+		TextStrokeTransparency = 1,
 	}
 
 	local tween = TweenService:Create(popup, tweenInfo, goal)
@@ -3694,17 +3267,20 @@ local function showGainPopup(delta: number)
 	end)
 end
 
--- Smoothly animates the cash value counting up
+--------------------------------------------------
+-- Cash animations
+--------------------------------------------------
+
 local function animateCashIncrease(startValue: number, endValue: number)
 	local duration = 0.5
 	local startTime = os.clock()
 	local delta = endValue - startValue
 
-	if connection then
-		connection:Disconnect()
+	if animConn then
+		animConn:Disconnect()
 	end
 
-	connection = RunService.Heartbeat:Connect(function()
+	animConn = RunService.Heartbeat:Connect(function()
 		local elapsed = os.clock() - startTime
 		local progress = math.min(elapsed / duration, 1)
 		local alpha = TweenService:GetValue(progress, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
@@ -3714,16 +3290,15 @@ local function animateCashIncrease(startValue: number, endValue: number)
 
 		if progress >= 1 then
 			setCashText(endValue)
-			if connection then
-				connection:Disconnect()
-				connection = nil
+			if animConn then
+				animConn:Disconnect()
+				animConn = nil
 			end
 		end
 	end)
 end
 
--- Just snap to the new value (for decreases or initial)
-local function animateCashDecrease(newValue: number)
+local function animateCashSnap(newValue: number)
 	setCashText(newValue)
 end
 
@@ -3733,9 +3308,8 @@ local function onCashChanged(newValue: number)
 		showGainPopup(diff)
 		animateCashIncrease(oldCashValue, newValue)
 	elseif newValue < oldCashValue then
-		animateCashDecrease(newValue)
+		animateCashSnap(newValue)
 	else
-		-- initial setup or no change
 		setCashText(newValue)
 	end
 
@@ -3743,31 +3317,29 @@ local function onCashChanged(newValue: number)
 end
 
 --------------------------------------------------
--- Friend invite button
+-- FriendBoost label -> invite friends
 --------------------------------------------------
 
-plusButton.MouseButton1Click:Connect(function()
-	-- Try to open Roblox's native invite prompt
-	local ok, err = pcall(function()
-		SocialService:PromptGameInvite(player)
-	end)
-
-	if not ok then
-		warn("[CashDisplayHandler] Failed to prompt game invite:", err)
+friendBoostLabel.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local ok, err = pcall(function()
+			SocialService:PromptGameInvite(player)
+		end)
+		if not ok then
+			warn("[CashDisplayHandler] Failed to open invite prompt:", err)
+		end
 	end
 end)
 
 --------------------------------------------------
--- Init: hook CashUpdated + initial value
+-- Initialization
 --------------------------------------------------
 
 task.spawn(function()
-	-- Listen to server cash updates
 	CashUpdated.OnClientEvent:Connect(function(newValue: number)
 		onCashChanged(newValue)
 	end)
 
-	-- Request initial cash
 	local success, initialCash = pcall(function()
 		return GetPlayerCash:InvokeServer()
 	end)
@@ -3775,7 +3347,7 @@ task.spawn(function()
 	if success and typeof(initialCash) == "number" then
 		onCashChanged(initialCash)
 	else
-		warn("[CashDisplayHandler] Failed to get initial cash from server.")
+		warn("[CashDisplayHandler] Failed to get initial cash.")
 		onCashChanged(0)
 	end
 end)
@@ -6069,5 +5641,599 @@ rebirthFrame:GetPropertyChangedSignal("Visible"):Connect(function()
 end)
 
 task.delay(1, refreshUI)
+
+---
+
+--- StarterGui.ScreenGui.Shop.ShopHandler (LocalScript) ---
+--!strict
+-- ShopHandler
+-- LOCATION: ScreenGui.Shop.ShopHandler (LocalScript)
+-- Wires the new Shop UI to MarketplaceService.
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local Modules            = ReplicatedStorage:WaitForChild("Modules")
+local NumberFormatter    = require(Modules:WaitForChild("NumberFormatter"))
+
+local EventsFolder         = ReplicatedStorage:WaitForChild("Events")
+local ServerLuckStateEvent = EventsFolder:WaitForChild("ServerLuckState") :: RemoteEvent
+
+local player     = Players.LocalPlayer
+local playerGui  = player:WaitForChild("PlayerGui")
+local screenGui  = playerGui:WaitForChild("ScreenGui")
+local shopFrame  = script.Parent :: Frame
+local giftFrame  = screenGui:FindFirstChild("Gift") :: Frame?
+
+-- Cache for prices
+local robuxPricesCache: {[number]: string} = {}
+
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+
+local function setPriceLabel(label: TextLabel, id: number, infoType: Enum.InfoType)
+	if id == 0 then
+		label.Text = "N/A"
+		return
+	end
+
+	if robuxPricesCache[id] then
+		label.Text = robuxPricesCache[id]
+		return
+	end
+
+	label.Text = "..."
+
+	task.spawn(function()
+		local success, info = pcall(function()
+			return MarketplaceService:GetProductInfo(id, infoType)
+		end)
+
+		if success and info and label.Parent then
+			local priceText = "" .. tostring(info.PriceInRobux)
+			robuxPricesCache[id] = priceText
+			label.Text = priceText
+		elseif label.Parent then
+			label.Text = "N/A"
+		end
+	end)
+end
+
+local function wireDevProductButton(
+	button: TextButton,
+	priceLabel: TextLabel,
+	productId: number
+)
+	setPriceLabel(priceLabel, productId, Enum.InfoType.Product)
+
+	button.MouseButton1Click:Connect(function()
+		if productId == 0 then
+			warn("[ShopHandler] DevProductId = 0, button has no product set:", button:GetFullName())
+			return
+		end
+
+		MarketplaceService:PromptProductPurchase(player, productId)
+	end)
+end
+
+local function wireGamepassButton(
+	button: TextButton,
+	priceLabel: TextLabel,
+	gamePassId: number
+)
+	setPriceLabel(priceLabel, gamePassId, Enum.InfoType.GamePass)
+
+	button.MouseButton1Click:Connect(function()
+		if gamePassId == 0 then
+			warn("[ShopHandler] GamePassId = 0, button has no gamepass set:", button:GetFullName())
+			return
+		end
+
+		MarketplaceService:PromptGamePassPurchase(player, gamePassId)
+	end)
+end
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+
+local DEV_PRODUCTS = {
+	-- Cash
+	Money = {
+		One = {
+			productId = 3433108028, -- 5k cash
+			cashAmount = 5_000,
+		},
+		Two = {
+			productId = 3433108213, -- 25k cash
+			cashAmount = 25_000,
+		},
+		Three = {
+			productId = 3433108417, -- 100k cash
+			cashAmount = 100_000,
+		},
+	},
+	Money2 = {
+		Four = {
+			productId = 3433108573, -- 300k cash
+			cashAmount = 300_000,
+		},
+		MoneyOffer = {
+			productId = 3466012642, -- Test Devproduct (special offer)
+			cashAmount = 0,
+		},
+	},
+
+	-- Potions (Money, Luck, Damage) – all using Test Devproduct for now
+	Potions = {
+		MoneyPotion  = 3466012642,
+		LuckPotion   = 3466012642,
+		DamagePotion = 3466012642,
+	},
+
+	-- Limited eggs – all Test Devproduct for now
+	Limited = {
+		BuyOne   = 3466012642,
+		BuyThree = 3466012642,
+		BuyTen   = 3466012642,
+	},
+}
+
+-- Server luck product ids
+local SERVER_LUCK_PRODUCTS = {
+	X2 = {
+		productId = 3446300267, -- 2x (299R$)
+	},
+	X4 = {
+		productId = 3446300425, -- 4x (799R$)
+	},
+	X10 = {
+		productId = 3446300596, -- Max (x10, 999R$)
+	},
+}
+
+-- GAMEPASSES – FILL THESE IDs
+local GAMEPASSES = {
+	VIP = {
+		gamePassId = 0, -- TODO: put your VIP gamepass ID
+	},
+	["2xMoney"] = {
+		gamePassId = 0, -- TODO: put your 2x money gamepass ID
+	},
+	ExtraCrateSlots = {
+		gamePassId = 0, -- TODO: put your extra crate slots gamepass ID
+	},
+	SmallLuck = {
+		gamePassId = 0, -- TODO: put your small luck gamepass ID
+	},
+	BigLuck = {
+		gamePassId = 0, -- TODO: put your big luck gamepass ID
+	},
+}
+
+----------------------------------------------------------------
+-- Wiring: Money
+----------------------------------------------------------------
+
+local container = shopFrame:WaitForChild("Container") :: ScrollingFrame
+
+local function setupMoney()
+	local moneyFrame = container:WaitForChild("Money") :: Frame
+	local money2Frame = container:WaitForChild("Money2") :: Frame
+
+	-- Money.One (5k)
+	do
+		local cfg = DEV_PRODUCTS.Money.One
+		local card = moneyFrame:WaitForChild("One") :: Frame
+
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+		local icon = card:WaitForChild("Icon") :: ImageLabel
+		local amountLabel = icon:WaitForChild("Amount") :: TextLabel
+		amountLabel.Text = NumberFormatter.formatNumber(cfg.cashAmount)
+
+		wireDevProductButton(buy, priceLabel, cfg.productId)
+	end
+
+	-- Money.Two (25k)
+	do
+		local cfg = DEV_PRODUCTS.Money.Two
+		local card = moneyFrame:WaitForChild("Two") :: Frame
+
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+		local icon = card:WaitForChild("Icon") :: ImageLabel
+		local amountLabel = icon:WaitForChild("Amount") :: TextLabel
+		amountLabel.Text = NumberFormatter.formatNumber(cfg.cashAmount)
+
+		wireDevProductButton(buy, priceLabel, cfg.productId)
+	end
+
+	-- Money.Three (100k)
+	do
+		local cfg = DEV_PRODUCTS.Money.Three
+		local card = moneyFrame:WaitForChild("Three") :: Frame
+
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("TextLabel") :: TextLabel
+
+		local icon = card:WaitForChild("Icon") :: ImageLabel
+		local amountLabel = icon:WaitForChild("TextLabel") :: TextLabel
+		amountLabel.Text = NumberFormatter.formatNumber(cfg.cashAmount)
+
+		wireDevProductButton(buy, priceLabel, cfg.productId)
+	end
+
+	-- Money2.Four (300k)
+	do
+		local cfg = DEV_PRODUCTS.Money2.Four
+		local card = money2Frame:WaitForChild("Four") :: Frame
+
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+		local icon = card:WaitForChild("Icon") :: ImageLabel
+		local amountLabel = icon:WaitForChild("Amount") :: TextLabel
+		amountLabel.Text = NumberFormatter.formatNumber(cfg.cashAmount)
+
+		wireDevProductButton(buy, priceLabel, cfg.productId)
+	end
+
+	-- Money2.MoneyOffer (special offer, Test Devproduct)
+	do
+		local cfg = DEV_PRODUCTS.Money2.MoneyOffer
+		local card = money2Frame:WaitForChild("MoneyOffer") :: Frame
+
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+		if cfg.cashAmount > 0 then
+			local icon = card:WaitForChild("Icon") :: ImageLabel
+			local amountLabel = icon:WaitForChild("Amount") :: TextLabel
+			amountLabel.Text = NumberFormatter.formatNumber(cfg.cashAmount)
+		end
+
+		wireDevProductButton(buy, priceLabel, cfg.productId)
+	end
+end
+
+----------------------------------------------------------------
+-- Wiring: Server Luck (upgrade path 2x -> 4x -> MAX, with time left)
+----------------------------------------------------------------
+
+local function setupServerLuck()
+	local frame = container:WaitForChild("ServerLuck") :: Frame
+	local holder = frame:WaitForChild("Holder") :: Frame
+	local luckLabel = holder:WaitForChild("Luck") :: TextLabel
+	local timeLabel = holder:WaitForChild("Time") :: TextLabel
+
+	local buy = frame:WaitForChild("Buy") :: TextButton
+	local buyFrame = buy:WaitForChild("Frame") :: Frame
+	local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+	local currentMulti = 1
+	local remainingSeconds = 0
+	local countdownRunning = false
+
+	local function getTimeText(): string
+		if remainingSeconds <= 0 then
+			return "15 minutes"
+		end
+		local minutes = math.ceil(remainingSeconds / 60)
+		return string.format("%d minutes left", minutes)
+	end
+
+	local function refresh()
+		local nextProductId: number? = nil
+
+		if currentMulti < 2 then
+			-- Base -> 2x
+			luckLabel.Text = "x2 Server Luck"
+			timeLabel.Text = getTimeText()
+			nextProductId = SERVER_LUCK_PRODUCTS.X2.productId
+
+		elseif currentMulti < 4 then
+			-- 2x -> 4x
+			luckLabel.Text = "2x > 4x Server Luck"
+			timeLabel.Text = getTimeText()
+			nextProductId = SERVER_LUCK_PRODUCTS.X4.productId
+
+		elseif currentMulti < 10 then
+			-- 4x -> MAX
+			luckLabel.Text = "4x > MAX Server Luck"
+			timeLabel.Text = getTimeText()
+			nextProductId = SERVER_LUCK_PRODUCTS.X10.productId
+
+		else
+			-- Already maxed (10x); can still buy more time with MAX product
+			luckLabel.Text = "MAX Server Luck"
+			timeLabel.Text = getTimeText()
+			nextProductId = SERVER_LUCK_PRODUCTS.X10.productId
+		end
+
+		buy.AutoButtonColor = true
+		buy.Active = true
+		buy:SetAttribute("ProductId", nextProductId)
+
+		if nextProductId then
+			setPriceLabel(priceLabel, nextProductId, Enum.InfoType.Product)
+		else
+			priceLabel.Text = "N/A"
+		end
+	end
+
+	local function startCountdown()
+		if countdownRunning then return end
+		countdownRunning = true
+
+		task.spawn(function()
+			while true do
+				if remainingSeconds <= 0 then
+					countdownRunning = false
+					break
+				end
+				task.wait(1)
+				remainingSeconds -= 1
+				if remainingSeconds < 0 then remainingSeconds = 0 end
+				refresh()
+			end
+		end)
+	end
+
+	-- Sync from server attributes at start (in case buff is already active)
+	do
+		local multAttr = ReplicatedStorage:GetAttribute("ServerLuckMultiplier")
+		local expAttr  = ReplicatedStorage:GetAttribute("ServerLuckExpiresAt")
+
+		if typeof(multAttr) == "number" then
+			currentMulti = multAttr :: number
+		end
+
+		if typeof(expAttr) == "number" then
+			local now = os.time()
+			remainingSeconds = math.max(0, (expAttr :: number) - now)
+		end
+	end
+
+	-- When server tells us the multiplier/time changed, update the card
+	ServerLuckStateEvent.OnClientEvent:Connect(function(mult: number, remaining: number)
+		if typeof(mult) == "number" then
+			currentMulti = mult
+		end
+		if typeof(remaining) == "number" then
+			remainingSeconds = math.max(0, remaining)
+		end
+		refresh()
+		if remainingSeconds > 0 then
+			startCountdown()
+		end
+	end)
+
+	-- Clicking the Buy button buys the "next tier" (or extends MAX)
+	buy.MouseButton1Click:Connect(function()
+		local productId = buy:GetAttribute("ProductId")
+		if typeof(productId) == "number" and productId > 0 then
+			MarketplaceService:PromptProductPurchase(player, productId)
+		end
+	end)
+
+	-- Initial UI
+	refresh()
+	if remainingSeconds > 0 then
+		startCountdown()
+	end
+end
+
+----------------------------------------------------------------
+-- Wiring: Potions (Money / Luck / Damage) – all Test Devproduct
+----------------------------------------------------------------
+
+local function setupPotions()
+	local gears = container:WaitForChild("Gears") :: Frame
+
+	-- MoneyPotion
+	do
+		local card = gears:WaitForChild("MoneyPotion") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		local productId = DEV_PRODUCTS.Potions.MoneyPotion
+		wireDevProductButton(buy, priceLabel, productId)
+	end
+
+	-- LuckPotion
+	do
+		local card = gears:WaitForChild("LuckPotion") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		local productId = DEV_PRODUCTS.Potions.LuckPotion
+		wireDevProductButton(buy, priceLabel, productId)
+	end
+
+	-- DamagePotion
+	do
+		local card = gears:WaitForChild("DamagePotion") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		local productId = DEV_PRODUCTS.Potions.DamagePotion
+		wireDevProductButton(buy, priceLabel, productId)
+	end
+
+	-- Optional: OfferTemplate in Gears uses Test devproduct as well
+	local offerTemplate = gears:FindFirstChild("OfferTemplate")
+	if offerTemplate and offerTemplate:IsA("Frame") then
+		local buy = offerTemplate:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+		wireDevProductButton(buy, priceLabel, 3466012642)
+	end
+end
+
+----------------------------------------------------------------
+-- Wiring: Limited eggs (all Test Devproduct for now)
+----------------------------------------------------------------
+
+local function setupLimited()
+	local limited = container:WaitForChild("Limited") :: Frame
+	local buyOptions = limited:WaitForChild("BuyOptions") :: Frame
+
+	-- BuyOne
+	do
+		local button = buyOptions:WaitForChild("BuyOne") :: TextButton
+		local frame = button:WaitForChild("Frame") :: Frame
+		local priceLabel = frame:WaitForChild("Amount") :: TextLabel
+		wireDevProductButton(button, priceLabel, DEV_PRODUCTS.Limited.BuyOne)
+	end
+
+	-- BuyThree
+	do
+		local button = buyOptions:WaitForChild("BuyThree") :: TextButton
+		local frame = button:WaitForChild("Frame") :: Frame
+		local priceLabel = frame:WaitForChild("Amount") :: TextLabel
+		wireDevProductButton(button, priceLabel, DEV_PRODUCTS.Limited.BuyThree)
+	end
+
+	-- BuyTen
+	do
+		local button = buyOptions:WaitForChild("Buy10") :: TextButton
+		local frame = button:WaitForChild("Frame") :: Frame
+		local priceLabel = frame:WaitForChild("Amount") :: TextLabel
+		wireDevProductButton(button, priceLabel, DEV_PRODUCTS.Limited.BuyTen)
+	end
+end
+
+----------------------------------------------------------------
+-- Wiring: Gamepasses
+----------------------------------------------------------------
+
+local function setupGamepasses()
+	-- VIP big card
+	do
+		local vipCard = container:WaitForChild("VIPGamepass") :: Frame
+		local buy = vipCard:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Amount") :: TextLabel
+
+		wireGamepassButton(buy, priceLabel, GAMEPASSES.VIP.gamePassId)
+	end
+
+	-- Other gamepasses in the Gamepasses frame (2xMoney, ExtraCrateSlots, SmallLuck, BigLuck)
+	local gpasses = container:WaitForChild("Gamepasses") :: Frame
+
+	-- 2xMoney
+	do
+		local card = gpasses:WaitForChild("2xMoney") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		wireGamepassButton(buy, priceLabel, GAMEPASSES["2xMoney"].gamePassId)
+	end
+
+	-- ExtraCrateSlots
+	do
+		local card = gpasses:WaitForChild("ExtraCrateSlots") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		wireGamepassButton(buy, priceLabel, GAMEPASSES.ExtraCrateSlots.gamePassId)
+	end
+
+	-- SmallLuck
+	do
+		local card = gpasses:WaitForChild("SmallLuck") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		wireGamepassButton(buy, priceLabel, GAMEPASSES.SmallLuck.gamePassId)
+	end
+
+	-- BigLuck
+	do
+		local card = gpasses:WaitForChild("BigLuck") :: Frame
+		local buy = card:WaitForChild("Buy") :: TextButton
+		local buyFrame = buy:WaitForChild("Frame") :: Frame
+		local priceLabel = buyFrame:WaitForChild("Labels") :: TextLabel
+
+		wireGamepassButton(buy, priceLabel, GAMEPASSES.BigLuck.gamePassId)
+	end
+end
+
+----------------------------------------------------------------
+-- Gift + Close buttons (simple wiring)
+----------------------------------------------------------------
+
+local function setupFrameButtons()
+	-- Close button (xbutton)
+	local closeButton = shopFrame:FindFirstChild("xbutton")
+	if closeButton and closeButton:IsA("TextButton") then
+		closeButton.MouseButton1Click:Connect(function()
+			shopFrame.Visible = false
+		end)
+	end
+
+	-- Gift button (open Gift frame)
+	local giftButton = shopFrame:FindFirstChild("Gift")
+	if giftButton and giftButton:IsA("TextButton") and giftFrame then
+		giftButton.MouseButton1Click:Connect(function()
+			shopFrame.Visible = false
+			giftFrame.Visible = true
+		end)
+	end
+end
+
+----------------------------------------------------------------
+-- Init
+----------------------------------------------------------------
+
+setupMoney()
+setupServerLuck()
+setupPotions()
+setupLimited()
+setupGamepasses()
+setupFrameButtons()
+
+---
+
+--- StarterGui.ScreenGui.Shop.StoreSoundHandler (LocalScript) ---
+--!strict
+-- StoreSoundHandler
+-- LOCATION: ScreenGui.Shop.StoreSoundHandler (LocalScript)
+-- Plays a sound when the Shop frame becomes visible.
+
+local frame = script.Parent :: Instance
+if not frame:IsA("Frame") then
+	warn("[StoreSoundHandler] Parent is not a Frame:", frame:GetFullName())
+	return
+end
+
+-- Put a Sound named "StoreSound" directly under the Shop frame
+local storeSound = frame:FindFirstChild("StoreSound")
+if not storeSound or not storeSound:IsA("Sound") then
+	warn("[StoreSoundHandler] Could not find a valid 'StoreSound' under", frame:GetFullName())
+	return
+end
+
+frame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if frame.Visible then
+		storeSound:Play()
+	end
+end)
 
 ---
