@@ -1401,7 +1401,7 @@ local function updateNextUnlockLabel(currentModelIndex: number)
 		plotNextLabel.Visible = true
 	else
 		-- This happens if the player has unlocked all models
-		plotNextLabel.Text = "All Cars Unlocked"
+		plotNextLabel.Text = "All Loot Stacks Unlocked ! "
 		plotNextLabel.Visible = true
 	end
 end
@@ -2946,6 +2946,473 @@ LocalPlayer:GetAttributeChangedSignal("SelectedEnemyId"):Connect(updateAllPrompt
 
 -- Initial state
 updateAllPromptsEnabled()
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.BarrelClient (LocalScript) ---
+--!strict
+-- BarrelClient
+-- • Shows Barrel Inventory billboard above your BarrelSlots platform.
+-- • Wires "Place" buttons to PlaceBarrelRequest on the server.
+-- • Listens to BarrelOpened and plays the rolling/reveal UI.
+--
+-- NOTE: Server-side PlaceBarrelRequest should have the signature:
+--   PlaceBarrelFn.OnServerInvoke(player: Player, barrelId: string): (boolean, string?)
+-- and internally pick a free BarrelSlot on the player's plot.
+
+---------------------------------------------------------------------
+-- Services
+---------------------------------------------------------------------
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Workspace          = game:GetService("Workspace")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- Modules
+---------------------------------------------------------------------
+
+local Modules              = ReplicatedStorage:WaitForChild("Modules")
+local BarrelConfig         = require(Modules:WaitForChild("BarrelConfiguration"))
+local EnemyConfigurations  = require(Modules:WaitForChild("EnemyConfigurations"))
+local ItemConfigurations   = require(Modules:WaitForChild("ItemConfigurations"))
+local NotificationManager  = require(Modules:WaitForChild("NotificationManager"))
+
+type RewardEntry = BarrelConfig.RewardEntry
+
+---------------------------------------------------------------------
+-- Remotes
+---------------------------------------------------------------------
+
+local Functions   = ReplicatedStorage:WaitForChild("Functions")
+local Events      = ReplicatedStorage:WaitForChild("Events")
+
+local GetBarrelInvFn = Functions:WaitForChild("GetBarrelInventory")  :: RemoteFunction
+local PlaceBarrelFn  = Functions:WaitForChild("PlaceBarrelRequest")  :: RemoteFunction
+
+local BarrelInvEvt   = Events:WaitForChild("BarrelInventoryUpdated") :: RemoteEvent
+local BarrelOpened   = Events:WaitForChild("BarrelOpened")           :: RemoteEvent
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+
+local MAX_SHOW_DISTANCE = 18 -- studs from platform to show billboard
+
+---------------------------------------------------------------------
+-- STATE
+---------------------------------------------------------------------
+
+local billboardGui: BillboardGui? = nil
+local scrollingFrame: ScrollingFrame? = nil
+local barrelTemplate: Frame? = nil
+
+local barrelInventory: {[string]: number} = {} -- [barrelId] = count
+local slotPlatform: BasePart? = nil            -- Plots.PlotX.BarrelSlots.Platform
+
+---------------------------------------------------------------------
+-- Helpers: plot / billboard wiring
+---------------------------------------------------------------------
+
+-- Waits for the player's plot to exist and have OwnerId/OwnerID set to their UserId.
+local function getMyPlot(timeout: number?): Model?
+	local plots = Workspace:WaitForChild("Plots")
+
+	local deadline = timeout and (os.clock() + timeout) or math.huge
+
+	while os.clock() < deadline do
+		for _, plot in ipairs(plots:GetChildren()) do
+			if plot:IsA("Model") then
+				local ownerId = plot:GetAttribute("OwnerId") or plot:GetAttribute("OwnerID")
+				if typeof(ownerId) == "number" and ownerId == player.UserId then
+					return plot
+				end
+			end
+		end
+
+		-- Try again a bit later
+		task.wait(0.25)
+	end
+
+	return nil
+end
+
+local function initBillboard()
+	-- If it's already wired up, don't redo it.
+	if billboardGui and billboardGui.Parent and scrollingFrame and barrelTemplate and slotPlatform then
+		return
+	end
+
+	local plot = getMyPlot(10) -- wait up to 10 seconds for the plot; increase or remove timeout if needed
+	if not plot then
+		warn("[BarrelClient] Could not find plot for", player.Name, "after waiting.")
+		return
+	end
+
+	local barrelSlots = plot:FindFirstChild("BarrelSlots")
+	if not barrelSlots then
+		warn("[BarrelClient] No BarrelSlots folder under plot:", plot.Name)
+		return
+	end
+
+	local platform = barrelSlots:FindFirstChild("Platform")
+	if not (platform and platform:IsA("BasePart")) then
+		warn("[BarrelClient] Missing Platform part under BarrelSlots.")
+		return
+	end
+	slotPlatform = platform
+
+	local attachment = platform:FindFirstChildOfClass("Attachment")
+	if not attachment then
+		warn("[BarrelClient] Platform has no Attachment.")
+		return
+	end
+
+	local bb = attachment:FindFirstChildOfClass("BillboardGui")
+	if not bb then
+		warn("[BarrelClient] Attachment has no BillboardGui.")
+		return
+	end
+
+	billboardGui = bb
+
+	-- Expected UI tree:
+	-- Attachment
+	--   BillboardGui
+	--     MainFrame
+	--       Inventory
+	--         ScrollingFrame
+	--           BarrelTemplate
+	local mainFrame = billboardGui:FindFirstChild("MainFrame")
+	if not (mainFrame and mainFrame:IsA("Frame")) then
+		warn("[BarrelClient] MainFrame missing under BillboardGui.")
+		return
+	end
+
+	local inventoryFrame = mainFrame:FindFirstChild("Inventory")
+	if not (inventoryFrame and inventoryFrame:IsA("Frame")) then
+		warn("[BarrelClient] Inventory frame missing.")
+		return
+	end
+
+	local scroll = inventoryFrame:FindFirstChildOfClass("ScrollingFrame")
+	if not scroll then
+		warn("[BarrelClient] ScrollingFrame missing in Inventory.")
+		return
+	end
+
+	local template = scroll:FindFirstChild("BarrelTemplate")
+	if not (template and template:IsA("Frame")) then
+		warn("[BarrelClient] BarrelTemplate missing in ScrollingFrame.")
+		return
+	end
+
+	scrollingFrame = scroll
+	barrelTemplate = template
+
+	barrelTemplate.Visible = false
+	billboardGui.Enabled = false
+end
+
+---------------------------------------------------------------------
+-- Inventory UI: populate list
+---------------------------------------------------------------------
+
+local function clearList()
+	if not scrollingFrame then return end
+	for _, child in ipairs(scrollingFrame:GetChildren()) do
+		if child:IsA("Frame") and child.Name ~= "BarrelTemplate" then
+			child:Destroy()
+		end
+	end
+end
+
+local function buildEntry(barrelId: string, count: number)
+	if not (scrollingFrame and barrelTemplate) then return end
+
+	local info = BarrelConfig.Get(barrelId)
+	local clone = barrelTemplate:Clone()
+	clone.Name = barrelId
+	clone.Visible = true
+	clone.Parent = scrollingFrame
+
+	local nameLabel  = clone:FindFirstChild("BarrelName") :: TextLabel?
+	local countLabel = clone:FindFirstChild("Count")      :: TextLabel?
+	local icon       = clone:FindFirstChild("BarrelIcon") :: ImageLabel?
+	local placeBtn   = clone:FindFirstChild("PlaceButton"):: TextButton?
+
+	if nameLabel then
+		nameLabel.Text = (info and info.DisplayName) or barrelId
+	end
+	if countLabel then
+		countLabel.Text = "x" .. tostring(count)
+	end
+	if icon and info and info.ImageId then
+		icon.Image = info.ImageId
+	end
+
+	if not placeBtn then return end
+
+	placeBtn.MouseButton1Click:Connect(function()
+		local currentCount = barrelInventory[barrelId] or 0
+		if currentCount <= 0 then
+			NotificationManager.show("You don't have any more of this barrel.", "Error")
+			return
+		end
+
+		-- Ask server to place this barrel on a free slot.
+		local ok, success, err = pcall(function()
+			return PlaceBarrelFn:InvokeServer(barrelId)
+		end)
+
+		if not ok then
+			warn("[BarrelClient] PlaceBarrelRequest failed:", success)
+			NotificationManager.show("Could not place barrel.", "Error")
+			return
+		end
+
+		if success ~= true then
+			local reason = tostring(err or success)
+			if reason == "NoFreeSlot" then
+				NotificationManager.show("All barrel slots are busy.", "Error")
+			elseif reason == "NoBarrel" then
+				NotificationManager.show("You don't have this barrel.", "Error")
+			else
+				NotificationManager.show("Could not place barrel (" .. reason .. ").", "Error")
+			end
+			return
+		end
+
+		-- Server will update inventory and fire BarrelInventoryUpdated.
+	end)
+end
+
+local function rebuildList()
+	if not scrollingFrame then return end
+	clearList()
+
+	for barrelId, count in pairs(barrelInventory) do
+		if type(barrelId) == "string" and type(count) == "number" and count > 0 then
+			buildEntry(barrelId, count)
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Inventory syncing
+---------------------------------------------------------------------
+
+local function setInventory(newInv: {[string]: number})
+	barrelInventory = newInv or {}
+	rebuildList()
+end
+
+local function fetchInitialInventory()
+	local ok, data = pcall(function()
+		return GetBarrelInvFn:InvokeServer()
+	end)
+
+	if ok and typeof(data) == "table" then
+		setInventory(data :: {[string]: number})
+	else
+		warn("[BarrelClient] GetBarrelInventory failed:", data)
+	end
+end
+
+BarrelInvEvt.OnClientEvent:Connect(function(newInv: {[string]: number})
+	setInventory(newInv)
+end)
+
+---------------------------------------------------------------------
+-- Show/hide billboard based on distance to Platform
+---------------------------------------------------------------------
+
+local function getRoot(): BasePart?
+	local character = player.Character
+	if not character then
+		character = player.CharacterAdded:Wait()
+	end
+	return character:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function updateVisibility()
+	if not (billboardGui and slotPlatform) then return end
+
+	local root = getRoot()
+	if not root then
+		billboardGui.Enabled = false
+		return
+	end
+
+	local dist = (slotPlatform.Position - root.Position).Magnitude
+	billboardGui.Enabled = dist <= MAX_SHOW_DISTANCE
+end
+
+---------------------------------------------------------------------
+-- Reveal UI (BarrelOpened)
+---------------------------------------------------------------------
+
+local function getPrettyName(reward: RewardEntry): string
+	if reward.Kind == "Enemy" then
+		local cfg = EnemyConfigurations[reward.Id]
+		if cfg and type(cfg) == "table" and cfg.DisplayName then
+			return tostring(cfg.DisplayName)
+		end
+	elseif reward.Kind == "Cowboy" then
+		local cfg = ItemConfigurations[reward.Id]
+		if cfg and type(cfg) == "table" and cfg.DisplayName then
+			return tostring(cfg.DisplayName)
+		end
+	end
+	return reward.Id
+end
+
+local function getOrCreateRevealGui(): Frame
+	local pg = player:WaitForChild("PlayerGui")
+
+	local screen = pg:FindFirstChild("BarrelRevealGui") :: ScreenGui?
+	if not screen then
+		screen = Instance.new("ScreenGui")
+		screen.Name = "BarrelRevealGui"
+		screen.ResetOnSpawn = false
+		screen.IgnoreGuiInset = true
+		screen.Parent = pg
+	end
+
+	local frame = screen:FindFirstChild("Main") :: Frame?
+	if not frame then
+		frame = Instance.new("Frame")
+		frame.Name = "Main"
+		frame.Size = UDim2.fromScale(0.35, 0.18)
+		frame.Position = UDim2.fromScale(0.5, 0.18)
+		frame.AnchorPoint = Vector2.new(0.5, 0)
+		frame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+		frame.BackgroundTransparency = 0.2
+		frame.BorderSizePixel = 0
+		frame.Visible = false
+		frame.Parent = screen
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 12)
+		corner.Parent = frame
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 2
+		stroke.Transparency = 0.2
+		stroke.Parent = frame
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Label"
+		label.Size = UDim2.fromScale(1, 1)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.GothamBold
+		label.TextScaled = true
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.Text = ""
+		label.Parent = frame
+	end
+
+	return frame
+end
+
+local function playSpin(barrelId: string, finalReward: RewardEntry)
+	local frame = getOrCreateRevealGui()
+	local label = frame:FindFirstChild("Label") :: TextLabel?
+	if not label then return end
+
+	local pool = BarrelConfig.GetRewards(barrelId)
+	if not pool or #pool == 0 then
+		label.Text = "You got: " .. getPrettyName(finalReward)
+		frame.Visible = true
+		task.delay(2, function() frame.Visible = false end)
+		return
+	end
+
+	frame.Visible = true
+	frame.Size = UDim2.fromScale(0.2, 0.12)
+	frame.BackgroundTransparency = 0.4
+	label.TextTransparency = 0
+
+	TweenService:Create(
+		frame,
+		TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.fromScale(0.35, 0.18), BackgroundTransparency = 0.2 }
+	):Play()
+
+	local totalTime = 2.0
+	local step = 0.12
+	local t = 0
+	while t < totalTime do
+		local candidate = pool[math.random(1, #pool)]
+		label.Text = "Rolling... " .. getPrettyName(candidate)
+		task.wait(step)
+		t += step
+	end
+
+	label.Text = "You got: " .. getPrettyName(finalReward)
+
+	task.delay(2.5, function()
+		local tween1 = TweenService:Create(
+			frame,
+			TweenInfo.new(0.25),
+			{ BackgroundTransparency = 1 }
+		)
+		local tween2 = TweenService:Create(
+			label,
+			TweenInfo.new(0.25),
+			{ TextTransparency = 1 }
+		)
+		tween1:Play()
+		tween2:Play()
+		tween1.Completed:Wait()
+		frame.Visible = false
+		frame.BackgroundTransparency = 0.2
+		label.TextTransparency = 0
+	end)
+end
+
+BarrelOpened.OnClientEvent:Connect(function(
+	barrelId: string,
+	reward: RewardEntry,
+	_slotCF: CFrame,
+	_slotSizeY: number
+)
+	-- Play spin + reveal
+	playSpin(barrelId, reward)
+
+	local niceName = getPrettyName(reward)
+	NotificationManager.show(("You got %s!"):format(niceName), "Success")
+end)
+
+---------------------------------------------------------------------
+-- Boot
+---------------------------------------------------------------------
+
+-- Helper to (re)attempt wiring the billboard; returns true once everything is ready.
+local function ensureBillboard(): boolean
+	if billboardGui and slotPlatform and scrollingFrame and barrelTemplate then
+		return true
+	end
+
+	initBillboard()
+	return billboardGui ~= nil and slotPlatform ~= nil and scrollingFrame ~= nil and barrelTemplate ~= nil
+end
+
+task.spawn(function()
+	-- Keep retrying until the billboard is properly wired
+	while not ensureBillboard() do
+		task.wait(1)
+	end
+
+	fetchInitialInventory()
+	rebuildList()
+
+	RunService.RenderStepped:Connect(updateVisibility)
+end)
 
 ---
 

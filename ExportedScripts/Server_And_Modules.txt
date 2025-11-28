@@ -2714,6 +2714,8 @@ local ProfileTemplate = {
 		CurrentDay = 1,
 		LastClaimDayId = 0,
 	},
+	
+	BarrelInventory = {}, -- [barrelId] = count (e.g. FestiveBarrel)
 
 	-- Simple map: [enemyId] = count
 	EnemyInventory = {},
@@ -5119,6 +5121,7 @@ local WeaponConfigurations  = require(Modules:WaitForChild("WeaponConfigurations
 local ItemConfigurations    = require(Modules:WaitForChild("ItemConfigurations"))
 local NumberFormatter       = require(Modules:WaitForChild("NumberFormatter"))
 local BadgeController       = require(ServerScriptService.Controllers:WaitForChild("BadgeController"))
+local BarrelController = require(ServerScriptService.Controllers:WaitForChild("BarrelController"))
 
 local PlayerController      : any
 local CrateController       : any
@@ -5350,6 +5353,14 @@ local function processReceipt(receiptInfo: {[string]: any})
 		return decision
 	end
 
+	--Barrels 
+	if productId == 3466012642 then
+		local successLabel = "Festive Barrel"
+		BarrelController.GiveBarrels(beneficiary, "FestiveBarrel", 1)
+		showNotificationEvent:FireClient(beneficiary, "You received a Festive Barrel!", "Success")
+		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, successLabel)
+	end
+	
 	-- ===== Server luck products (2x, 4x, 10x) =====
 	if productId == PRODUCT_SERVERLUCK_X2 then
 		setServerLuck(2, 15 * 60, false)
@@ -9804,6 +9815,330 @@ return TradeController
 
 ---
 
+--- ServerScriptService.Controllers.BarrelController (ModuleScript) ---
+--!strict
+-- BarrelController
+-- • Uses Data.BarrelInventory to track barrels per player.
+-- • RemoteFunction GetBarrelInventory -> returns { [barrelId]: count }.
+-- • RemoteFunction PlaceBarrelRequest(player, barrelId?) -> (true, "OK") or (false, reason)
+--      - Validates player profile & inventory.
+--      - Finds a free BarrelSlot on the player's plot.
+--      - Consumes 1 barrel.
+--      - After DurationSeconds, rolls reward and grants enemy/cowboy.
+--      - Fires BarrelOpened to that client for UI reveal.
+-- • GiveBarrels(player, barrelId, amount) for processReceipt.
+
+---------------------------------------------------------------------
+-- Services
+---------------------------------------------------------------------
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local Workspace           = game:GetService("Workspace")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+---------------------------------------------------------------------
+-- Modules
+---------------------------------------------------------------------
+
+local Modules             = ReplicatedStorage:WaitForChild("Modules")
+local EnemyConfigurations = require(Modules:WaitForChild("EnemyConfigurations"))
+local ItemConfigurations  = require(Modules:WaitForChild("ItemConfigurations"))
+local BarrelConfig        = require(Modules:WaitForChild("BarrelConfiguration"))
+
+local PlayerController = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+
+export type RewardEntry = BarrelConfig.RewardEntry
+
+---------------------------------------------------------------------
+-- Remote folders
+---------------------------------------------------------------------
+
+local Events = ReplicatedStorage:FindFirstChild("Events")
+if not Events then
+	Events = Instance.new("Folder")
+	Events.Name = "Events"
+	Events.Parent = ReplicatedStorage
+end
+
+local Functions = ReplicatedStorage:FindFirstChild("Functions")
+if not Functions then
+	Functions = Instance.new("Folder")
+	Functions.Name = "Functions"
+	Functions.Parent = ReplicatedStorage
+end
+
+---------------------------------------------------------------------
+-- Remotes
+---------------------------------------------------------------------
+
+local GetBarrelInvFn: RemoteFunction = (function()
+	local fn = Functions:FindFirstChild("GetBarrelInventory") :: RemoteFunction?
+	if not fn then
+		fn = Instance.new("RemoteFunction")
+		fn.Name = "GetBarrelInventory"
+		fn.Parent = Functions
+	end
+	return fn
+end)()
+
+local PlaceBarrelFn: RemoteFunction = (function()
+	local fn = Functions:FindFirstChild("PlaceBarrelRequest") :: RemoteFunction?
+	if not fn then
+		fn = Instance.new("RemoteFunction")
+		fn.Name = "PlaceBarrelRequest"
+		fn.Parent = Functions
+	end
+	return fn
+end)()
+
+local BarrelOpened: RemoteEvent = (function()
+	local ev = Events:FindFirstChild("BarrelOpened") :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = "BarrelOpened"
+		ev.Parent = Events
+	end
+	return ev
+end)()
+
+local BarrelInventoryUpdated: RemoteEvent = (function()
+	local ev = Events:FindFirstChild("BarrelInventoryUpdated") :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = "BarrelInventoryUpdated"
+		ev.Parent = Events
+	end
+	return ev
+end)()
+
+local ShowNotification = Events:FindFirstChild("ShowNotification") :: RemoteEvent?
+local BlockInventoryUpdated = Events:FindFirstChild("BlockInventoryUpdated") :: RemoteEvent?
+
+---------------------------------------------------------------------
+-- Internal helpers / state
+---------------------------------------------------------------------
+
+local FESTIVE_BARREL_ID = "FestiveBarrel"
+
+local function getProfile(player: Player)
+	return PlayerController:GetProfile(player)
+end
+
+local function getBarrelInventory(profile: any): {[string]: number}
+	local data = profile.Data
+	data.BarrelInventory = data.BarrelInventory or {}
+	return data.BarrelInventory :: {[string]: number}
+end
+
+local function getPlayerPlot(player: Player): Model?
+	local plots = Workspace:FindFirstChild("Plots")
+	if not plots then return nil end
+
+	for _, plot in ipairs(plots:GetChildren()) do
+		if plot:IsA("Model") then
+			local ownerId = plot:GetAttribute("OwnerId") or plot:GetAttribute("OwnerID")
+			if typeof(ownerId) == "number" and ownerId == player.UserId then
+				return plot
+			end
+		end
+	end
+	return nil
+end
+
+local function getBarrelSlotsFor(player: Player): {BasePart}
+	local out: {BasePart} = {}
+	local plot = getPlayerPlot(player)
+	if not plot then return out end
+
+	local barrelSlots = plot:FindFirstChild("BarrelSlots")
+	if not barrelSlots then return out end
+
+	for _, child in ipairs(barrelSlots:GetChildren()) do
+		if child:IsA("BasePart") and child.Name ~= "Platform" then
+			table.insert(out, child)
+		end
+	end
+
+	return out
+end
+
+-- Track which slots are currently "opening" (per user)
+local openingSlots: {[number]: {[string]: boolean}} = {}
+
+local function isOpening(userId: number, slotName: string): boolean
+	local map = openingSlots[userId]
+	return map and map[slotName] or false
+end
+
+local function setOpening(userId: number, slotName: string, val: boolean)
+	openingSlots[userId] = openingSlots[userId] or {}
+	openingSlots[userId][slotName] = val
+end
+
+local function findFreeSlotForPlayer(player: Player): BasePart?
+	local userId = player.UserId
+	for _, slotPart in ipairs(getBarrelSlotsFor(player)) do
+		if not isOpening(userId, slotPart.Name) then
+			return slotPart
+		end
+	end
+	return nil
+end
+
+local function grantEnemy(player: Player, enemyId: string)
+	if not EnemyConfigurations[enemyId] then
+		warn("[BarrelController] Enemy id not in EnemyConfigurations:", enemyId)
+	end
+
+	local ok, err = pcall(function()
+		-- Assumes you have this method; adapt if your API name differs.
+		PlayerController:AddCapturedEnemy(player, enemyId)
+	end)
+	if not ok then
+		warn("[BarrelController] AddCapturedEnemy failed:", err)
+	end
+end
+
+local function grantCowboy(player: Player, profile: any, turretId: string)
+	if not ItemConfigurations[turretId] then
+		warn("[BarrelController] Cowboy id not in ItemConfigurations:", turretId)
+		return
+	end
+
+	local inv = profile.Data.BlockInventory or {}
+	profile.Data.BlockInventory = inv
+
+	inv[turretId] = (inv[turretId] or 0) + 1
+
+	if BlockInventoryUpdated then
+		BlockInventoryUpdated:FireClient(player, inv)
+	end
+end
+
+local function applyReward(player: Player, reward: RewardEntry)
+	local profile = getProfile(player)
+	if not profile then return end
+
+	if reward.Kind == "Enemy" then
+		grantEnemy(player, reward.Id)
+	elseif reward.Kind == "Cowboy" then
+		grantCowboy(player, profile, reward.Id)
+	end
+end
+
+---------------------------------------------------------------------
+-- Remote handlers
+---------------------------------------------------------------------
+
+-- Client pulls initial inventory or refresh on join
+GetBarrelInvFn.OnServerInvoke = function(player: Player): {[string]: number}
+	local profile = getProfile(player)
+	if not profile then return {} end
+	return getBarrelInventory(profile)
+end
+
+-- Client asks to place/open a barrel; server picks a free slot
+PlaceBarrelFn.OnServerInvoke = function(player: Player, barrelId: string?): (boolean, string?)
+	local profile = getProfile(player)
+	if not profile then
+		return false, "NoProfile"
+	end
+
+	barrelId = barrelId or FESTIVE_BARREL_ID
+	local info = BarrelConfig.Get(barrelId)
+	if not info then
+		return false, "UnknownBarrel"
+	end
+
+	local inv = getBarrelInventory(profile)
+	local currentCount = inv[barrelId] or 0
+	if currentCount <= 0 then
+		return false, "NoBarrel"
+	end
+
+	local slotPart = findFreeSlotForPlayer(player)
+	if not slotPart then
+		return false, "NoFreeSlot"
+	end
+
+	local userId = player.UserId
+	if isOpening(userId, slotPart.Name) then
+		return false, "AlreadyOpening"
+	end
+
+	-- Consume one barrel and mark slot as opening
+	inv[barrelId] = currentCount - 1
+	setOpening(userId, slotPart.Name, true)
+
+	BarrelInventoryUpdated:FireClient(player, inv)
+
+	if ShowNotification then
+		local niceName = info.DisplayName or barrelId
+		ShowNotification:FireClient(player, "Opening a " .. niceName .. "...", "Info")
+	end
+
+	local slotCF = slotPart.CFrame
+	local slotSizeY = slotPart.Size.Y
+
+	-- Async opening
+	task.spawn(function()
+		task.wait(info.DurationSeconds)
+
+		local reward = BarrelConfig.PickReward(barrelId)
+		if not reward then
+			warn("[BarrelController] PickReward returned nil for barrel:", barrelId)
+			setOpening(userId, slotPart.Name, false)
+			return
+		end
+
+		applyReward(player, reward)
+
+		-- Client does the UI spin/reveal
+		BarrelOpened:FireClient(player, barrelId :: string, reward, slotCF, slotSizeY)
+
+		setOpening(userId, slotPart.Name, false)
+	end)
+
+	return true, "OK"
+end
+
+---------------------------------------------------------------------
+-- Public API
+---------------------------------------------------------------------
+
+local BarrelController = {}
+
+function BarrelController.GiveBarrels(player: Player, barrelId: string, amount: number)
+	local profile = getProfile(player)
+	if not profile then return end
+
+	if amount <= 0 then amount = 1 end
+
+	local inv = getBarrelInventory(profile)
+	inv[barrelId] = (inv[barrelId] or 0) + amount
+
+	BarrelInventoryUpdated:FireClient(player, inv)
+
+	if ShowNotification then
+		local info = BarrelConfig.Get(barrelId)
+		local niceName = info and info.DisplayName or barrelId
+		ShowNotification:FireClient(
+			player,
+			string.format("You received x%d %s", amount, niceName),
+			"Success"
+		)
+	end
+end
+
+function BarrelController:Init(_controllers: {[string]: any}?) end
+
+function BarrelController:Start() end
+
+return BarrelController
+
+---
+
 --- ReplicatedStorage.Modules.NumberFormatter (ModuleScript) ---
 --!strict
 
@@ -13490,7 +13825,7 @@ local EnemyConfigurations = {
 		MaxHealth = 85,
 		Damage = 10,
 		Rarity = "Common",
-		ValuePerSecond = 1,
+		ValuePerSecond = 10,
 		SellValue = 5,
 	},
 
@@ -13498,18 +13833,18 @@ local EnemyConfigurations = {
 		CashReward = 7,
 		MaxHealth = 100,
 		Damage = 15,
-		Rarity = "Rare",
-		ValuePerSecond = 2,
-		SellValue = 10,
+		Rarity = "Epic",
+		ValuePerSecond = 25,
+		SellValue = 30,
 	},
 
 	["Ice Zombie"] = {
 		CashReward = 8,
 		MaxHealth = 150,
 		Damage = 20,
-		Rarity = "Rare",
-		ValuePerSecond = 2,
-		SellValue = 12,
+		Rarity = "Common",
+		ValuePerSecond = 12,
+		SellValue = 9,
 	},
 
 	["Fire Zombie"] = {
@@ -13517,7 +13852,7 @@ local EnemyConfigurations = {
 		MaxHealth = 190,
 		Damage = 25,
 		Rarity = "Rare",
-		ValuePerSecond = 3,
+		ValuePerSecond = 18,
 		SellValue = 15,
 	},
 
@@ -13525,8 +13860,8 @@ local EnemyConfigurations = {
 		CashReward = 10,
 		MaxHealth = 240,
 		Damage = 30,
-		Rarity = "Rare",
-		ValuePerSecond = 3,
+		Rarity = "Epic",
+		ValuePerSecond = 24,
 		SellValue = 18,
 	},
 
@@ -13535,7 +13870,7 @@ local EnemyConfigurations = {
 		MaxHealth = 90,
 		Damage = 15,
 		Rarity = "Common",
-		ValuePerSecond = 1,
+		ValuePerSecond = 14,
 		SellValue = 6,
 	},
 
@@ -13543,8 +13878,8 @@ local EnemyConfigurations = {
 		CashReward = 8,
 		MaxHealth = 135,
 		Damage = 15,
-		Rarity = "Rare",
-		ValuePerSecond = 2,
+		Rarity = "Common",
+		ValuePerSecond = 13,
 		SellValue = 12,
 	},
 
@@ -13553,7 +13888,7 @@ local EnemyConfigurations = {
 		MaxHealth = 105,
 		Damage = 20,
 		Rarity = "Rare",
-		ValuePerSecond = 2,
+		ValuePerSecond = 17,
 		SellValue = 14,
 	},
 
@@ -13562,7 +13897,7 @@ local EnemyConfigurations = {
 		MaxHealth = 245,
 		Damage = 35,
 		Rarity = "Epic",
-		ValuePerSecond = 4,
+		ValuePerSecond = 22,
 		SellValue = 20,
 	},
 
@@ -13570,8 +13905,8 @@ local EnemyConfigurations = {
 		CashReward = 10,
 		MaxHealth = 130,
 		Damage = 25,
-		Rarity = "Epic",
-		ValuePerSecond = 4,
+		Rarity = "Common",
+		ValuePerSecond = 16,
 		SellValue = 22,
 	},
 
@@ -13579,8 +13914,8 @@ local EnemyConfigurations = {
 		CashReward = 10,
 		MaxHealth = 135,
 		Damage = 25,
-		Rarity = "Epic",
-		ValuePerSecond = 4,
+		Rarity = "Rare",
+		ValuePerSecond = 21,
 		SellValue = 22,
 	},
 
@@ -13589,7 +13924,7 @@ local EnemyConfigurations = {
 		MaxHealth = 300,
 		Damage = 40,
 		Rarity = "Epic",
-		ValuePerSecond = 5,
+		ValuePerSecond = 27,
 		SellValue = 25,
 	},
 
@@ -13598,7 +13933,7 @@ local EnemyConfigurations = {
 		MaxHealth = 250,
 		Damage = 65,
 		Rarity = "Legendary",
-		ValuePerSecond = 7,
+		ValuePerSecond = 34,
 		SellValue = 35,
 	},
 
@@ -13607,7 +13942,7 @@ local EnemyConfigurations = {
 		MaxHealth = 250,
 		Damage = 65,
 		Rarity = "Legendary",
-		ValuePerSecond = 7,
+		ValuePerSecond = 37,
 		SellValue = 35,
 	},
 
@@ -13615,8 +13950,17 @@ local EnemyConfigurations = {
 		CashReward = 12,
 		MaxHealth = 160,
 		Damage = 70,
+		Rarity = "Epic",
+		ValuePerSecond = 22,
+		SellValue = 40,
+	},
+	
+	["Elf Zombie"] = {
+		CashReward = 12,
+		MaxHealth = 160,
+		Damage = 70,
 		Rarity = "Legendary",
-		ValuePerSecond = 8,
+		ValuePerSecond = 40,
 		SellValue = 40,
 	},
 
@@ -13703,6 +14047,15 @@ local EnemyConfigurations = {
 	},
 
 	["Pumpkin Reaper"] = {
+		CashReward = 20,
+		MaxHealth = 1640,
+		Damage = 65,
+		Rarity = "Boss",
+		ValuePerSecond = 18,
+		SellValue = 120,
+	},
+
+	["Santa Boss"] = {
 		CashReward = 20,
 		MaxHealth = 1640,
 		Damage = 65,
@@ -14834,5 +15187,102 @@ function LuckHelper.Roll(player: Player, baseChance: number): boolean
 end
 
 return LuckHelper
+
+---
+
+--- ReplicatedStorage.Modules.BarrelConfiguration (ModuleScript) ---
+--!strict
+-- ReplicatedStorage.Modules.BarrelConfiguration
+-- Defines barrel types + their reward pools.
+
+export type RewardEntry = {
+	Kind: "Enemy" | "Cowboy",
+	Id: string,          -- EnemyConfigurations key OR ItemConfigurations key
+	Weight: number,      -- relative odds
+	MutationId: string?, -- e.g. "Christmas" (festive)
+}
+
+export type BarrelInfo = {
+	Id: string,
+	DisplayName: string,
+	DurationSeconds: number,
+	Rewards: {RewardEntry},
+}
+
+local BarrelConfiguration = {}
+
+local DATA: {[string]: BarrelInfo} = {
+	FestiveBarrel = {
+		Id = "FestiveBarrel",
+		DisplayName = "Festive Barrel",
+		DurationSeconds = 1, -- instant-ish hatch
+		Rewards = {
+			-- BOSSES
+			{
+				Kind = "Enemy",
+				Id = "Ghost Rider",
+				MutationId = "Christmas",
+				Weight = 55,
+			},
+			{
+				Kind = "Enemy",
+				Id = "Zombie Boss",
+				MutationId = "Christmas",
+				Weight = 25,
+			},
+
+			-- COWBOYS (TURRETS)
+			{
+				Kind = "Cowboy",
+				Id = "RifleGuard", -- Rifle Cowboy
+				MutationId = "Christmas",
+				Weight = 25,
+			},
+			{
+				Kind = "Cowboy",
+				Id = "GatlingGuard", -- Heavy Gunner
+				MutationId = "Christmas",
+				Weight = 25,
+			},
+		},
+	},
+}
+
+
+function BarrelConfiguration.Get(id: string): BarrelInfo?
+	return DATA[id]
+end
+
+function BarrelConfiguration.GetRewards(id: string): {RewardEntry}?
+	local info = DATA[id]
+	return info and info.Rewards or nil
+end
+
+function BarrelConfiguration.PickReward(id: string): RewardEntry?
+	local info = DATA[id]
+	if not info then return nil end
+
+	local total = 0
+	for _, r in ipairs(info.Rewards) do
+		total += r.Weight
+	end
+	if total <= 0 then
+		return nil
+	end
+
+	local roll = math.random() * total
+	local acc = 0
+	for _, r in ipairs(info.Rewards) do
+		acc += r.Weight
+		if roll <= acc then
+			return r
+		end
+	end
+
+	-- fallback
+	return info.Rewards[#info.Rewards]
+end
+
+return BarrelConfiguration
 
 ---
