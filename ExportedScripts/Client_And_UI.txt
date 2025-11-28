@@ -1829,25 +1829,25 @@ end
 --- StarterPlayer.StarterPlayerScripts.WorldUIController (LocalScript) ---
 --!strict
 -- LOCATION: StarterPlayerScripts/WorldUIController.lua
--- Manages in-world UI elements, like the shop restock timers.
+-- Manages in-world UI elements, like the shop restock timers,
+-- now using the local player's Plot/Vendors shops.
 
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
+local Workspace         = game:GetService("Workspace")
+local RunService        = game:GetService("RunService")
 
--- Find shop models
-local blocksShop = Workspace:WaitForChild("BlocksShop")
-local weaponsShop = Workspace:WaitForChild("WeaponsShop")
-
--- Find the timer labels
-local blocksTimerLabel = blocksShop:WaitForChild("Touch"):WaitForChild("RestockGUI"):WaitForChild("TimerLabel")
-local weaponsTimerLabel = weaponsShop:WaitForChild("Touch"):WaitForChild("RestockGUI"):WaitForChild("TimerLabel")
+local localPlayer  = Players.LocalPlayer
+local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
 
 -- Remotes
-local getBlocksResetTime = ReplicatedStorage.Functions:WaitForChild("GetBlockShopResetTime")
-local getWeaponsResetTime = ReplicatedStorage.Functions:WaitForChild("GetWeaponShopResetTime")
+local getBlocksResetTime     = ReplicatedStorage.Functions:WaitForChild("GetBlockShopResetTime")
+local getWeaponsResetTime    = ReplicatedStorage.Functions:WaitForChild("GetWeaponShopResetTime")
 local updateBlocksStockEvent = ReplicatedStorage.Events:WaitForChild("UpdateBlockStocks")
-local updateWeaponsStockEvent = ReplicatedStorage.Events:WaitForChild("UpdateWeaponStocks")
+local updateWeaponsStockEvent= ReplicatedStorage.Events:WaitForChild("UpdateWeaponStocks")
+
+local blocksTimerLabel: TextLabel
+local weaponsTimerLabel: TextLabel
 
 local activeTimers: {[string]: RBXScriptConnection?} = {
 	Blocks = nil,
@@ -1861,28 +1861,120 @@ local function formatRemaining(seconds: number): string
 	return string.format("%02d:%02d", min, sec)
 end
 
--- Accepts optional 'nextTime' (server gives it in the broadcast).
+local function waitForPlayerPlot(): Model?
+	local plot: Model? = nil
+
+	while not plot do
+		local plotNum = localPlayer:GetAttribute("PlotNumber")
+		if plotNum then
+			local candidate = PLOTS_FOLDER:FindFirstChild("Plot" .. tostring(plotNum))
+			if candidate and candidate:IsA("Model") then
+				plot = candidate
+				break
+			end
+		end
+		task.wait(0.5)
+	end
+
+	return plot
+end
+
+local function resolveTimerLabels()
+	local plot = waitForPlayerPlot()
+	if not plot then
+		warn("[WorldUIController] Could not resolve player plot.")
+		return
+	end
+
+	local vendors = plot:FindFirstChild("Vendors")
+	if not vendors then
+		warn("[WorldUIController] Vendors folder missing on plot:", plot.Name)
+		return
+	end
+
+	local blocksShop  = vendors:FindFirstChild("BlocksShop")
+	local weaponsShop = vendors:FindFirstChild("WeaponsShop")
+
+	if not (blocksShop and weaponsShop) then
+		warn("[WorldUIController] BlocksShop/WeaponsShop missing under Vendors.")
+		return
+	end
+
+	local blocksTouch  = blocksShop:FindFirstChild("Touch")
+	local weaponsTouch = weaponsShop:FindFirstChild("Touch")
+
+	if not (blocksTouch and weaponsTouch) then
+		warn("[WorldUIController] Touch parts missing in shop models.")
+		return
+	end
+
+	-- Make sure this structure exists on each Touch:
+	-- Touch -> RestockGUI -> TimerLabel
+	local blocksGUI   = blocksTouch:FindFirstChild("RestockGUI")
+	local weaponsGUI  = weaponsTouch:FindFirstChild("RestockGUI")
+
+	if not (blocksGUI and weaponsGUI) then
+		warn("[WorldUIController] RestockGUI missing on shop touches.")
+		return
+	end
+
+	blocksTimerLabel  = (blocksGUI:FindFirstChild("TimerLabel") :: TextLabel)
+	weaponsTimerLabel = (weaponsGUI:FindFirstChild("TimerLabel") :: TextLabel)
+end
+
 local function startTimer(shopName: "Blocks" | "Weapons", nextTime: number?)
+	if not (blocksTimerLabel and weaponsTimerLabel) then
+		resolveTimerLabels()
+	end
+
 	if activeTimers[shopName] then
 		activeTimers[shopName]:Disconnect()
 		activeTimers[shopName] = nil
 	end
 
-	local label = if shopName == "Blocks" then blocksTimerLabel else weaponsTimerLabel
+	local label: TextLabel?
+	local rf: RemoteFunction?
 
-	local function bind(ts: number)
-		activeTimers[shopName] = RunService.Heartbeat:Connect(function()
-			local remaining = ts - os.time()
-			label.Text = formatRemaining(remaining)
-		end)
+	if shopName == "Blocks" then
+		label = blocksTimerLabel
+		rf    = getBlocksResetTime
+	else
+		label = weaponsTimerLabel
+		rf    = getWeaponsResetTime
 	end
 
-	if nextTime and typeof(nextTime) == "number" then
+	if not (label and rf) then
+		return
+	end
+
+	local function bind(serverResetTime: number)
+		local function update()
+			local now = os.time()
+			local remaining = serverResetTime - now
+
+			if remaining <= 0 then
+				label.Text = "00:00"
+				if activeTimers[shopName] then
+					activeTimers[shopName]:Disconnect()
+					activeTimers[shopName] = nil
+				end
+				return
+			end
+
+			label.Text = formatRemaining(remaining)
+		end
+
+		update()
+		activeTimers[shopName] = RunService.RenderStepped:Connect(update)
+	end
+
+	if nextTime then
 		bind(nextTime)
 	else
-		-- Fetch from server on first run / fallback
-		local fn = if shopName == "Blocks" then getBlocksResetTime else getWeaponsResetTime
-		local ok, ts = pcall(fn.InvokeServer, fn)
+		local ok, ts = pcall(function()
+			return rf:InvokeServer()
+		end)
+
 		if ok and typeof(ts) == "number" then
 			bind(ts)
 		else
@@ -1892,7 +1984,7 @@ local function startTimer(shopName: "Blocks" | "Weapons", nextTime: number?)
 	end
 end
 
--- When server restocks, it now sends (stocks, nextRestockTime).
+-- When server restocks, it sends (stocks, nextRestockTime)
 updateBlocksStockEvent.OnClientEvent:Connect(function(_, newRestockTime: number?)
 	startTimer("Blocks", newRestockTime)
 end)
@@ -1902,6 +1994,7 @@ updateWeaponsStockEvent.OnClientEvent:Connect(function(_, newRestockTime: number
 end)
 
 -- Initial timers (will fetch from server)
+resolveTimerLabels()
 startTimer("Blocks")
 startTimer("Weapons")
 
@@ -2299,30 +2392,113 @@ end)
 ---
 
 --- StarterPlayer.StarterPlayerScripts.ShopClient (LocalScript) ---
---[[
-	ShopClient Script
-	
-	Description: Listens for the OpenShopFrame event from the server and
-	uses the FrameManager to open the specified shop UI.
-	
-	Location: StarterPlayerScripts
---]]
 --!strict
+-- ShopClient (client-side shop triggers, per-plot only)
+--
+-- Structure:
+-- Workspace
+--   Plots
+--     Plot1..8
+--       Vendors
+--         BlocksShop   (Model)
+--           Touch      (BasePart)
+--         WeaponsShop  (Model)
+--           Touch      (BasePart)
 
--- Services
+local Players           = game:GetService("Players")
+local Workspace         = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
--- Modules
-local FrameManager = require(ReplicatedStorage.Modules.FrameManager)
+local FrameManager      = require(ReplicatedStorage.Modules.FrameManager)
 
--- Events
-local openShopFrameEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild("OpenShopFrame")
+local localPlayer  = Players.LocalPlayer
+local PLOTS_FOLDER = Workspace:WaitForChild("Plots")
 
--- Listen for the server's instruction to open a shop frame
-openShopFrameEvent.OnClientEvent:Connect(function(frameName: string)
-	--print(`Received instruction to open frame: {frameName}`)
-	FrameManager.open(frameName)
-end)
+---------------------------------------------------------------------
+-- Utils
+---------------------------------------------------------------------
+
+local function isFromLocalCharacter(hit: Instance?): boolean
+	if not hit or not hit:IsA("BasePart") then return false end
+
+	local character = hit:FindFirstAncestorOfClass("Model")
+	if not character then return false end
+
+	return Players:GetPlayerFromCharacter(character) == localPlayer
+end
+
+local function waitForPlayerPlot(): Model?
+	local plot: Model? = nil
+
+	while not plot do
+		local plotNum = localPlayer:GetAttribute("PlotNumber")
+		if plotNum then
+			local candidate = PLOTS_FOLDER:FindFirstChild("Plot" .. tostring(plotNum))
+			if candidate and candidate:IsA("Model") then
+				plot = candidate
+				break
+			end
+		end
+
+		task.wait(0.5)
+	end
+
+	return plot
+end
+
+local function connectTouch(touchPart: BasePart?, frameName: string)
+	if not touchPart or not touchPart:IsA("BasePart") then
+		warn("[ShopClient] Touch part missing or invalid for frame:", frameName)
+		return
+	end
+
+	local debounce = false
+
+	touchPart.Touched:Connect(function(hit: BasePart)
+		if debounce then return end
+		if not isFromLocalCharacter(hit) then return end
+
+		debounce = true
+		FrameManager.open(frameName)
+
+		task.delay(1, function()
+			debounce = false
+		end)
+	end)
+end
+
+---------------------------------------------------------------------
+-- Init
+---------------------------------------------------------------------
+
+local function init()
+	local plot = waitForPlayerPlot()
+	if not plot then
+		warn("[ShopClient] Could not resolve player plot.")
+		return
+	end
+
+	local vendors = plot:FindFirstChild("Vendors")
+	if not (vendors and vendors:IsA("Folder")) then
+		warn("[ShopClient] Vendors folder missing under:", plot:GetFullName())
+		return
+	end
+
+	-- NOW: grab the Touch PART inside the model
+	local blocksModel  = vendors:FindFirstChild("BlocksShop")
+	local weaponsModel = vendors:FindFirstChild("WeaponsShop")
+
+	local blocksTouch: BasePart?  = blocksModel and blocksModel:FindFirstChild("Touch")  :: BasePart?
+	local weaponsTouch: BasePart? = weaponsModel and weaponsModel:FindFirstChild("Touch") :: BasePart?
+
+	-- Blocks/Cowboys shop
+	connectTouch(blocksTouch, "BlocksShop")
+
+	-- Weapon crate shop
+	connectTouch(weaponsTouch, "WeaponsShop")
+end
+
+task.spawn(init)
 
 ---
 
@@ -2650,6 +2826,126 @@ game:GetService("TweenService"):Create(
 	TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
 	{TextTransparency = 0}
 ):Play()
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.TradeClient (LocalScript) ---
+--!strict
+-- TradeClient
+-- LOCATION: StarterPlayerScripts/TradeClient
+--
+-- Client-side:
+--  • For every other player, attach a ProximityPrompt to their HumanoidRootPart
+--  • Prompt is only Enabled when LocalPlayer has SelectedEnemyId set
+--  • When triggered, fire GiftEnemyRequest(targetUserId, enemyId)
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+local EventsFolder      = ReplicatedStorage:WaitForChild("Events")
+local GiftEnemyRequest  = EventsFolder:WaitForChild("GiftEnemyRequest") :: RemoteEvent
+
+local PROMPT_NAME       = "TradeEnemyPrompt"
+local MAX_DISTANCE      = 8
+local KEYBOARD_KEY      = Enum.KeyCode.E
+local GAMEPAD_KEY       = Enum.KeyCode.ButtonX
+
+-- Track all prompts so we can toggle Enabled when you equip/unequip an enemy tool
+local allPrompts: {ProximityPrompt} = {}
+
+----------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------
+
+local function hasSelectedEnemy(): boolean
+	local val = LocalPlayer:GetAttribute("SelectedEnemyId")
+	return typeof(val) == "string" and val ~= ""
+end
+
+local function updateAllPromptsEnabled()
+	local enabled = hasSelectedEnemy()
+	for _, prompt in ipairs(allPrompts) do
+		if prompt.Parent then
+			prompt.Enabled = enabled
+		end
+	end
+end
+
+local function createPromptForCharacter(plr: Player, character: Model)
+	if plr == LocalPlayer then return end
+	if not character then return end
+
+	local root = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not root then
+		-- fallback – try later when HRP appears
+		task.spawn(function()
+			local hrp = character:WaitForChild("HumanoidRootPart", 5)
+			if hrp and hrp:IsA("BasePart") then
+				createPromptForCharacter(plr, character)
+			end
+		end)
+		return
+	end
+
+	-- Avoid duplicates
+	if root:FindFirstChild(PROMPT_NAME) then return end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = PROMPT_NAME
+	prompt.ActionText = "Gift Enemy"
+	prompt.ObjectText = plr.DisplayName
+	prompt.KeyboardKeyCode = KEYBOARD_KEY
+	prompt.GamepadKeyCode = GAMEPAD_KEY
+	prompt.RequiresLineOfSight = false
+	prompt.MaxActivationDistance = MAX_DISTANCE
+	prompt.Enabled = hasSelectedEnemy() -- only visible if holding enemy
+	prompt.Parent = root
+
+	table.insert(allPrompts, prompt)
+
+	prompt.Triggered:Connect(function(triggeringPlayer: Player)
+		if triggeringPlayer ~= LocalPlayer then return end
+
+		local enemyId = LocalPlayer:GetAttribute("SelectedEnemyId")
+		if typeof(enemyId) ~= "string" or enemyId == "" then
+			return
+		end
+
+		GiftEnemyRequest:FireServer(plr.UserId, enemyId)
+	end)
+end
+
+local function setupForPlayer(plr: Player)
+	if plr == LocalPlayer then return end
+
+	if plr.Character then
+		createPromptForCharacter(plr, plr.Character)
+	end
+
+	plr.CharacterAdded:Connect(function(char)
+		createPromptForCharacter(plr, char)
+	end)
+end
+
+----------------------------------------------------------------
+-- BOOTSTRAP
+----------------------------------------------------------------
+
+-- Existing players
+for _, plr in ipairs(Players:GetPlayers()) do
+	setupForPlayer(plr)
+end
+
+-- Future players
+Players.PlayerAdded:Connect(setupForPlayer)
+
+-- React when your selected enemy changes (equipping / unequipping placer)
+LocalPlayer:GetAttributeChangedSignal("SelectedEnemyId"):Connect(updateAllPromptsEnabled)
+
+-- Initial state
+updateAllPromptsEnabled()
 
 ---
 

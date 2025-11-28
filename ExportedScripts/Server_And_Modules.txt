@@ -2502,70 +2502,21 @@ return ShopController
 
 --- ServerScriptService.Controllers.ShopController (ModuleScript) ---
 --[[
-	ShopController Script
-	
-	Description: Manages interactions with in-world shop trigger parts.
-	Detects when a player touches a shop part and fires a remote event
-	to that player's client, instructing it to open the correct UI frame.
-	
-	Location: ServerScriptService/Controllers
+    ShopController Script (Server)
+
+    ❗ NOTE:
+      Shop opening is now handled entirely on the client (ShopClient LocalScript).
+      This server module is kept only so the Bootstrap that requires :Start()
+      doesn’t break. It currently does nothing.
+
+    Location: ServerScriptService/Controllers
 --]]
 --!strict
 
--- Services
-local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
--- Define the Controller Module
 local ShopController = {}
 
--- Events
-local openShopFrameEvent: RemoteEvent = ReplicatedStorage.Events:WaitForChild("OpenShopFrame")
-
--- Configuration
-local shops = {
-	WeaponsShop = Workspace:WaitForChild("WeaponsShop"),
-	BlocksShop = Workspace:WaitForChild("BlocksShop"),
-}
-
--- State
-local debounce = {} -- To prevent spamming the event
-
--- This function sets up the .Touched event for a given shop part.
-local function setupShopTrigger(shopName: string, shopModel: Model)
-	local touchPart = shopModel:FindFirstChild("Touch")
-
-	if not (touchPart and touchPart:IsA("BasePart")) then
-		warn(`Shop trigger part not found for '{shopName}'. Please add a BasePart named "Touch" to the model.`)
-		return
-	end
-
-	touchPart.Touched:Connect(function(hit)
-		local character = hit.Parent
-		local player = Players:GetPlayerFromCharacter(character)
-
-		if not player then return end
-		if debounce[player] then return end
-
-		debounce[player] = true
-
-		print(`Player {player.Name} touched the {shopName} trigger.`)
-		openShopFrameEvent:FireClient(player, shopName)
-
-		task.delay(1, function()
-			debounce[player] = nil
-		end)
-	end)
-
-	--print(`Successfully set up trigger for {shopName}.`)
-end
-
--- This method will be called by the Bootstrap script.
 function ShopController:Start()
-	for name, model in pairs(shops) do
-		setupShopTrigger(name, model)
-	end
+	-- Intentionally left blank – shop triggers are now client-side.
 end
 
 return ShopController
@@ -9663,6 +9614,193 @@ function AdminController:Start()
 end
 
 return AdminController
+
+---
+
+--- ServerScriptService.Controllers.TradeController (ModuleScript) ---
+--!strict
+-- TradeController
+-- LOCATION: ServerScriptService/Controllers/TradeController
+--
+-- • Secure gifting of enemies between players.
+-- • No duplication: server always:
+--      - Looks up sender profile
+--      - Checks inventory count
+--      - Decrements sender, increments receiver
+-- • Also validates distance between players.
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Modules          = ReplicatedStorage:WaitForChild("Modules")
+local PlayerController = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+
+-- Events folder
+local EventsFolder = ReplicatedStorage:FindFirstChild("Events")
+if not EventsFolder then
+	EventsFolder = Instance.new("Folder")
+	EventsFolder.Name = "Events"
+	EventsFolder.Parent = ReplicatedStorage
+end
+
+local function ensureEvent(name: string): RemoteEvent
+	local ev = EventsFolder:FindFirstChild(name) :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = name
+		ev.Parent = EventsFolder
+	end
+	return ev
+end
+
+local GiftEnemyRequest  = ensureEvent("GiftEnemyRequest")
+local ShowNotification  = ensureEvent("ShowNotification")
+
+-- Try to reuse the EnemyInventoryUpdated remote from PlayerController if it exposes them
+local EnemyInventoryUpdated: RemoteEvent? = nil
+do
+	local rc = (PlayerController :: any)._remotes
+	if rc and rc["EnemyInventoryUpdated"] then
+		EnemyInventoryUpdated = rc["EnemyInventoryUpdated"] :: RemoteEvent
+	end
+end
+
+local TradeController = {}
+
+-- CONFIG
+local MAX_GIFT_DISTANCE = 8        -- studs
+local GIFT_COOLDOWN     = 0.5      -- seconds per sender
+
+-- state
+local _cooldownByPlayer: {[Player]: number} = {}
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+
+local function notify(player: Player, msg: string, kind: string?)
+	ShowNotification:FireClient(player, msg, kind or "Info")
+end
+
+local function getProfile(player: Player)
+	return PlayerController:GetProfile(player)
+end
+
+local function getRoot(player: Player): BasePart?
+	local char = player.Character
+	if not char then return nil end
+	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	return root
+end
+
+local function playersInRange(a: Player, b: Player, maxDist: number): boolean
+	local ra = getRoot(a)
+	local rb = getRoot(b)
+	if not (ra and rb) then return false end
+	return (ra.Position - rb.Position).Magnitude <= maxDist
+end
+
+local function isOnCooldown(p: Player): boolean
+	local last = _cooldownByPlayer[p]
+	if not last then return false end
+	return (os.clock() - last) < GIFT_COOLDOWN
+end
+
+local function markCooldown(p: Player)
+	_cooldownByPlayer[p] = os.clock()
+end
+
+---------------------------------------------------------------------
+-- Remote handler (core anti-dupe logic)
+---------------------------------------------------------------------
+
+local function onGiftEnemyRequest(fromPlayer: Player, targetUserId: number, enemyId: string)
+	-- Basic type validation
+	if typeof(targetUserId) ~= "number" then return end
+	if typeof(enemyId) ~= "string" or enemyId == "" then return end
+
+	-- Cooldown per sender
+	if isOnCooldown(fromPlayer) then
+		return
+	end
+	markCooldown(fromPlayer)
+
+	-- No gifting to yourself
+	if targetUserId == fromPlayer.UserId then
+		notify(fromPlayer, "You can't gift enemies to yourself.", "Error")
+		return
+	end
+
+	-- Resolve target
+	local targetPlayer = Players:GetPlayerByUserId(targetUserId)
+	if not targetPlayer then
+		notify(fromPlayer, "That player is no longer in the game.", "Error")
+		return
+	end
+
+	-- Distance check (server-side, not just client)
+	if not playersInRange(fromPlayer, targetPlayer, MAX_GIFT_DISTANCE) then
+		notify(fromPlayer, "Move closer to the player to gift.", "Error")
+		return
+	end
+
+	-- Get profiles
+	local fromProfile = getProfile(fromPlayer)
+	local toProfile   = getProfile(targetPlayer)
+	if not (fromProfile and toProfile) then
+		return
+	end
+
+	-- Ensure enemy inventories exist
+	fromProfile.Data.EnemyInventory = fromProfile.Data.EnemyInventory or {}
+	toProfile.Data.EnemyInventory   = toProfile.Data.EnemyInventory   or {}
+
+	local fromInv = fromProfile.Data.EnemyInventory
+	local toInv   = toProfile.Data.EnemyInventory
+
+	-- ---- ANTI-DUPE CORE ----
+	-- We only trust the server profile.
+	-- If sender doesn't have at least 1 of this enemy, abort.
+	local owned = tonumber(fromInv[enemyId] or 0) or 0
+	if owned <= 0 then
+		notify(fromPlayer, "You don't have that enemy anymore.", "Error")
+		return
+	end
+
+	-- Decrement sender
+	fromInv[enemyId] = owned - 1
+	if fromInv[enemyId] <= 0 then
+		fromInv[enemyId] = nil
+	end
+
+	-- Increment receiver
+	toInv[enemyId] = (tonumber(toInv[enemyId] or 0) or 0) + 1
+
+	-- Push inventory updates back out, if the remote exists
+	if EnemyInventoryUpdated then
+		EnemyInventoryUpdated:FireClient(fromPlayer, fromInv)
+		EnemyInventoryUpdated:FireClient(targetPlayer, toInv)
+	end
+
+	-- Feedback
+	notify(fromPlayer, ("You gifted 1 %s to %s."):format(enemyId, targetPlayer.DisplayName), "Success")
+	notify(targetPlayer, ("%s gifted you 1 %s!"):format(fromPlayer.DisplayName, enemyId), "Success")
+end
+
+---------------------------------------------------------------------
+-- Lifecycle
+---------------------------------------------------------------------
+
+function TradeController:Init()
+	-- nothing for now
+end
+
+function TradeController:Start()
+	GiftEnemyRequest.OnServerEvent:Connect(onGiftEnemyRequest)
+end
+
+return TradeController
 
 ---
 
