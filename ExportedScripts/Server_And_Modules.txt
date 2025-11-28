@@ -3923,6 +3923,7 @@ local ModelProgression       = require(ReplicatedStorage.Modules.ModelProgressio
 local MutationConfigurations = require(ReplicatedStorage.Modules.MutationConfigurations)
 
 local LuckHelper = require(ReplicatedStorage.Modules:WaitForChild("LuckHelper"))
+local WeatherController = require(ServerScriptService.Controllers:WaitForChild("WeatherController"))
 
 local INTERMISSION_TIME = 1
 local NO_ACTIVITY_TIMEOUT = 40
@@ -3948,7 +3949,7 @@ local activeEnemiesFolder = Workspace:FindFirstChild("ActiveEnemies") or Instanc
 activeEnemiesFolder.Name = "ActiveEnemies"
 activeEnemiesFolder.Parent = Workspace
 
--- all mutation ids except "None"
+-- all mutation ids
 local ENEMY_MUTATIONS: {string} = {}
 for id, _ in pairs(MutationConfigurations) do
 	if id ~= "None" then
@@ -3956,16 +3957,61 @@ for id, _ in pairs(MutationConfigurations) do
 	end
 end
 
+-- WEATHER-AWARE mutation roll
 local function rollEnemyMutationId(player: Player): string?
-	if #ENEMY_MUTATIONS == 0 then return nil end
-
-	local BASE_CHANCE = 0.02
-	if not LuckHelper.Roll(player, BASE_CHANCE) then
+	if #ENEMY_MUTATIONS == 0 then
 		return nil
 	end
 
-	local idx = RNG:NextInteger(1, #ENEMY_MUTATIONS)
-	return ENEMY_MUTATIONS[idx]
+	local BASE_CHANCE = 0.02
+
+	-- Ask WeatherController for buffs
+	local baseChanceMult = 1
+	local goldWeightMult = 1
+	local christmasWeightMult = 1
+
+	local ok, effects = pcall(WeatherController.GetMutationEffects)
+	if ok and typeof(effects) == "table" then
+		baseChanceMult       = effects.BaseChanceMultiplier      or 1
+		goldWeightMult       = effects.GoldWeightMultiplier      or 1
+		christmasWeightMult  = effects.ChristmasWeightMultiplier or 1
+	end
+
+	-- Chance to get ANY mutation at all
+	local effectiveChance = BASE_CHANCE * baseChanceMult
+	if not LuckHelper.Roll(player, effectiveChance) then
+		return nil
+	end
+
+	-- Weighted pick (Gold / Christmas get juiced by weather)
+	local weightMap: {[string]: number} = {}
+	local totalWeight = 0
+	for _, id in ipairs(ENEMY_MUTATIONS) do
+		local w = 1
+		if id == "Gold" then
+			w *= goldWeightMult
+		elseif id == "Christmas" then
+			w *= christmasWeightMult
+		end
+		weightMap[id] = w
+		totalWeight += w
+	end
+
+	if totalWeight <= 0 then
+		local idx = RNG:NextInteger(1, #ENEMY_MUTATIONS)
+		return ENEMY_MUTATIONS[idx]
+	end
+
+	local r = RNG:NextNumber() * totalWeight
+	local acc = 0
+	for _, id in ipairs(ENEMY_MUTATIONS) do
+		acc += weightMap[id]
+		if r <= acc then
+			return id
+		end
+	end
+
+	return ENEMY_MUTATIONS[#ENEMY_MUTATIONS]
 end
 
 local function getPlotForPlayer(player: Player): Model?
@@ -4371,12 +4417,12 @@ startNextWave = function(player: Player, plot: Model)
 		end
 	end)
 
-	-- AFK timeout (unchanged)
+	-- AFK timeout
 	task.spawn(function()
 		while state.IsActive and totalRemaining() > 0 do
 			if not waveConfig.IsBossWave then
-				local now = os.clock()
-				if (now - lastActivityT) >= NO_ACTIVITY_TIMEOUT then
+				local nowClock = os.clock()
+				if (nowClock - lastActivityT) >= NO_ACTIVITY_TIMEOUT then
 					for _, enemy in ipairs(activeEnemiesFolder:GetChildren()) do
 						local owner = enemy:FindFirstChild("OwnerPlot")
 						if owner and owner.Value == plot then
@@ -4426,7 +4472,6 @@ startNextWave = function(player: Player, plot: Model)
 		end
 	end)
 end
-
 
 stopFight = function(plot: Model, reason: string)
 	local state = _plotStates[plot]
@@ -4541,11 +4586,11 @@ startFight = function(player: Player)
 end
 
 function WaveController:Init(controllers: {[string]: any})
-	PlayerController   = controllers.PlayerController
-	TurretController   = controllers.TurretController
+	PlayerController    = controllers.PlayerController
+	TurretController    = controllers.TurretController
 	PlacementController = controllers.PlacementController
-	WeaponController   = controllers.WeaponController
-	PlotController     = controllers.PlotController
+	WeaponController    = controllers.WeaponController
+	PlotController      = controllers.PlotController
 end
 
 function WaveController:Start()
@@ -5136,6 +5181,9 @@ local MAX_CRATES = 3
 local ShopController = {}
 local pendingSkips: {[Player]: Model} = {}
 
+-- Gifting: remember which product the payer wants to gift and to whom
+local pendingGifts: {[number]: {productId: number, targetUserId: number, timestamp: number}} = {}
+
 -- ===== Product ids =====
 -- Server luck
 local PRODUCT_SERVERLUCK_X2       = 3446300267 -- 2x (299R$)
@@ -5172,6 +5220,14 @@ if not serverLuckStateEvent then
 	serverLuckStateEvent = Instance.new("RemoteEvent")
 	serverLuckStateEvent.Name = "ServerLuckState"
 	serverLuckStateEvent.Parent = Events
+end
+
+-- Gifting remote (who to gift what)
+local giftProductSelectedEvent = Events:FindFirstChild("GiftProductSelected") :: RemoteEvent?
+if not giftProductSelectedEvent then
+	giftProductSelectedEvent = Instance.new("RemoteEvent")
+	giftProductSelectedEvent.Name = "GiftProductSelected"
+	giftProductSelectedEvent.Parent = Events
 end
 
 local Functions               = ReplicatedStorage:WaitForChild("Functions")
@@ -5304,8 +5360,23 @@ local function processReceipt(receiptInfo: {[string]: any})
 	local playerId   = receiptInfo.PlayerId
 	local productId  = receiptInfo.ProductId
 	local purchaseId = tostring(receiptInfo.PurchaseId or "")
-	local player     = Players:GetPlayerByUserId(playerId)
-	if not player then return Enum.ProductPurchaseDecision.NotProcessedYet end
+	local payer      = Players:GetPlayerByUserId(playerId)
+	if not payer then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+	-- By default, the payer is also the beneficiary
+	local beneficiary: Player = payer
+
+	-- Check if this purchase was marked as a gift (for any devproduct)
+	local giftInfo = pendingGifts[playerId]
+	if giftInfo and giftInfo.productId == productId then
+		if os.time() - giftInfo.timestamp <= 300 then
+			local target = Players:GetPlayerByUserId(giftInfo.targetUserId)
+			if target then
+				beneficiary = target
+			end
+		end
+		pendingGifts[playerId] = nil
+	end
 
 	local function grantAndCount(
 		decision: Enum.ProductPurchaseDecision,
@@ -5317,7 +5388,11 @@ local function processReceipt(receiptInfo: {[string]: any})
 			if robux > 0 then
 				RobuxSpent:Fire(playerId, robux)
 				if productLabel then
-					announcePurchase(player, productLabel)
+					if beneficiary ~= payer then
+						announcePurchase(payer, productLabel .. string.format(" (gifted to %s)", beneficiary.DisplayName))
+					else
+						announcePurchase(payer, productLabel)
+					end
 				end
 			end
 		end
@@ -5326,21 +5401,18 @@ local function processReceipt(receiptInfo: {[string]: any})
 
 	-- ===== Server luck products (2x, 4x, 10x) =====
 	if productId == PRODUCT_SERVERLUCK_X2 then
-		-- Always reset to 15 minutes at 2x
 		setServerLuck(2, 15 * 60, false)
-		showNotificationEvent:FireClient(player, "Server Luck set to 2x for 15 minutes!", "Success")
+		showNotificationEvent:FireClient(beneficiary, "Server Luck set to 2x for 15 minutes!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "2x Server Luck")
 
 	elseif productId == PRODUCT_SERVERLUCK_X4 then
-		-- Always reset to 15 minutes at 4x
 		setServerLuck(4, 15 * 60, false)
-		showNotificationEvent:FireClient(player, "Server Luck set to 4x for 15 minutes!", "Success")
+		showNotificationEvent:FireClient(beneficiary, "Server Luck set to 4x for 15 minutes!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "4x Server Luck")
 
 	elseif productId == PRODUCT_SERVERLUCK_X10 then
-		-- If already 10x and active, add 15 minutes; otherwise set 10x and reset to 15
 		setServerLuck(10, 15 * 60, true)
-		showNotificationEvent:FireClient(player, "MAX Server Luck (10x) extended by 15 minutes!", "Success")
+		showNotificationEvent:FireClient(beneficiary, "MAX Server Luck (10x) extended by 15 minutes!", "Success")
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "MAX Server Luck")
 	end
 
@@ -5363,9 +5435,9 @@ local function processReceipt(receiptInfo: {[string]: any})
 		end
 
 		if amount > 0 then
-			PlayerController.AddCash(player, amount)
+			PlayerController.AddCash(beneficiary, amount)
 			showNotificationEvent:FireClient(
-				player,
+				beneficiary,
 				`You received ${NumberFormatter.formatNumber(amount)} cash!`,
 				"Success"
 			)
@@ -5377,12 +5449,11 @@ local function processReceipt(receiptInfo: {[string]: any})
 	-- ===== Level-up skip product =====
 	if productId == PRODUCT_LEVELUP_SKIP then
 		if LevelUpController then
-			local ok = LevelUpController:SkipActiveJob(player)
+			local ok = LevelUpController:SkipActiveJob(beneficiary)
 			if ok then
 				return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, "Level-Up Timer Skip")
 			end
 		end
-		-- If we can't skip for some reason, don't consume the purchase.
 		return Enum.ProductPurchaseDecision.NotProcessedYet
 	end
 
@@ -5394,16 +5465,16 @@ local function processReceipt(receiptInfo: {[string]: any})
 
 	if productType == "ShopAction" then
 		if itemId == "RestockBlocksShop" then
-			BlocksShopController:PersonalRestock(player)
-			showNotificationEvent:FireClient(player, "Blocks Shop Restocked (Personal)!", "Success")
+			BlocksShopController:PersonalRestock(beneficiary)
+			showNotificationEvent:FireClient(beneficiary, "Blocks Shop Restocked (Personal)!", "Success")
 			return grantAndCount(
 				Enum.ProductPurchaseDecision.PurchaseGranted,
 				config.DisplayName or "Blocks Shop Restock"
 			)
 
 		elseif itemId == "RestockWeaponsShop" then
-			GlobalShopController:AddPersonalWeapons(player)
-			showNotificationEvent:FireClient(player, "Weapons Shop Restocked (Personal)!", "Success")
+			GlobalShopController:AddPersonalWeapons(beneficiary)
+			showNotificationEvent:FireClient(beneficiary, "Weapons Shop Restocked (Personal)!", "Success")
 			return grantAndCount(
 				Enum.ProductPurchaseDecision.PurchaseGranted,
 				config.DisplayName or "Weapons Shop Restock"
@@ -5411,10 +5482,9 @@ local function processReceipt(receiptInfo: {[string]: any})
 		end
 
 	elseif productType == "Cash" then
-		-- Old config-based cash path (still works if you keep WeaponConfigurations.CashProducts)
-		PlayerController.AddCash(player, config.CashAmount)
+		PlayerController.AddCash(beneficiary, config.CashAmount)
 		showNotificationEvent:FireClient(
-			player,
+			beneficiary,
 			`You received ${NumberFormatter.formatNumber(config.CashAmount)} cash!`,
 			"Success"
 		)
@@ -5422,14 +5492,14 @@ local function processReceipt(receiptInfo: {[string]: any})
 		return grantAndCount(Enum.ProductPurchaseDecision.PurchaseGranted, label)
 
 	elseif productType == "BlockOrTurret" then
-		local profile = PlayerController:GetProfile(player)
+		local profile = PlayerController:GetProfile(beneficiary)
 		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
 		local inv = profile.Data.BlockInventory
 		inv[itemId] = (inv[itemId] or 0) + 1
-		ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(player, inv)
-		showNotificationEvent:FireClient(player, `Purchased {config.DisplayName}!`, "Success")
+		ReplicatedStorage.Events.BlockInventoryUpdated:FireClient(beneficiary, inv)
+		showNotificationEvent:FireClient(beneficiary, `Purchased {config.DisplayName}!`, "Success")
 		if config.Type == "Turrets" then
-			BadgeController.SyncForNewItem(player, itemId)
+			BadgeController.SyncForNewItem(beneficiary, itemId)
 		end
 		return grantAndCount(
 			Enum.ProductPurchaseDecision.PurchaseGranted,
@@ -5452,24 +5522,24 @@ local function processReceipt(receiptInfo: {[string]: any})
 				end
 			end
 
-			local profile = PlayerController:GetProfile(player)
+			local profile = PlayerController:GetProfile(beneficiary)
 			if chosen and profile and not table.find(profile.Data.WeaponInventory, chosen) then
 				table.insert(profile.Data.WeaponInventory, chosen)
 			end
 			local wcfg = WeaponConfigurations.Weapons[chosen]
-			ReplicatedStorage.Events.ShowModelAward:FireClient(player, wcfg.DisplayName, wcfg.ImageId)
-			ReplicatedStorage.Events.WeaponInventoryUpdated:FireClient(player, profile.Data.WeaponInventory)
+			ReplicatedStorage.Events.ShowModelAward:FireClient(beneficiary, wcfg.DisplayName, wcfg.ImageId)
+			ReplicatedStorage.Events.WeaponInventoryUpdated:FireClient(beneficiary, profile.Data.WeaponInventory)
 			return grantAndCount(
 				Enum.ProductPurchaseDecision.PurchaseGranted,
 				config.DisplayName or "Gold Crate"
 			)
 
 		elseif config.SkipTimerProductID and productId == config.SkipTimerProductID then
-			local crate = pendingSkips[player]
+			local crate = pendingSkips[beneficiary]
 			if crate and crate.Parent then
 				crate:SetAttribute("UnlockTimestamp", 0)
-				pendingSkips[player] = nil
-				showNotificationEvent:FireClient(player, "Timer Skipped!", "Success")
+				pendingSkips[beneficiary] = nil
+				showNotificationEvent:FireClient(beneficiary, "Timer Skipped!", "Success")
 				return grantAndCount(
 					Enum.ProductPurchaseDecision.PurchaseGranted,
 					"Crate Timer Skip"
@@ -5477,14 +5547,14 @@ local function processReceipt(receiptInfo: {[string]: any})
 			end
 
 		else
-			local profile = PlayerController:GetProfile(player)
+			local profile = PlayerController:GetProfile(beneficiary)
 			if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
 			if #profile.Data.Crates >= MAX_CRATES then
 				return Enum.ProductPurchaseDecision.NotProcessedYet
 			end
 			while not CrateController do task.wait() end
-			if CrateController:PurchaseCrate(player, itemId, true) then
-				showNotificationEvent:FireClient(player, "Purchase Successful!", "Success")
+			if CrateController:PurchaseCrate(beneficiary, itemId, true) then
+				showNotificationEvent:FireClient(beneficiary, "Purchase Successful!", "Success")
 				return grantAndCount(
 					Enum.ProductPurchaseDecision.PurchaseGranted,
 					config.DisplayName or itemId
@@ -5594,6 +5664,19 @@ function ShopController:Start()
 	end
 
 	purchaseItemEvent.OnServerEvent:Connect(onPurchaseRequest)
+
+	-- GIFTING: remember who the payer wants to gift to for the next purchase
+	giftProductSelectedEvent.OnServerEvent:Connect(function(payer: Player, productId: number, targetUserId: number)
+		if typeof(productId) ~= "number" or typeof(targetUserId) ~= "number" then
+			return
+		end
+
+		pendingGifts[payer.UserId] = {
+			productId = productId,
+			targetUserId = targetUserId,
+			timestamp = os.time(),
+		}
+	end)
 end
 
 return ShopController
@@ -9042,6 +9125,544 @@ function RebirthController:Start()
 end
 
 return RebirthController
+
+---
+
+--- ServerScriptService.Controllers.WeatherController (ModuleScript) ---
+--!strict
+-- ServerScriptService.Controllers.WeatherController
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local RunService          = game:GetService("RunService")
+
+local Modules              = ReplicatedStorage:WaitForChild("Modules")
+local MutationConfigs      = require(Modules:WaitForChild("MutationConfigurations"))
+
+local EventsFolder = ReplicatedStorage:FindFirstChild("Events") or (function()
+	local f = Instance.new("Folder")
+	f.Name = "Events"
+	f.Parent = ReplicatedStorage
+	return f
+end)()
+
+local WeatherStateEvent = (function()
+	local ev = EventsFolder:FindFirstChild("WeatherState") :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = "WeatherState"
+		ev.Parent = EventsFolder
+	end
+	return ev
+end)()
+
+local ChatAnnouncement = (function()
+	local ev = EventsFolder:FindFirstChild("ChatAnnouncement") :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = "ChatAnnouncement"
+		ev.Parent = EventsFolder
+	end
+	return ev
+end)()
+
+local WeatherController = {}
+
+-- 20 minutes per event
+local WEATHER_DURATION_SECONDS = 20 * 60
+-- Max 3 weather events (any type) per hour
+local MAX_EVENTS_PER_HOUR = 3
+
+export type WeatherId = "Sunshine" | "Festive"
+
+type WeatherDef = {
+	Id: WeatherId,
+	DisplayName: string,
+	ImageId: string,
+	ChatStart: string,
+	ChatEnd: string,
+}
+
+local WEATHER_DEFS: {[WeatherId]: WeatherDef} = {
+	Sunshine = {
+		Id = "Sunshine",
+		DisplayName = "Sunshine",
+		-- TODO: assign a real image id
+		ImageId = "rbxassetid://0",
+		ChatStart = "[WEATHER] Sunshine breaks through the clouds! Gold enemies are shining brighter than ever ☀️",
+		ChatEnd   = "[WEATHER] Sunshine event has ended. The sky returns to normal.",
+	},
+	Festive = {
+		Id = "Festive",
+		DisplayName = "Festive",
+		ImageId = "rbxassetid://0",
+		ChatStart = "[WEATHER] A Festive storm arrives! Christmas enemies are much more common now 🎄",
+		ChatEnd   = "[WEATHER] Festive event has ended. Back to regular odds.",
+	},
+}
+
+-- Runtime state
+local activeEvents: {[WeatherId]: number} = {}          -- id -> expiresAt (os.time)
+local startTimestamps: {number} = {}                    -- when events started (for 3/hour cap)
+local _controllers: {[string]: any} = {}
+
+--========================
+-- Helpers
+--========================
+
+local function now(): number
+	return os.time()
+end
+
+local function getWeatherPayload()
+	local n = now()
+	local payload = {}
+
+	for id, expiresAt in pairs(activeEvents) do
+		if expiresAt > n then
+			table.insert(payload, {
+				Id = id,
+				ExpiresAt = expiresAt,
+				DisplayName = WEATHER_DEFS[id].DisplayName,
+				ImageId = WEATHER_DEFS[id].ImageId,
+			})
+		end
+	end
+
+	table.sort(payload, function(a, b)
+		return a.ExpiresAt < b.ExpiresAt
+	end)
+
+	return payload
+end
+
+local function pushStateToAll()
+	local payload = getWeatherPayload()
+	WeatherStateEvent:FireAllClients(payload)
+
+	-- Also mirror as attributes for debugging / analytics
+	for id, _ in pairs(WEATHER_DEFS) do
+		local attrName = "Weather_" .. id .. "_ExpiresAt"
+		local expiresAt = activeEvents[id]
+		if expiresAt and expiresAt > now() then
+			ReplicatedStorage:SetAttribute(attrName, expiresAt)
+		else
+			ReplicatedStorage:SetAttribute(attrName, 0)
+		end
+	end
+end
+
+local function pushStateToPlayer(player: Player)
+	WeatherStateEvent:FireClient(player, getWeatherPayload())
+end
+
+local function announce(text: string)
+	if ChatAnnouncement then
+		ChatAnnouncement:FireAllClients(text)
+	end
+end
+
+local function cleanupExpired()
+	local n = now()
+	local changed = false
+
+	for id, expiresAt in pairs(activeEvents) do
+		if expiresAt <= n then
+			activeEvents[id] = nil
+			local def = WEATHER_DEFS[id]
+			if def then
+				announce(def.ChatEnd)
+			end
+			changed = true
+		end
+	end
+
+	if changed then
+		pushStateToAll()
+	end
+end
+
+local function countEventsThisHour(): number
+	local n = now()
+	local cutoff = n - 3600
+	local newList: {number} = {}
+	local count = 0
+
+	for _, ts in ipairs(startTimestamps) do
+		if ts >= cutoff then
+			table.insert(newList, ts)
+			count += 1
+		end
+	end
+
+	startTimestamps = newList
+	return count
+end
+
+--========================
+-- Public control
+--========================
+
+-- Force a specific event ON for 20 minutes
+function WeatherController:StartEvent(id: WeatherId, source: string?)
+	if not WEATHER_DEFS[id] then return end
+
+	local n = now()
+	local expiresAt = n + WEATHER_DURATION_SECONDS
+
+	activeEvents[id] = expiresAt
+	table.insert(startTimestamps, n)
+
+	local def = WEATHER_DEFS[id]
+	announce(def.ChatStart)
+
+	pushStateToAll()
+end
+
+function WeatherController:StopEvent(id: WeatherId)
+	if not activeEvents[id] then return end
+	activeEvents[id] = nil
+	local def = WEATHER_DEFS[id]
+	if def then
+		announce(def.ChatEnd)
+	end
+	pushStateToAll()
+end
+
+function WeatherController:ClearAll()
+	for id, _ in pairs(activeEvents) do
+		activeEvents[id] = nil
+	end
+	announce("[WEATHER] All weather events have been cleared by an admin.")
+	pushStateToAll()
+end
+
+-- Used by AdminController
+function WeatherController:ForceMode(mode: string)
+	mode = string.lower(mode)
+
+	if mode == "sunshine" then
+		self:ClearAll()
+		self:StartEvent("Sunshine")
+	elseif mode == "festive" then
+		self:ClearAll()
+		self:StartEvent("Festive")
+	elseif mode == "both" then
+		self:ClearAll()
+		self:StartEvent("Sunshine")
+		self:StartEvent("Festive")
+	elseif mode == "clear" or mode == "none" then
+		self:ClearAll()
+	end
+end
+
+--========================
+-- Mutation effects hook
+--========================
+
+-- Called by WaveController.rollEnemyMutationId
+-- Returns multipliers for:
+--   - base chance
+--   - weight of Gold
+--   - weight of Christmas (Festive)
+function WeatherController.GetMutationEffects()
+	local n = now()
+	local hasSunshine = (activeEvents.Sunshine ~= nil and activeEvents.Sunshine > n)
+	local hasFestive  = (activeEvents.Festive  ~= nil and activeEvents.Festive  > n)
+
+	-- Defaults
+	local baseChanceMult   = 1
+	local goldWeightMult   = 1
+	local xmasWeightMult   = 1
+
+	if hasSunshine and not hasFestive then
+		baseChanceMult = 1.75
+		goldWeightMult = 4
+	elseif hasFestive and not hasSunshine then
+		baseChanceMult = 1.75
+		xmasWeightMult = 5
+	elseif hasSunshine and hasFestive then
+		baseChanceMult = 2.5
+		goldWeightMult = 4
+		xmasWeightMult = 5
+	end
+
+	return {
+		BaseChanceMultiplier = baseChanceMult,
+		GoldWeightMultiplier = goldWeightMult,
+		ChristmasWeightMultiplier = xmasWeightMult,
+	}
+end
+
+--========================
+-- Auto scheduler
+--========================
+
+local function autoTick()
+	-- 1) Remove expired
+	cleanupExpired()
+
+	-- 2) Auto-start if under cap & nothing currently running
+	if next(activeEvents) ~= nil then
+		return
+	end
+
+	local eventsThisHour = countEventsThisHour()
+	if eventsThisHour >= MAX_EVENTS_PER_HOUR then
+		return
+	end
+
+	-- small chance every tick to start something (to avoid being too spammy)
+	-- with tick every 30 seconds & p=0.12, expectation ~1.44 events per hour;
+	-- max is still capped by MAX_EVENTS_PER_HOUR
+	if math.random() < 0.12 then
+		local ids: {WeatherId} = {}
+		for id, _ in pairs(WEATHER_DEFS) do
+			table.insert(ids, id)
+		end
+		if #ids > 0 then
+			local chosen = ids[math.random(1, #ids)]
+			WeatherController:StartEvent(chosen, "Auto")
+		end
+	end
+end
+
+--========================
+-- Lifecycle
+--========================
+
+function WeatherController:Init(controllers: {[string]: any})
+	_controllers = controllers
+
+	Players.PlayerAdded:Connect(function(player)
+		task.defer(pushStateToPlayer, player)
+	end)
+end
+
+function WeatherController:Start()
+	-- heartbeat-style loop every ~30s
+	task.spawn(function()
+		while true do
+			task.wait(30)
+			autoTick()
+		end
+	end)
+end
+
+return WeatherController
+
+---
+
+--- ServerScriptService.Controllers.AdminController (ModuleScript) ---
+--!strict
+-- ServerScriptService.Controllers.AdminController
+-- Single entrypoint "AdminCommand" for all admin abuse actions.
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Modules              = ReplicatedStorage:WaitForChild("Modules")
+local ItemConfigurations   = require(Modules:WaitForChild("ItemConfigurations"))
+
+local PlayerController     = require(ServerScriptService.Controllers:WaitForChild("PlayerController"))
+local GlobalShopController = require(ServerScriptService.Controllers:WaitForChild("GlobalShopController"))
+local WeatherController    = require(ServerScriptService.Controllers:WaitForChild("WeatherController"))
+
+local EventsFolder = ReplicatedStorage:FindFirstChild("Events") or (function()
+	local f = Instance.new("Folder")
+	f.Name = "Events"
+	f.Parent = ReplicatedStorage
+	return f
+end)()
+
+local AdminCommandEvent = (function()
+	local ev = EventsFolder:FindFirstChild("AdminCommand") :: RemoteEvent?
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = "AdminCommand"
+		ev.Parent = EventsFolder
+	end
+	return ev
+end)()
+
+local AdminController = {}
+
+local ADMIN_USER_IDS: {[number]: boolean} = {
+	[936563031] = true, -- Zfx
+	[102527104] = true, -- Chuffy
+}
+
+
+local function isAdmin(player: Player): boolean
+	return ADMIN_USER_IDS[player.UserId] == true
+end
+
+local function findPlayerByName(name: string): Player?
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if string.lower(plr.Name) == string.lower(name) then
+			return plr
+		end
+	end
+	return nil
+end
+
+local function safeNumber(value: any, default: number): number
+	local n = tonumber(value)
+	if not n or n ~= n then
+		return default
+	end
+	return n
+end
+
+--========================
+-- Actions
+--========================
+
+local function doGiveCash(args: any)
+	-- args.scope: "All" | "Player"
+	-- args.playerName: string?
+	-- args.amount: number
+	local scope = tostring(args.scope or "All")
+	local amount = safeNumber(args.amount, 0)
+	if amount <= 0 then return end
+
+	if scope == "Player" then
+		local targetName = tostring(args.playerName or "")
+		local target = findPlayerByName(targetName)
+		if target then
+			PlayerController.AddCash(target, amount)
+		end
+	else
+		for _, plr in ipairs(Players:GetPlayers()) do
+			PlayerController.AddCash(plr, amount)
+		end
+	end
+end
+
+local function addUnitToPlayer(plr: Player, unitId: string, amount: number)
+	local profile = PlayerController:GetProfile(plr)
+	if not profile then return end
+
+	profile.Data.BlockInventory = profile.Data.BlockInventory or {}
+	local inv = profile.Data.BlockInventory
+	inv[unitId] = (inv[unitId] or 0) + amount
+
+	-- push to client
+	local events = PlayerController._remotes
+	if events and events["BlockInventoryUpdated"] then
+		(events["BlockInventoryUpdated"] :: RemoteEvent):FireClient(plr, inv)
+	end
+end
+
+local function doGiveUnits(args: any, cowboyOnly: boolean)
+	-- args.scope: "All" | "Player"
+	-- args.playerName: string?
+	-- args.unitId: string   (exact key in ItemConfigurations.Items)
+	-- args.amount: number
+	local scope = tostring(args.scope or "All")
+	local unitId = tostring(args.unitId or "")
+	local amount = math.max(1, safeNumber(args.amount, 1))
+
+	if unitId == "" then return end
+	local cfg = ItemConfigurations.Items[unitId]
+	if not cfg then
+		warn("[AdminController] Unknown unitId:", unitId)
+		return
+	end
+
+	if cowboyOnly then
+		-- basic filter: only Items with Type == "Turrets"
+		if cfg.Type ~= "Turrets" then
+			warn("[AdminController] Unit is not a cowboy / turret:", unitId)
+			return
+		end
+	end
+
+	if scope == "Player" then
+		local target = findPlayerByName(tostring(args.playerName or ""))
+		if target then
+			addUnitToPlayer(target, unitId, amount)
+		end
+	else
+		for _, plr in ipairs(Players:GetPlayers()) do
+			addUnitToPlayer(plr, unitId, amount)
+		end
+	end
+end
+
+local function doForceShopStock(args: any)
+	-- Force personal stocks for target(s) (Blocks / Weapons / Both)
+	-- args.scope: "All" | "Player"
+	-- args.playerName: string?
+	-- args.which: "Blocks" | "Weapons" | "Both"
+	local scope = tostring(args.scope or "All")
+	local which = string.lower(tostring(args.which or "Both"))
+
+	local function restockFor(plr: Player)
+		if which == "blocks" or which == "both" then
+			GlobalShopController:AddPersonalBlocks(plr)
+		end
+		if which == "weapons" or which == "both" then
+			GlobalShopController:AddPersonalWeapons(plr)
+		end
+	end
+
+	if scope == "Player" then
+		local target = findPlayerByName(tostring(args.playerName or ""))
+		if target then
+			restockFor(target)
+		end
+	else
+		for _, plr in ipairs(Players:GetPlayers()) do
+			restockFor(plr)
+		end
+	end
+end
+
+local function doForceWeather(args: any)
+	-- args.mode: "Sunshine" | "Festive" | "Both" | "Clear"
+	local mode = tostring(args.mode or "Clear")
+	WeatherController:ForceMode(mode)
+end
+
+--========================
+-- Remote dispatcher
+--========================
+
+local HANDLERS: {[string]: (any)->()} = {
+	GiveCash      = doGiveCash,
+	GiveUnit      = function(a) doGiveUnits(a, false) end,
+	GiveCowboy    = function(a) doGiveUnits(a, true) end,
+	ForceShopStock = doForceShopStock,
+	ForceWeather  = doForceWeather,
+}
+
+function AdminController:Init(controllers: {[string]: any})
+	-- if you want access to other controllers, store them here
+end
+
+function AdminController:Start()
+	AdminCommandEvent.OnServerEvent:Connect(function(player: Player, payload: any)
+		if not isAdmin(player) then
+			warn("[AdminController] Non-admin tried to send AdminCommand:", player.Name)
+			return
+		end
+
+		if typeof(payload) ~= "table" then return end
+		local t = tostring(payload.Type or "")
+		local handler = HANDLERS[t]
+		if not handler then
+			warn("[AdminController] Unknown command type:", t)
+			return
+		end
+
+		handler(payload.Args or {})
+	end)
+end
+
+return AdminController
 
 ---
 

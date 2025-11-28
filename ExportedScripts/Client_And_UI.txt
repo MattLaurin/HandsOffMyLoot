@@ -3354,6 +3354,157 @@ end)
 
 ---
 
+--- StarterGui.GUI.HUD.WeatherForecast.WeatherForecastHandler (LocalScript) ---
+--!strict
+-- StarterPlayerScripts/WeatherForecastHandler
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local gui = playerGui:WaitForChild("GUI")
+local hud = gui:WaitForChild("HUD")
+
+local rootFrame = hud:WaitForChild("WeatherForecast") :: Frame
+local template = rootFrame:WaitForChild("WeatherTemplate") :: Frame
+
+local eventsFolder = ReplicatedStorage:WaitForChild("Events")
+local WeatherState = eventsFolder:WaitForChild("WeatherState") :: RemoteEvent
+
+-- Internal state
+type WeatherPayloadItem = {
+	Id: string,
+	ExpiresAt: number,
+	DisplayName: string?,
+	ImageId: string?,
+}
+
+local currentEvents: {[string]: WeatherPayloadItem} = {}
+local rendered: {[string]: Frame} = {}
+local heartbeatConn: RBXScriptConnection?
+
+local function formatRemaining(seconds: number): string
+	if seconds <= 0 then
+		return "ENDING..."
+	end
+
+	local mins = math.floor(seconds / 60)
+	local secs = seconds % 60
+
+	if mins <= 0 then
+		return string.format("%ds", secs)
+	else
+		return string.format("%dm %02ds", mins, secs)
+	end
+end
+
+local function rebuildUI()
+	-- Clean old frames
+	for id, frame in pairs(rendered) do
+		if not currentEvents[id] or currentEvents[id].ExpiresAt <= os.time() then
+			frame:Destroy()
+			rendered[id] = nil
+		end
+	end
+
+	local count = 0
+	for id, data in pairs(currentEvents) do
+		if data.ExpiresAt > os.time() then
+			count += 1
+			local frame = rendered[id]
+			if not frame then
+				frame = template:Clone()
+				frame.Name = data.Id
+				frame.Visible = true
+				frame.Parent = rootFrame
+				rendered[id] = frame
+			end
+
+			local img = frame:FindFirstChild("WeatherImage") :: ImageLabel?
+			local timerLabel = img and img:FindFirstChild("Timer") :: TextLabel?
+
+			if img then
+				if data.ImageId and data.ImageId ~= "" then
+					img.Image = data.ImageId
+				end
+				if data.DisplayName and data.DisplayName ~= "" then
+					img:SetAttribute("DisplayName", data.DisplayName)
+				end
+			end
+
+			if timerLabel then
+				local remaining = data.ExpiresAt - os.time()
+				timerLabel.Text = formatRemaining(remaining)
+			end
+		end
+	end
+
+	rootFrame.Visible = (count > 0)
+end
+
+local function ensureHeartbeat()
+	if heartbeatConn then
+		heartbeatConn:Disconnect()
+		heartbeatConn = nil
+	end
+
+	if next(currentEvents) == nil then
+		rootFrame.Visible = false
+		return
+	end
+
+	heartbeatConn = RunService.Heartbeat:Connect(function()
+		local changed = false
+		local n = os.time()
+
+		for id, data in pairs(currentEvents) do
+			if data.ExpiresAt <= n then
+				currentEvents[id] = nil
+				changed = true
+			else
+				local frame = rendered[id]
+				if frame then
+					local img = frame:FindFirstChild("WeatherImage") :: ImageLabel?
+					local timerLabel = img and img:FindFirstChild("Timer") :: TextLabel?
+					if timerLabel then
+						timerLabel.Text = formatRemaining(data.ExpiresAt - n)
+					end
+				end
+			end
+		end
+
+		if changed then
+			rebuildUI()
+			if next(currentEvents) == nil then
+				ensureHeartbeat()
+			end
+		end
+	end)
+end
+
+WeatherState.OnClientEvent:Connect(function(payload: {WeatherPayloadItem})
+	-- Replace current state with server snapshot
+	currentEvents = {}
+
+	for _, entry in ipairs(payload) do
+		if entry.Id and entry.ExpiresAt then
+			currentEvents[entry.Id] = entry
+		end
+	end
+
+	rebuildUI()
+	ensureHeartbeat()
+end)
+
+-- Root frame starts hidden if no data yet
+rootFrame.Visible = false
+template.Visible = false
+
+---
+
 --- StarterGui.GUI.Frames.WeaponsShop.WeaponsShopHandler (LocalScript) ---
 --!strict
 -- Populates the weapons shop and handles purchase requests.
@@ -5424,6 +5575,271 @@ end)
 
 ---
 
+--- StarterGui.ScreenGui.Gift.GiftHandler (LocalScript) ---
+--!strict
+-- GiftHandler
+-- LOCATION: ScreenGui.Gift.GiftHandler (LocalScript)
+-- Step 1: list devproducts to gift
+-- Step 2: repopulate same list with players for the chosen product
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local localPlayer  = Players.LocalPlayer
+local playerGui    = localPlayer:WaitForChild("PlayerGui")
+local screenGui    = playerGui:WaitForChild("ScreenGui")
+local giftFrame    = screenGui:WaitForChild("Gift") :: Frame
+local shopFrame    = screenGui:WaitForChild("Shop") :: Frame
+
+local EventsFolder             = ReplicatedStorage:WaitForChild("Events")
+local GiftProductSelectedEvent = EventsFolder:WaitForChild("GiftProductSelected") :: RemoteEvent
+
+----------------------------------------------------------------
+-- Product IDs (must match ShopHandler + ShopController)
+----------------------------------------------------------------
+
+local PRODUCT_CASH_5K        = 3433108028
+local PRODUCT_CASH_25K       = 3433108213
+local PRODUCT_CASH_100K      = 3433108417
+local PRODUCT_CASH_300K      = 3433108573
+
+local PRODUCT_SERVERLUCK_X2  = 3446300267
+local PRODUCT_SERVERLUCK_X4  = 3446300425
+local PRODUCT_SERVERLUCK_X10 = 3446300596
+
+-- All giftable devproducts
+local GIFT_PRODUCTS = {
+	{
+		productId = PRODUCT_CASH_5K,
+		label    = "5,000 Cash",
+	},
+	{
+		productId = PRODUCT_CASH_25K,
+		label    = "25,000 Cash",
+	},
+	{
+		productId = PRODUCT_CASH_100K,
+		label    = "100,000 Cash",
+	},
+	{
+		productId = PRODUCT_CASH_300K,
+		label    = "300,000 Cash",
+	},
+	{
+		productId = PRODUCT_SERVERLUCK_X2,
+		label    = "x2 Server Luck (15 min)",
+	},
+	{
+		productId = PRODUCT_SERVERLUCK_X4,
+		label    = "x4 Server Luck (15 min)",
+	},
+	{
+		productId = PRODUCT_SERVERLUCK_X10,
+		label    = "MAX Server Luck (15+ min)",
+	},
+}
+
+----------------------------------------------------------------
+-- UI refs
+----------------------------------------------------------------
+
+local container = giftFrame:WaitForChild("Container") :: ScrollingFrame
+
+-- Find one Template we will use as a base
+local baseTemplate: Frame? = nil
+for _, child in ipairs(container:GetChildren()) do
+	if child:IsA("Frame") and child.Name == "Template" then
+		baseTemplate = child
+		break
+	end
+end
+
+if not baseTemplate then
+	warn("[GiftHandler] No Template found under Gift.Container")
+	return
+end
+
+baseTemplate.Visible = false -- we never show this original
+
+-- Title label (for mode text)
+local function setTitle(text: string)
+	local titleRoot = giftFrame:FindFirstChild("Title")
+	if titleRoot and titleRoot:IsA("TextLabel") then
+		local inner = titleRoot:FindFirstChild("Title")
+		if inner and inner:IsA("TextLabel") then
+			inner.Text = text
+		else
+			titleRoot.Text = text
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+
+type Mode = "Products" | "Players"
+
+local currentMode: Mode = "Products"
+local selectedProductId: number? = nil
+local selectedProductLabel: string? = nil
+
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+
+local function clearRows()
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Frame") and child ~= baseTemplate then
+			if child:GetAttribute("GiftRow") == true then
+				child:Destroy()
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Phase 1: list products
+----------------------------------------------------------------
+
+local function populateProducts()
+	currentMode = "Products"
+	selectedProductId = nil
+	selectedProductLabel = nil
+
+	setTitle("Choose what you want to gift")
+
+	clearRows()
+
+	for _, cfg in ipairs(GIFT_PRODUCTS) do
+		local row = baseTemplate:Clone()
+		row.Visible = true
+		row.Parent = container
+		row.Name = "GiftProductRow"
+		row:SetAttribute("GiftRow", true)
+
+		local settingLabel = row:FindFirstChild("Setting")
+		if settingLabel and settingLabel:IsA("TextLabel") then
+			settingLabel.Text = cfg.label
+		end
+
+		local button = row:FindFirstChild("Button")
+		if button and button:IsA("TextButton") then
+			local innerFrame = button:FindFirstChild("Frame")
+			if innerFrame and innerFrame:IsA("Frame") then
+				local textLabel = innerFrame:FindFirstChild("TextLabel")
+				if textLabel and textLabel:IsA("TextLabel") then
+					textLabel.Text = "Select"
+				end
+			end
+
+			button.MouseButton1Click:Connect(function()
+				-- Go to player selection for this product
+				selectedProductId = cfg.productId
+				selectedProductLabel = cfg.label
+				populatePlayers()
+			end)
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Phase 2: list players
+----------------------------------------------------------------
+
+function populatePlayers()
+	currentMode = "Players"
+
+	local label = selectedProductLabel or "this item"
+	setTitle("Choose who receives " .. label)
+
+	clearRows()
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer then
+			local row = baseTemplate:Clone()
+			row.Visible = true
+			row.Parent = container
+			row.Name = "GiftPlayerRow"
+			row:SetAttribute("GiftRow", true)
+
+			local settingLabel = row:FindFirstChild("Setting")
+			if settingLabel and settingLabel:IsA("TextLabel") then
+				settingLabel.Text = plr.DisplayName .. " (@" .. plr.Name .. ")"
+			end
+
+			-- Optional avatar
+			local avatarImage = row:FindFirstChild("ImageLabel")
+			if avatarImage and avatarImage:IsA("ImageLabel") then
+				local thumb, isReady = Players:GetUserThumbnailAsync(
+					plr.UserId,
+					Enum.ThumbnailType.HeadShot,
+					Enum.ThumbnailSize.Size100x100
+				)
+				if isReady then
+					avatarImage.Image = thumb
+				end
+			end
+
+			local button = row:FindFirstChild("Button")
+			if button and button:IsA("TextButton") then
+				local innerFrame = button:FindFirstChild("Frame")
+				if innerFrame and innerFrame:IsA("Frame") then
+					local textLabel = innerFrame:FindFirstChild("TextLabel")
+					if textLabel and textLabel:IsA("TextLabel") then
+						textLabel.Text = "Gift"
+					end
+				end
+
+				button.MouseButton1Click:Connect(function()
+					if not selectedProductId then return end
+
+					-- Tell server which product + target
+					GiftProductSelectedEvent:FireServer(selectedProductId, plr.UserId)
+
+					-- Prompt purchase for local player
+					MarketplaceService:PromptProductPurchase(localPlayer, selectedProductId)
+
+					-- After clicking, go back to products + close Gift
+					giftFrame.Visible = false
+					shopFrame.Visible = true
+					populateProducts()
+				end)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- UI wiring
+----------------------------------------------------------------
+
+-- Close button on Gift frame
+do
+	local closeButton = giftFrame:FindFirstChild("xbutton")
+	if closeButton and closeButton:IsA("TextButton") then
+		closeButton.MouseButton1Click:Connect(function()
+			-- Reset to product selection on close
+			populateProducts()
+			giftFrame.Visible = false
+			shopFrame.Visible = true
+		end)
+	end
+end
+
+-- When Gift becomes visible, always start at product list
+giftFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if giftFrame.Visible then
+		populateProducts()
+	end
+end)
+
+-- Ensure hidden at start
+giftFrame.Visible = false
+
+---
+
 --- StarterGui.ScreenGui.Rebirth.RebirthHandler (LocalScript) ---
 --!strict
 
@@ -5794,22 +6210,22 @@ local SERVER_LUCK_PRODUCTS = {
 	},
 }
 
--- GAMEPASSES – FILL THESE IDs
+-- GAMEPASSES – wired IDs
 local GAMEPASSES = {
 	VIP = {
-		gamePassId = 0, -- TODO: put your VIP gamepass ID
+		gamePassId = 1603639665, -- VIP
 	},
 	["2xMoney"] = {
-		gamePassId = 0, -- TODO: put your 2x money gamepass ID
+		gamePassId = 0, -- TODO: 2x money gamepass ID (if you add one)
 	},
 	ExtraCrateSlots = {
-		gamePassId = 0, -- TODO: put your extra crate slots gamepass ID
+		gamePassId = 0, -- TODO: extra crate slots gamepass ID (if you add one)
 	},
 	SmallLuck = {
-		gamePassId = 0, -- TODO: put your small luck gamepass ID
+		gamePassId = 1605301776, -- Small luck boost
 	},
 	BigLuck = {
-		gamePassId = 0, -- TODO: put your big luck gamepass ID
+		gamePassId = 1604617757, -- Godly (huge) luck boost
 	},
 }
 
@@ -6233,6 +6649,207 @@ end
 frame:GetPropertyChangedSignal("Visible"):Connect(function()
 	if frame.Visible then
 		storeSound:Play()
+	end
+end)
+
+---
+
+--- StarterGui.ScreenGui.AdminPanel.AdminPanelHandler (LocalScript) ---
+--!strict
+-- StarterGui.ScreenGui.AdminPanel.AdminPanelHandler
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+----------------------------------------------------------------
+-- Admin whitelist (CLIENT-SIDE UI access)
+----------------------------------------------------------------
+local ADMIN_USER_IDS: {[number]: boolean} = {
+	[936563031] = true, -- you
+	[102527104] = true, -- Chuffy
+}
+
+-- If not admin, hide panel + kill script
+local panel = script.Parent :: Frame
+if not ADMIN_USER_IDS[player.UserId] then
+	panel.Visible = false
+	script.Disabled = true
+	return
+end
+
+----------------------------------------------------------------
+-- Remotes
+----------------------------------------------------------------
+local eventsFolder = ReplicatedStorage:WaitForChild("Events")
+local AdminCommand = eventsFolder:WaitForChild("AdminCommand") :: RemoteEvent
+
+----------------------------------------------------------------
+-- UI refs (match your UI tree)
+----------------------------------------------------------------
+local TitleLabel          = panel:WaitForChild("Title") :: TextLabel
+
+local GiveCashButton      = panel:WaitForChild("GiveCashButton") :: TextButton
+local CashAmountBox       = panel:WaitForChild("CashAmount") :: TextBox
+local CashTargetBox       = panel:WaitForChild("CashTarget") :: TextBox
+
+local GiveUnitButton      = panel:WaitForChild("GiveUnitButton") :: TextButton
+local UnitIdBox           = panel:WaitForChild("UnitId") :: TextBox
+local UnitAmountBox       = panel:WaitForChild("UnitAmount") :: TextBox
+local UnitTargetBox       = panel:WaitForChild("UnitTarget") :: TextBox
+
+local GiveCowboyButton    = panel:WaitForChild("GiveCowboyButton") :: TextButton
+local CowboyIdBox         = panel:WaitForChild("CowboyId") :: TextBox
+local CowboyAmountBox     = panel:WaitForChild("CowboyAmount") :: TextBox
+local CowboyTargetBox     = panel:WaitForChild("CowboyTarget") :: TextBox
+
+local ForceStockButton    = panel:WaitForChild("ForceStockButton") :: TextButton
+local StockWhichBox       = panel:WaitForChild("StockWhich") :: TextBox
+local StockTargetBox      = panel:WaitForChild("StockTarget") :: TextBox
+
+local SunshineButton      = panel:WaitForChild("SunshineButton") :: TextButton
+local FestiveButton       = panel:WaitForChild("FestiveButton") :: TextButton
+local BothWeatherButton   = panel:WaitForChild("BothWeatherButton") :: TextButton
+local ClearWeatherButton  = panel:WaitForChild("ClearWeatherButton") :: TextButton
+
+TitleLabel.Text = "ADMIN PANEL"
+
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+local function scopeFromBox(box: TextBox): (string, string?)
+	local txt = string.lower(box.Text or "")
+	if txt == "" or txt == "all" or txt == "*" then
+		return "All", nil
+	end
+	return "Player", box.Text
+end
+
+----------------------------------------------------------------
+-- Buttons
+----------------------------------------------------------------
+
+-- Give Cash
+GiveCashButton.MouseButton1Click:Connect(function()
+	local amount = tonumber(CashAmountBox.Text) or 0
+	if amount <= 0 then return end
+
+	local scope, targetName = scopeFromBox(CashTargetBox)
+
+	AdminCommand:FireServer({
+		Type = "GiveCash",
+		Args = {
+			scope      = scope,
+			playerName = targetName,
+			amount     = amount,
+		},
+	})
+end)
+
+-- Give Unit
+GiveUnitButton.MouseButton1Click:Connect(function()
+	local unitId = UnitIdBox.Text
+	if unitId == "" then return end
+
+	local amount = tonumber(UnitAmountBox.Text) or 1
+	if amount <= 0 then amount = 1 end
+
+	local scope, targetName = scopeFromBox(UnitTargetBox)
+
+	AdminCommand:FireServer({
+		Type = "GiveUnit",
+		Args = {
+			scope      = scope,
+			playerName = targetName,
+			unitId     = unitId,
+			amount     = amount,
+		},
+	})
+end)
+
+-- Give Cowboy (turret)
+GiveCowboyButton.MouseButton1Click:Connect(function()
+	local unitId = CowboyIdBox.Text
+	if unitId == "" then return end
+
+	local amount = tonumber(CowboyAmountBox.Text) or 1
+	if amount <= 0 then amount = 1 end
+
+	local scope, targetName = scopeFromBox(CowboyTargetBox)
+
+	AdminCommand:FireServer({
+		Type = "GiveCowboy",
+		Args = {
+			scope      = scope,
+			playerName = targetName,
+			unitId     = unitId,
+			amount     = amount,
+		},
+	})
+end)
+
+-- Force shop stock
+ForceStockButton.MouseButton1Click:Connect(function()
+	local which = StockWhichBox.Text
+	if which == "" then which = "Both" end -- default
+
+	local scope, targetName = scopeFromBox(StockTargetBox)
+
+	AdminCommand:FireServer({
+		Type = "ForceShopStock",
+		Args = {
+			scope      = scope,
+			playerName = targetName,
+			which      = which, -- "Blocks", "Weapons" or "Both"
+		},
+	})
+end)
+
+-- Weather buttons
+SunshineButton.MouseButton1Click:Connect(function()
+	AdminCommand:FireServer({
+		Type = "ForceWeather",
+		Args = { mode = "Sunshine" },
+	})
+end)
+
+FestiveButton.MouseButton1Click:Connect(function()
+	AdminCommand:FireServer({
+		Type = "ForceWeather",
+		Args = { mode = "Festive" },
+	})
+end)
+
+BothWeatherButton.MouseButton1Click:Connect(function()
+	AdminCommand:FireServer({
+		Type = "ForceWeather",
+		Args = { mode = "Both" },
+	})
+end)
+
+ClearWeatherButton.MouseButton1Click:Connect(function()
+	AdminCommand:FireServer({
+		Type = "ForceWeather",
+		Args = { mode = "Clear" },
+	})
+end)
+
+-- Close button
+local closeBtn = panel:WaitForChild("CloseButton")
+closeBtn.MouseButton1Click:Connect(function()
+	panel.Visible = false
+end)
+
+
+----------------------------------------------------------------
+-- Chat command to open/close: "/Chuffy"
+----------------------------------------------------------------
+panel.Visible = false
+
+player.Chatted:Connect(function(message: string)
+	if string.lower(message) == "/chuffy" then
+		panel.Visible = not panel.Visible
 	end
 end)
 
